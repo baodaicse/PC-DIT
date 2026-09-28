@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+dit-contracts = { path = "../dit-contracts" }
 getrandom.workspace = true
 gpu-cuda = { path = "../gpu-cuda" }
 gpu-engine = { path = "../gpu-engine" }

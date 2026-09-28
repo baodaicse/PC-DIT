@@ -227,6 +227,7 @@ name = "dit-chain"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dit-contracts",
  "getrandom",
  "gpu-cuda",
  "gpu-engine",
@@ -298,6 +299,7 @@ name = "dit-system"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "dit-contracts",
  "dit-core",
  "hex",
  "memmap2",

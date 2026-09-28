@@ -1,3 +1,4 @@
+use dit_contracts::{FaultRecord, FaultWriter};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -150,6 +151,8 @@ pub struct SystemRunConfig {
     pub compute_oracle_idle_ramp_enabled: bool,
     pub compute_oracle_idle_sleep_ms: u64,
     pub fault_injection_compute_oracle_worker: Option<usize>,
+    /// Step F1 of the component fault ledger: one JSON line per failure as it is found.
+    pub fault_events_path: Option<PathBuf>,
 }
 
 impl SystemRunConfig {
@@ -255,7 +258,12 @@ pub fn run_system(
         return Ok(primary);
     }
 
-    let rerun = run_system_once(source, config);
+    // The rerun only reproduces; its failures are not new ones (no live fault records).
+    let rerun_config = SystemRunConfig {
+        fault_events_path: None,
+        ..config.clone()
+    };
+    let rerun = run_system_once(source, &rerun_config);
     primary.diagnostic = match rerun {
         Ok(rerun) => {
             let rerun_fingerprint = failure_fingerprint(&rerun);
@@ -336,6 +344,19 @@ fn run_system_once(
         + u64::from(!fp_fma_kat)
         + u64::from(coherency.actual != coherency.expected);
     counters.add(4, cpu_failures);
+    let faults = FaultWriter::new(config.fault_events_path.as_deref());
+    if cpu_tests_completed {
+        for (failed, source) in [
+            (!integer_kat, "cpu:integer_kat"),
+            (!sha256_kat, "cpu:sha256_kat"),
+            (!fp_fma_kat, "cpu:fp_fma_kat"),
+            (coherency.actual != coherency.expected, "cpu:coherency"),
+        ] {
+            if failed {
+                faults.write(&FaultRecord::new(source, 1, "CPU check failed"));
+            }
+        }
+    }
 
     let allocation = plan_and_allocate(
         &inventory.memory,
@@ -516,6 +537,7 @@ fn run_system_once(
             &control,
             config.fault_injection_worker_crash,
         )?;
+        emit_verify_faults(&faults, &write_results, round);
         arenas = collect_phase_results(
             write_results,
             &mut worker_evidence,
@@ -559,6 +581,7 @@ fn run_system_once(
             &control,
             &counters,
         )?;
+        emit_verify_faults(&faults, &read_results, round);
         let round_mismatch = read_results
             .iter()
             .find_map(|result| result.mismatch.clone());
@@ -652,6 +675,27 @@ fn run_system_once(
             })
         })
         .collect();
+    for outcome in &compute_oracle_outcomes {
+        for (mismatches, source) in [
+            (outcome.dense_fma_mismatches, "cpu:oracle_fma"),
+            (outcome.branch_predictor_mismatches, "cpu:oracle_branch"),
+            (outcome.aes256_mismatches, "cpu:oracle_aes"),
+        ] {
+            if mismatches > 0 {
+                faults.write(
+                    &FaultRecord::new(
+                        source,
+                        mismatches,
+                        format!(
+                            "compute-oracle worker {} on CPU {}",
+                            outcome.worker_id, outcome.cpu_id
+                        ),
+                    )
+                    .evidence("cpu", outcome.cpu_id.to_string()),
+                );
+            }
+        }
+    }
     let compute_oracle_evidence = if config.compute_oracle_workers > 0 {
         let aggregate = compute_oracle::aggregate_outcomes(&compute_oracle_outcomes);
         SystemComputeOracleEvidence {
@@ -1043,6 +1087,61 @@ fn write_worker(
         mismatch: None,
         crash,
         execution_error,
+    }
+}
+
+/// Live fault records of one phase's worker results (step F1): the first RAM mismatch of each
+/// failing worker, SIMD/scalar disagreements and worker crashes.
+fn emit_verify_faults(faults: &FaultWriter, results: &[BatchResult], round: u32) {
+    if !faults.enabled() {
+        return;
+    }
+    for result in results {
+        if let Some(m) = &result.mismatch {
+            faults.write(
+                &FaultRecord::new(
+                    "ram:pattern",
+                    1,
+                    format!(
+                        "round {round} worker {}: global offset {} (arena {} offset {}), expected {:#04x} actual {:#04x}, syndrome {:#04x}",
+                        result.worker_id,
+                        m.global_offset,
+                        m.arena_id,
+                        m.arena_offset,
+                        m.expected,
+                        m.actual,
+                        m.xor_syndrome
+                    ),
+                )
+                .evidence("global_offset", m.global_offset.to_string())
+                .evidence("syndrome", m.xor_syndrome.to_string())
+                .evidence("verifier_cpu", m.verifier_cpu.map_or_else(String::new, |c| c.to_string()))
+                .evidence("writer_cpu", m.writer_cpu.map_or_else(String::new, |c| c.to_string())),
+            );
+        }
+        if result.scalar_simd_mismatches > 0 {
+            faults.write(
+                &FaultRecord::new(
+                    "cpu:scalar_simd",
+                    result.scalar_simd_mismatches,
+                    format!(
+                        "round {round}: SIMD and scalar reductions differ on CPU {}",
+                        result.cpu_id
+                    ),
+                )
+                .evidence("cpu", result.cpu_id.to_string()),
+            );
+        }
+        if let Some(crash) = &result.crash {
+            faults.write(&FaultRecord::new(
+                "platform:worker_crash",
+                1,
+                format!(
+                    "worker {} on CPU {} in {}: {}",
+                    crash.worker_id, crash.cpu_id, crash.phase, crash.message
+                ),
+            ));
+        }
     }
 }
 
@@ -1772,6 +1871,7 @@ mod tests {
             compute_oracle_idle_ramp_enabled: false,
             compute_oracle_idle_sleep_ms: 0,
             fault_injection_compute_oracle_worker: None,
+            fault_events_path: None,
         };
         assert!(config.validate().is_err());
     }

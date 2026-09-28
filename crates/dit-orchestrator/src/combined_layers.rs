@@ -530,6 +530,8 @@ pub struct SsdTally {
     pending: String,
     devices: BTreeMap<String, SsdDevice>,
     pub events: u64,
+    /// Failure events read since the caller last took them (step F1), as fault records.
+    pub records: Vec<dit_contracts::FaultRecord>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -567,7 +569,8 @@ impl SsdTally {
             let Some(id) = envelope.device_id.as_ref() else {
                 continue;
             };
-            let device = self.devices.entry(id.0.clone()).or_default();
+            let stable_id = id.0.clone();
+            let device = self.devices.entry(stable_id.clone()).or_default();
             match envelope.event {
                 Event::Progress {
                     completed_operations,
@@ -583,7 +586,26 @@ impl SsdTally {
                     device.stage = stage;
                     device.matrix_checks = evidence.matrix_checks_completed;
                 }
-                Event::Failure { .. } => device.failure_events += 1,
+                Event::Failure {
+                    kind,
+                    offset_bytes,
+                    detail,
+                    ..
+                } => {
+                    device.failure_events += 1;
+                    let kind = serde_json::to_value(kind)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    self.records.push(
+                        dit_contracts::FaultRecord::new(
+                            format!("ssd:{kind}"),
+                            1,
+                            format!("offset {offset_bytes}: {detail}"),
+                        )
+                        .device(stable_id),
+                    );
+                }
                 Event::Completed { failures, .. } => {
                     device.failures = device.failures.max(failures);
                 }

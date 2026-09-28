@@ -430,6 +430,10 @@ struct RunArgs {
     /// Internal multi-GPU worker heartbeat file.
     #[arg(long, hide = true)]
     progress_file: Option<PathBuf>,
+    /// Appends one JSON line per failure record as soon as it exists (step F1 of the component
+    /// fault ledger); with several GPUs each worker writes `device-N/fault-events.jsonl`.
+    #[arg(long)]
+    fault_events: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1091,6 +1095,9 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
     });
     let mut first_failure: Option<hwhealth::FirstFailure> = None;
+    // Step F1: every failure record is also appended to `--fault-events` as soon as it exists.
+    let fault_writer = dit_contracts::FaultWriter::new(args.fault_events.as_deref());
+    let mut faults_emitted = 0_usize;
     // Transfer/retention operations per pattern class (schedule version 2), for the scorecard.
     let mut pattern_counts = [0_u64; 7];
     // Async only: guarantees transfer/retention a share of time (default off) and reports it.
@@ -1483,6 +1490,13 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 renderer.render_frame(&render_gpu_ui(&state, TerminalSize::current(), true))?;
             }
         }
+        emit_faults(
+            &fault_writer,
+            &failures,
+            &mut faults_emitted,
+            selected_pci.as_deref(),
+            vulkan.as_ref(),
+        );
         if args.stop_on_error && !failures.is_empty() {
             completion_reason = "stop_on_error".to_owned();
             break;
@@ -1578,6 +1592,13 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         hardware_note = health.summary();
     }
+    emit_faults(
+        &fault_writer,
+        &failures,
+        &mut faults_emitted,
+        selected_pci.as_deref(),
+        vulkan.as_ref(),
+    );
     let telemetry_end = collect_gpu_telemetry(&devices);
     // A profile that leaves a workload out is judged on the workloads it runs.
     let hardware_tested = vulkan.is_some()
@@ -2276,6 +2297,38 @@ impl LaneTotals {
             },
         }
     }
+}
+
+/// Appends the failure records found since the last call to `--fault-events` (step F1). The
+/// async pipeline's host-corpus check rides along as evidence of a compute failure.
+fn emit_faults(
+    writer: &dit_contracts::FaultWriter,
+    failures: &[FailureEvidence],
+    emitted: &mut usize,
+    pci: Option<&str>,
+    backend: Option<&Backend>,
+) {
+    if !writer.enabled() || failures.len() <= *emitted {
+        *emitted = failures.len();
+        return;
+    }
+    let host_changed = backend
+        .and_then(Backend::async_report)
+        .and_then(|report| report.failure_attribution)
+        .is_some_and(|attribution| attribution == "host_memory_changed");
+    for failure in &failures[*emitted..] {
+        let mut record =
+            dit_contracts::FaultRecord::new(failure.phase.clone(), 1, failure.detail.clone())
+                .evidence("generation", failure.generation.to_string());
+        if let Some(pci) = pci {
+            record = record.device(pci);
+        }
+        if host_changed && failure.phase == "compute" {
+            record = record.evidence("host", "host_memory_changed");
+        }
+        writer.write(&record);
+    }
+    *emitted = failures.len();
 }
 
 /// Lane verification failures become ordinary failure records (phase says which detector).
@@ -3966,6 +4019,7 @@ mod tests {
             inject_fault: None,
             inject_vulkan_fault: None,
             progress_file: None,
+            fault_events: None,
         };
         assert_eq!(allocation_target_bytes(&info, &args), 760);
         args.vram_mib = Some(64);
@@ -4030,6 +4084,7 @@ mod tests {
             inject_fault: None,
             inject_vulkan_fault: None,
             progress_file: None,
+            fault_events: None,
         };
         assert_eq!(effective_vram_percent(&info, &args), 60);
         assert_eq!(allocation_target_bytes(&info, &args), 480);
@@ -4096,6 +4151,7 @@ mod tests {
             inject_fault: None,
             inject_vulkan_fault: None,
             progress_file: None,
+            fault_events: None,
         };
         assert_eq!(
             resolved_compute_rounds(&args),
@@ -4290,6 +4346,7 @@ mod tests {
             inject_fault: None,
             inject_vulkan_fault: None,
             progress_file: None,
+            fault_events: None,
         };
         assert!(!should_stop(&args, u64::MAX, Duration::from_secs(1_799)));
         assert!(should_stop(&args, 0, Duration::from_mins(30)));

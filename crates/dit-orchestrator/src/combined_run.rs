@@ -17,8 +17,9 @@ use dit_orchestrator::combined::{
     self, Available, Holding, Intensity, Layer, LayerOutcome, Level, MemoryPolicy, Phase,
     PhaseKind, ThreadPlan,
 };
-use dit_orchestrator::fault_ledger::{Component, CsvMeta, Ledger, LedgerReport};
+use dit_orchestrator::fault_ledger::{Component, CsvMeta, FaultEvent, Ledger, LedgerReport};
 use dit_orchestrator::fault_sources;
+use dit_orchestrator::hw_events::{self, HwMonitor};
 use dit_ui_core::{InPlaceRenderer, TerminalSize};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -212,6 +213,10 @@ struct Running {
     tally: Option<SsdTally>,
     live: LiveLayer,
     drained: bool,
+    /// Fault-event files of this layer and how far each was read (step F1).
+    faults: Vec<(PathBuf, dit_contracts::FaultTail)>,
+    /// Failures counted live, to reconcile with the report at the end.
+    live_attributed: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -275,6 +280,8 @@ struct CombinedReport<'a> {
     elapsed_seconds: f64,
     /// Every FAIL counted on its component cell (`docs/COMPONENT_FAULT_ATTRIBUTION_ROADMAP.md`).
     fault_ledger: LedgerReport,
+    /// The links watched for hardware events (step F2), both ends.
+    hardware_links: Vec<String>,
 }
 
 struct Session<'a> {
@@ -306,6 +313,7 @@ struct Session<'a> {
     last_line: Option<Instant>,
     phase_started: Instant,
     ledger: Ledger,
+    monitor: HwMonitor,
 }
 
 fn unix_ms() -> u128 {
@@ -506,6 +514,28 @@ fn run_session(
     if renderer.is_some() {
         print!("\x1b[H\x1b[2J");
     }
+    // Step F2: every GPU's and every SSD's link, read at both ends every few seconds.
+    let mut links: Vec<(Component, String)> = telemetry
+        .gpus
+        .iter()
+        .enumerate()
+        .filter_map(|(i, gpu)| {
+            u8::try_from(i + 1)
+                .ok()
+                .map(|n| (Component::PcieGpu(n), gpu.pci_address.clone()))
+        })
+        .collect();
+    if let Some(plan) = &storage {
+        for device in &plan.devices {
+            if let (Ok(n), Some(bdf)) = (
+                u8::try_from(device.alias),
+                dit_system::pcie::pci_of_block(&device.block_name),
+            ) {
+                links.push((Component::SsdPath(n), bdf));
+            }
+        }
+    }
+    let monitor = HwMonitor::new(links);
     let mut session = Session {
         menu,
         settings,
@@ -535,6 +565,7 @@ fn run_session(
         last_line: None,
         phase_started: Instant::now(),
         ledger: Ledger::default(),
+        monitor,
     };
     for index in 0..session.phases.len() {
         if session.abort.is_some() || INTERRUPTED.load(Ordering::SeqCst) {
@@ -639,6 +670,8 @@ impl Session<'_> {
             peak_bytes: 0,
             resident_bytes: 0,
             tally: (layer == Layer::Ssd).then(SsdTally::default),
+            faults: Vec::new(),
+            live_attributed: 0,
             live: LiveLayer::default(),
             drained: false,
         })
@@ -737,6 +770,13 @@ impl Session<'_> {
                 Layer::Chain => launch.args.extend(["--inject".into(), "gpu".into()]),
                 Layer::Gpu | Layer::Ssd => {}
             }
+        }
+        // Step F1: failures are written as they are found and counted on their cells live.
+        if layer != Layer::Ssd {
+            launch.args.extend([
+                "--fault-events".into(),
+                dir.join("fault-events.jsonl").into(),
+            ]);
         }
         self.spawn(index, layer, launch)
     }
@@ -979,11 +1019,15 @@ impl Session<'_> {
     fn tick(&mut self, running: &mut Vec<Running>, record: &mut PhaseRecord) {
         std::thread::sleep(Duration::from_millis(250));
         self.telemetry.sample();
+        for event in self.monitor.sample() {
+            self.ledger.add_hardware(&event);
+        }
         let mut held = 0;
         for layer in running.iter_mut() {
             if let Some(tally) = layer.tally.as_mut() {
                 tally.update(&layer.dir.join("events.jsonl"));
             }
+            self.drain_live(layer, &record.label);
             layer.live = layers::live(layer.layer, &layer.dir, layer.tally.as_ref());
             if let Some(read) = layer.live.read_gibps {
                 self.chain_peak_gibps = self.chain_peak_gibps.max(read);
@@ -1020,6 +1064,7 @@ impl Session<'_> {
         if let Some(tally) = ended.tally.as_mut() {
             tally.update(&ended.dir.join("events.jsonl"));
         }
+        self.drain_live(&mut ended, &record.label);
         let live = layers::live(ended.layer, &ended.dir, ended.tally.as_ref());
         let (mut outcome, mut detail) = layers::outcome(ended.layer, &ended.dir);
         // A layer the session stopped (drain, Ctrl+C) did not crash, even without a report.
@@ -1129,10 +1174,99 @@ impl Session<'_> {
                 fault_sources::chain(&report, phase, gpu, ssd)
             }
         };
-        self.ledger.add_all(findings.failures);
+        let report_total: u64 = findings.failures.iter().map(|e| e.count).sum();
+        if ended.live_attributed == 0 {
+            // No live record: the report is the only source (as in step F0).
+            self.ledger.add_all(findings.failures);
+        } else if report_total > ended.live_attributed
+            && let Some(first) = findings.failures.first()
+        {
+            // The live records are the failures; count what the report has beyond them.
+            self.ledger.add(
+                FaultEvent::new(
+                    layers::slug(ended.layer),
+                    "reconcile:report",
+                    report_total - ended.live_attributed,
+                    first.attribution().clone(),
+                    "session/reconcile",
+                    "failures in the report beyond the live records",
+                )
+                .in_phase(phase),
+            );
+        }
         for event in &findings.hardware {
+            // The live monitor already counts link AER, replays and width.
+            if hw_events::link_kind(&event.kind) || event.kind.starts_with("aer:") {
+                continue;
+            }
             self.ledger.add_hardware(event);
         }
+    }
+
+    /// Fault-event files of a layer's run directory (one per GPU worker with several GPUs).
+    fn fault_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files = vec![dir.join("fault-events.jsonl")];
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            files.extend(
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("device-"))
+                    .map(|e| e.path().join("fault-events.jsonl")),
+            );
+        }
+        files
+    }
+
+    /// Counts the failures a running layer wrote since the last tick on their cells (step F1).
+    fn drain_live(&mut self, layer: &mut Running, phase: &str) {
+        let mut records = layer
+            .tally
+            .as_mut()
+            .map(|tally| std::mem::take(&mut tally.records))
+            .unwrap_or_default();
+        for path in Self::fault_files(&layer.dir) {
+            if !layer.faults.iter().any(|(known, _)| *known == path) {
+                layer
+                    .faults
+                    .push((path, dit_contracts::FaultTail::default()));
+            }
+        }
+        for (path, tail) in &mut layer.faults {
+            records.extend(tail.read(path));
+        }
+        if records.is_empty() {
+            return;
+        }
+        let at = self.started.elapsed().as_secs_f64();
+        let slug = layers::slug(layer.layer);
+        let (chain_gpu, chain_ssd) = self.chain_devices();
+        let events: Vec<FaultEvent> = {
+            let numbering = fault_sources::Numbering {
+                gpu: &|pci| self.gpu_number(pci),
+                ssd: &|id| self.ssd_number(id),
+                chain_gpu,
+                chain_ssd,
+            };
+            records
+                .iter()
+                .flat_map(|record| fault_sources::from_record(slug, record, &numbering))
+                .collect()
+        };
+        for event in events {
+            layer.live_attributed += event.count;
+            self.ledger.add(event.in_phase(phase).at(at));
+        }
+    }
+
+    /// GPU and SSD the data chain runs on: the first CUDA GPU, the first SSD of the plan.
+    fn chain_devices(&self) -> (u8, u8) {
+        let ssd = self
+            .storage
+            .as_ref()
+            .and_then(|plan| plan.devices.first())
+            .and_then(|device| u8::try_from(device.alias).ok())
+            .unwrap_or(1);
+        (1, ssd)
     }
 
     /// One row of `fail-summary.csv` on the results volume (in the session directory without it).
@@ -1388,7 +1522,12 @@ impl Session<'_> {
             fault_rows: vec![
                 self.ledger.fail_line(
                     &self.machine_cells(),
-                    running.iter().map(|r| r.live.failures).sum(),
+                    // Failures of layers that have not written a live record yet.
+                    running
+                        .iter()
+                        .filter(|r| r.live_attributed == 0)
+                        .map(|r| r.live.failures)
+                        .sum(),
                 ),
                 self.ledger.hardware_line(),
             ],
@@ -1454,6 +1593,7 @@ impl Session<'_> {
             memory_timeline: &self.timeline,
             elapsed_seconds: self.started.elapsed().as_secs_f64(),
             fault_ledger: self.ledger.report(),
+            hardware_links: self.monitor.describe(),
         };
         let path = self.dir.join("combined-report.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;

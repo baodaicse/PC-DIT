@@ -6,6 +6,7 @@
 //! round trip stays unresolved between its `PCIe` link, the GPU and its VRAM, instead of being
 //! blamed on the GPU.
 use crate::fault_ledger::{Attribution, Component, FaultEvent, HardwareEvent};
+use dit_contracts::FaultRecord;
 use serde_json::Value;
 
 /// Failures and hardware counters found in one report.
@@ -193,14 +194,21 @@ fn ram_pattern(report: &Value, found: &mut Findings, counted_in_total: u64) {
                 m.pointer("/verifier_cpu").map_or_else(|| "N/A".into(), ToString::to_string),
             )
         });
+        // A pattern written and read by the CPU: RAM is the likely cell unless the confirmation
+        // step (F4) re-read and rewrote it from other CPUs.
+        let (attribution, rule) = mismatch
+            .and_then(|m| m.pointer("/confirm").and_then(Value::as_str))
+            .and_then(ram_confirmed)
+            .unwrap_or((
+                Attribution::Suspected(Component::Ram, vec![Component::Cpu]),
+                "cpu-ram/pattern",
+            ));
         found.fail(FaultEvent::new(
             CPU_RAM,
             "ram:pattern",
             failing_rounds,
-            // A pattern written and read by the CPU: RAM is the likely cell until the
-            // confirmation step (F4) re-reads and rewrites from another CPU.
-            Attribution::Suspected(Component::Ram, vec![Component::Cpu]),
-            "cpu-ram/pattern",
+            attribution,
+            rule,
             format!(
                 "{wrong_bytes} wrong byte(s) in {failing_rounds} failing round(s); {first}; rerun: {}",
                 str_at(report, "/diagnostic/classification")
@@ -333,6 +341,129 @@ pub fn gpu_hardware_reason(reason: &str, gpu: u8) -> Attribution {
     Attribution::Suspected(Component::Gpu(gpu), vec![Component::Vram(gpu)])
 }
 
+/// Counts from the GPU boundary-check tag of a failure detail (step F3), e.g.
+/// `[boundary: d2h=12 device=1]`: how many failed batches each check places where.
+#[must_use]
+pub fn boundary_counts(detail: &str) -> Vec<(String, u64)> {
+    let Some(start) = detail.find("[boundary: ") else {
+        return Vec::new();
+    };
+    let rest = &detail[start + "[boundary: ".len()..];
+    let body = rest.split(']').next().unwrap_or("");
+    body.split_whitespace()
+        .filter_map(|pair| {
+            let (kind, count) = pair.split_once('=')?;
+            let count: u64 = count.parse().ok()?;
+            (count > 0).then(|| (kind.to_owned(), count))
+        })
+        .collect()
+}
+
+/// Cell a GPU boundary check places a failed batch in (step F3).
+#[must_use]
+pub fn boundary_attribution(kind: &str, gpu: u8) -> Option<(Attribution, &'static str)> {
+    Some(match kind {
+        // Input hashed on the GPU right after the upload differed from the host's hash, and a
+        // second upload into the same place was clean: the copy went wrong on the link.
+        "h2d" => (
+            Attribution::Confirmed(Component::PcieGpu(gpu)),
+            "gpu/boundary_h2d",
+        ),
+        // The GPU checked its own output before the copy back and found it right; the CPU found
+        // it wrong after the copy, and the host buffer read the same twice: the link.
+        "d2h" => (
+            Attribution::Confirmed(Component::PcieGpu(gpu)),
+            "gpu/boundary_d2h",
+        ),
+        // The input or the answers held in VRAM changed after they were checked.
+        "vram-input" | "vram-answers" => (
+            Attribution::Confirmed(Component::Vram(gpu)),
+            "gpu/boundary_vram_at_rest",
+        ),
+        // Wrong already on the GPU, with its input intact: computed wrong, or written wrong.
+        "device" => (
+            Attribution::Suspected(Component::Gpu(gpu), vec![Component::Vram(gpu)]),
+            "gpu/boundary_device",
+        ),
+        // The input arrived wrong twice at the same place: link or VRAM.
+        "h2d-persistent" => (
+            Attribution::Unresolved(vec![Component::PcieGpu(gpu), Component::Vram(gpu)]),
+            "gpu/boundary_h2d_persistent",
+        ),
+        _ => return None,
+    })
+}
+
+/// Events of one GPU failure record (report or live), `count` batches or regions.
+#[must_use]
+pub fn gpu_failure_events(
+    phase: &str,
+    detail: &str,
+    count: u64,
+    gpu: u8,
+    host_changed: bool,
+) -> Vec<FaultEvent> {
+    const LAYER: &str = "gpu-vram";
+    if phase == "gpu-a-mock" {
+        return Vec::new();
+    }
+    if phase == "hardware" {
+        return detail
+            .split("; ")
+            .filter(|r| !r.is_empty())
+            .map(|reason| {
+                FaultEvent::new(
+                    LAYER,
+                    "gpu:hardware",
+                    1,
+                    gpu_hardware_reason(reason, gpu),
+                    "gpu/hardware_error",
+                    reason,
+                )
+            })
+            .collect();
+    }
+    let source = format!("gpu:{phase}");
+    if phase == "compute" && host_changed {
+        // The host copy of the corpus no longer matched its hashes after the failure.
+        return vec![FaultEvent::new(
+            LAYER,
+            source,
+            count,
+            Attribution::Confirmed(Component::Ram),
+            "gpu/host_corpus_changed",
+            detail,
+        )];
+    }
+    let mut events = Vec::new();
+    let mut placed = 0;
+    for (kind, n) in boundary_counts(detail) {
+        if let Some((attribution, rule)) = boundary_attribution(&kind, gpu) {
+            placed += n;
+            events.push(FaultEvent::new(
+                LAYER,
+                source.clone(),
+                n,
+                attribution,
+                rule,
+                detail,
+            ));
+        }
+    }
+    if placed < count {
+        let (attribution, rule) = gpu_phase(phase, gpu);
+        events.push(FaultEvent::new(
+            LAYER,
+            source,
+            count - placed,
+            attribution,
+            rule,
+            detail,
+        ));
+    }
+    events
+}
+
 /// `(burst: N failed batches` in an async compute failure: N batches failed at once.
 fn burst_batches(detail: &str) -> u64 {
     detail
@@ -404,44 +535,14 @@ fn gpu_device(report: &Value, gpu: u8) -> Findings {
     for record in &records {
         let phase = str_at(record, "/phase");
         let detail = str_at(record, "/detail");
-        if phase == "gpu-a-mock" {
-            continue;
-        }
-        if phase == "hardware" {
-            for reason in detail.split("; ").filter(|r| !r.is_empty()) {
-                found.fail(FaultEvent::new(
-                    LAYER,
-                    "gpu:hardware",
-                    1,
-                    gpu_hardware_reason(reason, gpu),
-                    "gpu/hardware_error",
-                    reason,
-                ));
-            }
-            continue;
-        }
-        let (attribution, rule) = if phase == "compute" && host_changed {
-            // The host copy of the corpus no longer matched its hashes after the failure.
-            (
-                Attribution::Confirmed(Component::Ram),
-                "gpu/host_corpus_changed",
-            )
-        } else {
-            gpu_phase(phase, gpu)
-        };
         let count = if phase == "compute" {
             burst_batches(detail)
         } else {
             1
         };
-        found.fail(FaultEvent::new(
-            LAYER,
-            format!("gpu:{phase}"),
-            count,
-            attribution,
-            rule,
-            detail,
-        ));
+        found
+            .failures
+            .extend(gpu_failure_events(phase, detail, count, gpu, host_changed));
     }
     // Records the report counted but did not list.
     let unlisted = u64_at(report, "/failure_count").saturating_sub(records.len() as u64);
@@ -514,6 +615,45 @@ fn gpu_hardware(report: &Value, gpu: u8, found: &mut Findings) {
 
 // --------------------------------------------------------------------------------------- SSD
 
+/// Cell of an SSD failure after the engine's immediate re-read (step F4): clean on the re-read,
+/// the first read went wrong on its way; the same wrong data again, the data at rest is wrong.
+#[must_use]
+pub fn ssd_confirmed(confirm: &str, ssd: u8) -> Option<(Attribution, &'static str)> {
+    Some(match confirm {
+        "reread_clean" | "reread_differs" => (
+            Attribution::Confirmed(Component::SsdPath(ssd)),
+            "ssd/reread_path",
+        ),
+        "reread_same" => (
+            Attribution::Confirmed(Component::Ssd(ssd)),
+            "ssd/reread_stored",
+        ),
+        _ => return None,
+    })
+}
+
+/// Event of one SSD failure record (report or live); `None` for tool errors.
+#[must_use]
+pub fn ssd_failure_event(
+    kind: &str,
+    ssd: u8,
+    detail: &str,
+    confirm: Option<&str>,
+) -> Option<FaultEvent> {
+    let (attribution, rule) = confirm
+        .and_then(|c| ssd_confirmed(c, ssd))
+        .map_or_else(|| ssd_kind(kind, ssd), Some)?;
+    let detail = confirm.map_or_else(|| detail.to_owned(), |c| format!("{detail} [confirm: {c}]"));
+    Some(FaultEvent::new(
+        "cpu-nvme",
+        format!("ssd:{kind}"),
+        1,
+        attribution,
+        rule,
+        detail,
+    ))
+}
+
 /// Cell of an SSD failure kind; `None` for tool errors that are no component's fault.
 #[must_use]
 pub fn ssd_kind(kind: &str, ssd: u8) -> Option<(Attribution, &'static str)> {
@@ -580,22 +720,18 @@ pub fn ssd(report: &Value, phase: &str, alias_of: &dyn Fn(&str) -> Option<u8>) -
             .unwrap_or_default();
         let mut listed = 0_u64;
         for record in &records {
-            let kind = str_at(record, "/kind");
             listed += 1;
-            if let Some((attribution, rule)) = ssd_kind(kind, number) {
-                found.fail(FaultEvent::new(
-                    LAYER,
-                    format!("ssd:{kind}"),
-                    1,
-                    attribution,
-                    rule,
-                    format!(
-                        "offset {}: {}",
-                        u64_at(record, "/offset_bytes"),
-                        str_at(record, "/detail")
-                    ),
-                ));
-            }
+            let confirm = str_at(record, "/confirm");
+            found.failures.extend(ssd_failure_event(
+                str_at(record, "/kind"),
+                number,
+                &format!(
+                    "offset {}: {}",
+                    u64_at(record, "/offset_bytes"),
+                    str_at(record, "/detail")
+                ),
+                (!confirm.is_empty()).then_some(confirm),
+            ));
         }
         let unlisted = u64_at(engine, "/failure_count").saturating_sub(listed);
         if unlisted > 0 {
@@ -609,7 +745,68 @@ pub fn ssd(report: &Value, phase: &str, alias_of: &dyn Fn(&str) -> Option<u8>) -
             ));
         }
     }
+    ssd_hardware(report, &mut found, alias_of, &target_alias);
     found.in_phase(phase)
+}
+
+/// SMART and AER changes of each SSD between the inventories taken before and after the run.
+fn ssd_hardware(
+    report: &Value,
+    found: &mut Findings,
+    alias_of: &dyn Fn(&str) -> Option<u8>,
+    target_alias: &dyn Fn(&str) -> Option<u8>,
+) {
+    let devices = |pointer: &str| {
+        report
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let before = devices("/inventory_before");
+    for after in devices("/inventory_after") {
+        let id = str_at(&after, "/stable_id");
+        let Some(start) = before.iter().find(|d| str_at(d, "/stable_id") == id) else {
+            continue;
+        };
+        let Some(number) = alias_of(id).or_else(|| target_alias(id)) else {
+            continue;
+        };
+        let grew = |pointer: &str| u64_at(&after, pointer).saturating_sub(u64_at(start, pointer));
+        found.hw(
+            Component::Ssd(number),
+            "media_errors",
+            grew("/smart/media_and_data_integrity_errors"),
+        );
+        found.hw(
+            Component::Ssd(number),
+            "error_log_entries",
+            grew("/smart/error_log_entries"),
+        );
+        let counters = |device: &Value| -> Vec<(String, u64)> {
+            device
+                .pointer("/aer/counters")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(k, v)| {
+                            let n = v.as_str()?.split_whitespace().last()?.parse().ok()?;
+                            Some((k.clone(), n))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let old = counters(start);
+        for (name, value) in counters(&after) {
+            let previous = old.iter().find(|(k, _)| *k == name).map_or(0, |(_, v)| *v);
+            found.hw(
+                Component::SsdPath(number),
+                &format!("aer:{name}"),
+                value.saturating_sub(previous),
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------- chain
@@ -653,6 +850,26 @@ pub fn chain_attribution(attribution: &str, gpu: u8, ssd: u8) -> (Attribution, &
     }
 }
 
+/// Cell of one chain failure: its own attribution, refined by the GPU boundary tag of a GPU-side
+/// failure (step F3; the check that placed most of the step's failed batches decides).
+#[must_use]
+pub fn chain_cell(
+    attribution: &str,
+    detail: &str,
+    gpu: u8,
+    ssd: u8,
+) -> (Attribution, &'static str) {
+    if attribution == "gpu_vram_pcie"
+        && let Some((attribution, rule)) = boundary_counts(detail)
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .and_then(|(kind, _)| boundary_attribution(&kind, gpu))
+    {
+        return (attribution, rule);
+    }
+    chain_attribution(attribution, gpu, ssd)
+}
+
 /// `dit-chain` report (`report.json`); the chain runs on GPU `gpu` and SSD `ssd`.
 #[must_use]
 pub fn chain(report: &Value, phase: &str, gpu: u8, ssd: u8) -> Findings {
@@ -666,7 +883,7 @@ pub fn chain(report: &Value, phase: &str, gpu: u8, ssd: u8) -> Findings {
     let mut last = None;
     for record in &records {
         let attribution = str_at(record, "/attribution");
-        let (cell, rule) = chain_attribution(attribution, gpu, ssd);
+        let (cell, rule) = chain_cell(attribution, str_at(record, "/detail"), gpu, ssd);
         last = Some((cell.clone(), rule));
         found.fail(FaultEvent::new(
             LAYER,
@@ -710,10 +927,181 @@ pub fn crash(layer: &'static str, phase: &str, detail: &str) -> FaultEvent {
     .in_phase(phase)
 }
 
+// -------------------------------------------------------------------------------- live (F1)
+
+/// How a session numbers its devices, for live records that name one.
+pub struct Numbering<'a> {
+    pub gpu: &'a dyn Fn(&str) -> u8,
+    pub ssd: &'a dyn Fn(&str) -> Option<u8>,
+    /// GPU and SSD the data chain runs on.
+    pub chain_gpu: u8,
+    pub chain_ssd: u8,
+}
+
+/// Cell of a CPU-RAM pattern failure after the engine's confirmation (step F4).
+#[must_use]
+pub fn ram_confirmed(confirm: &str) -> Option<(Attribution, &'static str)> {
+    Some(match confirm {
+        // Wrong from another CPU after the caches were evicted, and wrong again at the same bit
+        // after a rewrite: the cell.
+        "cell_persistent" => (
+            Attribution::Confirmed(Component::Ram),
+            "cpu-ram/confirm_cell",
+        ),
+        // Right from other CPUs, wrong again from the verifier's own CPU: that core.
+        "verifier_core" => (
+            Attribution::Confirmed(Component::Cpu),
+            "cpu-ram/confirm_core",
+        ),
+        // Wrong from every CPU but right after a rewrite: held wrong (written wrong or decayed).
+        "rewrite_fixed" => (
+            Attribution::Suspected(Component::Ram, vec![Component::Cpu]),
+            "cpu-ram/confirm_rewrite_fixed",
+        ),
+        // Right on every re-read: a transient read.
+        "transient" => (
+            Attribution::Unresolved(vec![Component::Cpu, Component::Ram]),
+            "cpu-ram/confirm_transient",
+        ),
+        _ => return None,
+    })
+}
+
+/// Events of one live record written by `layer` while it runs (step F1).
+#[must_use]
+pub fn from_record(
+    layer: &str,
+    record: &FaultRecord,
+    numbering: &Numbering<'_>,
+) -> Vec<FaultEvent> {
+    let device = record.device.as_deref().unwrap_or("");
+    let evidence = |key: &str| record.evidence.get(key).map(String::as_str);
+    match layer {
+        "gpu-vram" => gpu_failure_events(
+            &record.source,
+            &record.detail,
+            if record.source == "compute" {
+                burst_batches(&record.detail).max(record.count)
+            } else {
+                record.count
+            },
+            (numbering.gpu)(device),
+            evidence("host") == Some("host_memory_changed"),
+        ),
+        "cpu-nvme" => {
+            let number = (numbering.ssd)(device).unwrap_or(1);
+            let kind = record.source.strip_prefix("ssd:").unwrap_or(&record.source);
+            ssd_failure_event(kind, number, &record.detail, evidence("confirm"))
+                .into_iter()
+                .collect()
+        }
+        "chain" => {
+            let attribution = record
+                .source
+                .strip_prefix("chain:")
+                .unwrap_or(&record.source);
+            let (cell, rule) = chain_cell(
+                attribution,
+                &record.detail,
+                numbering.chain_gpu,
+                numbering.chain_ssd,
+            );
+            vec![FaultEvent::new(
+                "chain",
+                record.source.clone(),
+                record.count,
+                cell,
+                rule,
+                record.detail.clone(),
+            )]
+        }
+        _ => {
+            let (attribution, rule) = match record.source.as_str() {
+                "ram:pattern" => evidence("confirm").and_then(ram_confirmed).unwrap_or((
+                    Attribution::Suspected(Component::Ram, vec![Component::Cpu]),
+                    "cpu-ram/pattern",
+                )),
+                "ram:edac_uncorrected" => {
+                    (Attribution::Confirmed(Component::Ram), "cpu-ram/edac_ue")
+                }
+                source if source.starts_with("platform:") => (
+                    Attribution::Confirmed(Component::Platform),
+                    "cpu-ram/worker_crash",
+                ),
+                _ => (Attribution::Confirmed(Component::Cpu), "cpu-ram/cpu_check"),
+            };
+            vec![FaultEvent::new(
+                CPU_RAM,
+                record.source.clone(),
+                record.count,
+                attribution,
+                rule,
+                record.detail.clone(),
+            )]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fault_ledger::{Confidence, Ledger};
+
+    #[test]
+    fn boundary_tags_place_gpu_batches_and_leave_the_rest_unresolved() {
+        let events = gpu_failure_events(
+            "compute",
+            "matrix mismatch (burst: 5 failed batches, 320 words) [boundary: d2h=3 device=1]",
+            5,
+            1,
+            false,
+        );
+        let cells: Vec<(String, u64)> = events.iter().map(|e| (e.cell.clone(), e.count)).collect();
+        assert_eq!(
+            cells,
+            vec![
+                ("PCIe-GPU1".to_owned(), 3),
+                ("GPU1".to_owned(), 1),
+                ("PCIe-GPU1|GPU1|VRAM1".to_owned(), 1)
+            ]
+        );
+        assert_eq!(events[0].confidence, Confidence::Confirmed);
+        assert_eq!(events[1].confidence, Confidence::Suspected);
+        assert!(boundary_counts("no tag").is_empty());
+        assert_eq!(
+            chain_cell("gpu_vram_pcie", "x [boundary: vram-input=2]", 1, 1).0,
+            Attribution::Confirmed(Component::Vram(1))
+        );
+    }
+
+    #[test]
+    fn live_records_use_the_same_rules_and_the_confirmations() {
+        let numbering = Numbering {
+            gpu: &|_| 2,
+            ssd: &|id| (id == "nvme:X").then_some(3),
+            chain_gpu: 1,
+            chain_ssd: 1,
+        };
+        let ram = FaultRecord::new("ram:pattern", 1, "bit 3").evidence("confirm", "verifier_core");
+        assert_eq!(from_record("cpu-ram", &ram, &numbering)[0].cell, "CPU");
+        let ram = FaultRecord::new("ram:pattern", 1, "bit 3");
+        assert_eq!(
+            from_record("cpu-ram", &ram, &numbering)[0].confidence,
+            Confidence::Suspected
+        );
+        let ssd = FaultRecord::new("ssd:data_mismatch", 1, "offset 0")
+            .device("nvme:X")
+            .evidence("confirm", "reread_clean");
+        let event = &from_record("cpu-nvme", &ssd, &numbering)[0];
+        assert_eq!(
+            (event.cell.as_str(), event.confidence),
+            ("SSD3-path", Confidence::Confirmed)
+        );
+        let gpu = FaultRecord::new("vram-sweep", 1, "").device("0000:08:00.0");
+        assert_eq!(from_record("gpu-vram", &gpu, &numbering)[0].cell, "VRAM2");
+        let chain = FaultRecord::new("chain:host_ram", 1, "");
+        assert_eq!(from_record("chain", &chain, &numbering)[0].cell, "RAM");
+    }
 
     fn one(_: &str) -> u8 {
         1

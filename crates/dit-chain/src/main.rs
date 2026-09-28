@@ -130,6 +130,10 @@ struct OutputArgs {
     /// counters (for the watchdog and the combined scheduler).
     #[arg(long)]
     progress_file: Option<PathBuf>,
+    /// Appends one JSON line per failure as it is found (`dit_contracts::FaultRecord`), so the
+    /// control center counts it on its component cell during the run.
+    #[arg(long)]
+    fault_events: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -470,6 +474,7 @@ struct Ctx {
     failures: Vec<ChainFailure>,
     progress: Progress,
     writer: ProgressWriter,
+    faults: dit_contracts::FaultWriter,
 }
 
 impl Ctx {
@@ -514,6 +519,7 @@ impl Ctx {
             failures: Vec::new(),
             progress: Progress::new(layout.records),
             writer: ProgressWriter::new(output.progress_file.clone(), started, headroom),
+            faults: dit_contracts::FaultWriter::new(output.fault_events.as_deref()),
         };
         ctx.beat(true);
         ctx
@@ -531,6 +537,11 @@ impl Ctx {
         detail: String,
     ) {
         eprintln!("CHAIN FAIL {phase} record {record}: {attribution}: {detail}");
+        self.faults.write(
+            &dit_contracts::FaultRecord::new(format!("chain:{attribution}"), 1, detail.clone())
+                .evidence("phase", phase)
+                .evidence("record", record.to_string()),
+        );
         self.report.failure_count += 1;
         self.progress.failures = self.report.failure_count;
         if self.failures.len() < 64 {

@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod fault;
+pub use fault::{FaultRecord, FaultTail, FaultWriter};
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const NVME_MODULE_ID: &str = "dit.cpu-nvme";
 

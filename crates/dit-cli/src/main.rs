@@ -424,6 +424,10 @@ struct SystemRunArgs {
 
     #[arg(long, default_value = "build/system-report.json")]
     report: PathBuf,
+
+    /// Appends one JSON line per failure as it is found (component fault ledger, step F1).
+    #[arg(long)]
+    fault_events: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -714,6 +718,7 @@ fn system_run(args: &SystemRunArgs) -> u8 {
         compute_oracle_idle_ramp_enabled: args.compute_oracle_idle_ramp,
         compute_oracle_idle_sleep_ms: args.compute_oracle_idle_sleep_ms,
         fault_injection_compute_oracle_worker: args.inject_compute_oracle_worker,
+        fault_events_path: args.fault_events.clone(),
     };
     let report = match run_system(&source, &config) {
         Ok(report) => report,

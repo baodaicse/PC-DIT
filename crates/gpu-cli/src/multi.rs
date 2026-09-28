@@ -311,6 +311,11 @@ fn run_multi(
             .arg(&progress_path)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(error_log));
+        if args.fault_events.is_some() {
+            command
+                .arg("--fault-events")
+                .arg(device_dir.join("fault-events.jsonl"));
+        }
         if args.async_compute {
             command.arg("--async-compute");
         }
@@ -1204,6 +1209,7 @@ mod tests {
             inject_fault: None,
             inject_vulkan_fault: None,
             progress_file: None,
+            fault_events: None,
         };
         for count in [1, 2, 4] {
             let snapshots = devices(count)
@@ -1270,6 +1276,7 @@ mod tests {
             inject_fault: None,
             inject_vulkan_fault: None,
             progress_file: None,
+            fault_events: None,
         };
         assert_eq!(multi_device_vram_percent(&integrated, &args, 1), 60);
         assert_eq!(multi_device_vram_percent(&integrated, &args, 2), 30);

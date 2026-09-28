@@ -3,6 +3,7 @@
 pub mod combined;
 pub mod fault_ledger;
 pub mod fault_sources;
+pub mod hw_events;
 
 use dit_contracts::{SCHEMA_VERSION, Verdict};
 use serde::{Deserialize, Serialize};

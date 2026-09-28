@@ -8,6 +8,7 @@ mod error;
 mod gpu;
 mod inventory;
 mod memory;
+pub mod pcie;
 pub mod power_platform;
 mod report;
 mod safety;

@@ -160,6 +160,9 @@ pub struct FaultEvent {
     /// The mapping rule applied (`<layer>/<name>`, versioned by [`ATTRIBUTION_VERSION`]).
     pub rule: &'static str,
     pub detail: String,
+    /// Seconds since the session started, for failures seen live (step F1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_seconds: Option<f64>,
     #[serde(skip)]
     attribution: Attribution,
 }
@@ -189,6 +192,7 @@ impl FaultEvent {
             candidates: attribution.candidates().iter().map(|c| c.label()).collect(),
             rule,
             detail: detail.into(),
+            at_seconds: None,
             attribution,
         }
     }
@@ -196,6 +200,12 @@ impl FaultEvent {
     #[must_use]
     pub fn in_phase(mut self, phase: &str) -> Self {
         phase.clone_into(&mut self.phase);
+        self
+    }
+
+    #[must_use]
+    pub fn at(mut self, seconds: f64) -> Self {
+        self.at_seconds = Some(seconds);
         self
     }
 
@@ -247,6 +257,32 @@ pub struct Ledger {
     events: Vec<FaultEvent>,
     kept_per_cell: BTreeMap<String, usize>,
     details_dropped: u64,
+    occurrences: Vec<Occurrence>,
+    rankings: Vec<Ranking>,
+}
+
+/// Every failure as the signature analysis (step F6) needs it, kept up to [`OCCURRENCE_CAP`].
+#[derive(Clone, Debug)]
+pub struct Occurrence {
+    pub at_seconds: Option<f64>,
+    pub phase: String,
+    pub source: String,
+    pub candidates: Vec<Component>,
+    pub confidence: Confidence,
+    pub count: u64,
+    pub detail: String,
+}
+
+const OCCURRENCE_CAP: usize = 8192;
+
+/// An unresolved group moved to a suspected cell by the evidence ranking (step F6).
+#[derive(Clone, Debug, Serialize)]
+pub struct Ranking {
+    pub group: String,
+    pub suspected: String,
+    pub count: u64,
+    pub scores: BTreeMap<String, i64>,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -277,10 +313,53 @@ pub struct LedgerReport {
     pub by_phase: BTreeMap<String, BTreeMap<String, u64>>,
     pub events: Vec<FaultEvent>,
     pub details_dropped: u64,
+    /// Unresolved groups the evidence ranking (step F6) placed on a suspected cell.
+    pub rankings: Vec<Ranking>,
 }
 
 impl Ledger {
+    /// Unresolved groups and their counts.
+    #[must_use]
+    pub fn unresolved_groups(&self) -> Vec<(Vec<Component>, u64)> {
+        self.unresolved
+            .iter()
+            .map(|(group, count)| (group.clone(), *count))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn occurrences(&self) -> &[Occurrence] {
+        &self.occurrences
+    }
+
+    /// Hardware counters counted on `cell`.
+    #[must_use]
+    pub fn hardware_of(&self, cell: Component) -> BTreeMap<String, u64> {
+        self.hardware.get(&cell).cloned().unwrap_or_default()
+    }
+
+    /// Moves an unresolved group to a suspected cell (tier 2 of the attribution; it never makes
+    /// anything confirmed).
+    pub fn rank_unresolved(&mut self, group: &[Component], cell: Component, ranking: Ranking) {
+        let Some(count) = self.unresolved.remove(group) else {
+            return;
+        };
+        self.cells.entry(cell).or_default().suspected += count;
+        self.rankings.push(Ranking { count, ..ranking });
+    }
+
     pub fn add(&mut self, event: FaultEvent) {
+        if self.occurrences.len() < OCCURRENCE_CAP {
+            self.occurrences.push(Occurrence {
+                at_seconds: event.at_seconds,
+                phase: event.phase.clone(),
+                source: event.source.clone(),
+                candidates: event.attribution().candidates(),
+                confidence: event.confidence,
+                count: event.count,
+                detail: event.detail.clone(),
+            });
+        }
         match event.attribution() {
             Attribution::Confirmed(cell) => {
                 self.cells.entry(*cell).or_default().confirmed += event.count;
@@ -440,6 +519,7 @@ impl Ledger {
             by_phase: self.by_phase.clone(),
             events: self.events.clone(),
             details_dropped: self.details_dropped,
+            rankings: self.rankings.clone(),
         }
     }
 
