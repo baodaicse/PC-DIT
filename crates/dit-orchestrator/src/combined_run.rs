@@ -17,6 +17,8 @@ use dit_orchestrator::combined::{
     self, Available, Holding, Intensity, Layer, LayerOutcome, Level, MemoryPolicy, Phase,
     PhaseKind, ThreadPlan,
 };
+use dit_orchestrator::fault_ledger::{Component, CsvMeta, Ledger, LedgerReport};
+use dit_orchestrator::fault_sources;
 use dit_ui_core::{InPlaceRenderer, TerminalSize};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -271,6 +273,8 @@ struct CombinedReport<'a> {
     calculations_total: u64,
     memory_timeline: &'a [MemorySample],
     elapsed_seconds: f64,
+    /// Every FAIL counted on its component cell (`docs/COMPONENT_FAULT_ATTRIBUTION_ROADMAP.md`).
+    fault_ledger: LedgerReport,
 }
 
 struct Session<'a> {
@@ -301,6 +305,7 @@ struct Session<'a> {
     last_frame: Option<Instant>,
     last_line: Option<Instant>,
     phase_started: Instant,
+    ledger: Ledger,
 }
 
 fn unix_ms() -> u128 {
@@ -529,6 +534,7 @@ fn run_session(
         last_frame: None,
         last_line: None,
         phase_started: Instant::now(),
+        ledger: Ledger::default(),
     };
     for index in 0..session.phases.len() {
         if session.abort.is_some() || INTERRUPTED.load(Ordering::SeqCst) {
@@ -544,9 +550,10 @@ fn run_session(
     let release = release_storage(holder);
     let (verdict, report_path) = session.write_report()?;
     let stored = session.persist();
+    let csv = session.append_fail_summary(verdict, &report_path);
     let failures: u64 = session.totals.values().map(|t| t.failures).sum();
     let summary = format!(
-        "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\nReport: {}\n{stored}\n{cleanup}{release}",
+        "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\n{}\n{}\nReport: {}\n{stored}\n{csv}\n{cleanup}{release}",
         session.settings.level.label(),
         session.settings.intensity.label(),
         combined::grade(
@@ -556,6 +563,8 @@ fn run_session(
         )
         .map_or("none (not every phase completed)", Level::label),
         session.layer_summary(),
+        session.ledger.fail_line(&session.machine_cells(), 0),
+        session.ledger.hardware_line(),
         report_path.display()
     );
     Ok((summary, verdict))
@@ -1027,6 +1036,7 @@ impl Session<'_> {
         if matches!(record.phase, PhaseKind::Baseline(_)) {
             self.peaks.insert(ended.layer, ended.peak_bytes);
         }
+        self.attribute(&ended, outcome, &detail, &record.label);
         if outcome == LayerOutcome::Crashed && self.abort.is_none() {
             self.abort = Some(format!(
                 "{} ended without a report in phase {}: {detail}",
@@ -1043,6 +1053,135 @@ impl Session<'_> {
             directory: ended.dir.display().to_string(),
             detail,
         });
+    }
+
+    /// GPU number of a PCI address: its place among the GPUs this session tests.
+    fn gpu_number(&self, pci: &str) -> u8 {
+        self.telemetry
+            .gpus
+            .iter()
+            .position(|gpu| gpu.pci_address.eq_ignore_ascii_case(pci))
+            .and_then(|i| u8::try_from(i + 1).ok())
+            .unwrap_or(1)
+    }
+
+    /// SSD number (the operator's alias) of a namespace stable ID.
+    fn ssd_number(&self, stable_id: &str) -> Option<u8> {
+        self.storage.as_ref().and_then(|plan| {
+            plan.devices
+                .iter()
+                .find(|device| device.stable_id == stable_id)
+                .and_then(|device| u8::try_from(device.alias).ok())
+        })
+    }
+
+    /// Cells of this machine, in display order.
+    fn machine_cells(&self) -> Vec<Component> {
+        let gpus = u8::try_from(self.gpu_count).unwrap_or(u8::MAX);
+        let ssds = self.storage.as_ref().map_or(0, |plan| {
+            u8::try_from(plan.devices.len()).unwrap_or(u8::MAX)
+        });
+        let mut cells = Component::machine(gpus, 0);
+        cells.pop();
+        if let Some(plan) = &self.storage {
+            for device in &plan.devices {
+                let n = u8::try_from(device.alias).unwrap_or(u8::MAX);
+                cells.extend([Component::Ssd(n), Component::SsdPath(n)]);
+            }
+        } else if ssds > 0 {
+            cells.extend((1..=ssds).flat_map(|n| [Component::Ssd(n), Component::SsdPath(n)]));
+        }
+        cells.push(Component::Platform);
+        cells
+    }
+
+    /// Counts the failures of a layer that just ended on their component cells, from its report.
+    fn attribute(&mut self, ended: &Running, outcome: LayerOutcome, detail: &str, phase: &str) {
+        if outcome == LayerOutcome::Crashed {
+            self.ledger.add(fault_sources::crash(
+                layers::slug(ended.layer),
+                phase,
+                detail,
+            ));
+            return;
+        }
+        let Some(report) = layers::report_json(ended.layer, &ended.dir) else {
+            return;
+        };
+        let findings = match ended.layer {
+            Layer::CpuRam => fault_sources::cpu_ram(&report, phase),
+            Layer::Gpu => fault_sources::gpu(&report, phase, &|pci| self.gpu_number(pci)),
+            Layer::Ssd => fault_sources::ssd(&report, phase, &|id| self.ssd_number(id)),
+            Layer::Chain => {
+                let gpu = self.gpu_number(
+                    report
+                        .pointer("/gpu/pci")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                );
+                // The chain's records live on the first SSD of the plan.
+                let ssd = self
+                    .storage
+                    .as_ref()
+                    .and_then(|plan| plan.devices.first())
+                    .and_then(|device| u8::try_from(device.alias).ok())
+                    .unwrap_or(1);
+                fault_sources::chain(&report, phase, gpu, ssd)
+            }
+        };
+        self.ledger.add_all(findings.failures);
+        for event in &findings.hardware {
+            self.ledger.add_hardware(event);
+        }
+    }
+
+    /// One row of `fail-summary.csv` on the results volume (in the session directory without it).
+    fn append_fail_summary(&self, verdict: &str, report: &Path) -> String {
+        let root = &self.menu.results_root;
+        let path = if root.is_dir() {
+            root.join("fail-summary.csv")
+        } else {
+            self.dir.join("fail-summary.csv")
+        };
+        let system = &self.telemetry.system;
+        let meta = CsvMeta {
+            time: super::local_timestamp(),
+            image_id: super::image_id(),
+            test: format!(
+                "COMBINED {} {}",
+                self.settings.level.label(),
+                self.settings.intensity.label()
+            ),
+            board: system.board.clone(),
+            cpu: system.cpu.clone(),
+            memory: format_bytes(system.memory_total_bytes),
+            gpus: self
+                .telemetry
+                .gpus
+                .iter()
+                .map(|gpu| gpu.model.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+            ssds: self.storage.as_ref().map_or_else(String::new, |plan| {
+                plan.devices
+                    .iter()
+                    .map(|device| device.model.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }),
+            verdict: verdict.to_owned(),
+            report: format!(
+                "runs/{}/combined/{}",
+                self.run_id,
+                report
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            ),
+        };
+        match dit_orchestrator::fault_ledger::append_csv(&path, &self.ledger, &meta) {
+            Ok(()) => format!("Fail summary row added to {}", path.display()),
+            Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
+        }
     }
 
     fn phases_row(&self) -> String {
@@ -1246,6 +1385,13 @@ impl Session<'_> {
             calculations,
             chain,
             held_bytes: held,
+            fault_rows: vec![
+                self.ledger.fail_line(
+                    &self.machine_cells(),
+                    running.iter().map(|r| r.live.failures).sum(),
+                ),
+                self.ledger.hardware_line(),
+            ],
         }
     }
 
@@ -1307,6 +1453,7 @@ impl Session<'_> {
             calculations_total: self.totals.values().map(|t| t.calculations).sum(),
             memory_timeline: &self.timeline,
             elapsed_seconds: self.started.elapsed().as_secs_f64(),
+            fault_ledger: self.ledger.report(),
         };
         let path = self.dir.join("combined-report.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;

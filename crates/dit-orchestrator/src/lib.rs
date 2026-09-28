@@ -1,6 +1,8 @@
 //! Versioned module registry, report adapters and resource arbitration for the DIT suite.
 
 pub mod combined;
+pub mod fault_ledger;
+pub mod fault_sources;
 
 use dit_contracts::{SCHEMA_VERSION, Verdict};
 use serde::{Deserialize, Serialize};

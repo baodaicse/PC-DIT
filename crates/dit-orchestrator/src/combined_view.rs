@@ -243,6 +243,8 @@ pub struct SessionView {
     pub calculations: u64,
     pub chain: Option<ChainMeter>,
     pub held_bytes: u64,
+    /// `FAIL BY PART` and `HW EVENTS` lines of the fault ledger.
+    pub fault_rows: Vec<String>,
 }
 
 pub struct ChainMeter {
@@ -393,6 +395,7 @@ pub fn render(
             )
         })
         .collect();
+    running_rows.extend(view.fault_rows.iter().cloned());
     running_rows.push(view.phases_row.clone());
     #[allow(clippy::cast_precision_loss)]
     let progress = (view.planned_seconds > 0)
@@ -465,6 +468,10 @@ mod tests {
                 loads: 10,
             }),
             held_bytes: 1 << 30,
+            fault_rows: vec![
+                "FAIL BY PART  CPU 0 | RAM 0 | ? PCIe-GPU1|GPU1|VRAM1 1".into(),
+                "HW EVENTS     none recorded".into(),
+            ],
         };
         let frame = render(
             &view,
@@ -485,6 +492,8 @@ mod tests {
             "FAIL TOTAL  1",
             "PHASE 6/6 OVERLAP",
             "COMBINED / BOUNDED / balanced",
+            "FAIL BY PART",
+            "HW EVENTS",
         ] {
             assert!(frame.contains(needle), "{needle} missing:\n{frame}");
         }

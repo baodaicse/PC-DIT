@@ -630,6 +630,16 @@ pub fn live(layer: Layer, dir: &Path, tally: Option<&SsdTally>) -> LiveLayer {
     }
 }
 
+/// The layer's own report, parsed; `None` when it wrote none (or it is unreadable).
+#[must_use]
+pub fn report_json(layer: Layer, dir: &Path) -> Option<serde_json::Value> {
+    let name = match layer {
+        Layer::CpuRam => "system-report.json",
+        Layer::Gpu | Layer::Ssd | Layer::Chain => "report.json",
+    };
+    json(&dir.join(name))
+}
+
 /// Final outcome of a layer from its report; `Crashed` when there is none.
 #[must_use]
 pub fn outcome(layer: Layer, dir: &Path) -> (LayerOutcome, String) {

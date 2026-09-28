@@ -1,0 +1,110 @@
+{
+ "schema_version": 1,
+ "run_id": "sim-1790586040755-19987",
+ "started_unix_ms": 1790586040755,
+ "elapsed_seconds": 0.028803204,
+ "aggregate_verdict": "FAIL",
+ "selected_devices": 2,
+ "max_parallel_workers": 2,
+ "devices": [
+  {
+   "device_id": "memory:nvme-1",
+   "report": {
+    "schema_version": 1,
+    "run_id": "sim-1790586040755-19987",
+    "module_id": "dit.cpu-nvme",
+    "device_id": "memory:nvme-1",
+    "verdict": "FAIL",
+    "target_operations": 40,
+    "completed_operations": 40,
+    "bytes_written": 12492800,
+    "bytes_read": 12492800,
+    "bytes_verified": 12488704,
+    "seed_slots": 1,
+    "generations": 40,
+    "failure_count": 1,
+    "failures": [
+     {
+      "kind": "data_mismatch",
+      "operation": 5,
+      "offset_bytes": 2228224,
+      "detail": "deep block SHA-256 mismatch"
+     }
+    ],
+    "completion_reason": "failure",
+    "performance": {
+     "elapsed_seconds": 0.026178766,
+     "average_read_bytes_per_sec": 477211187.11248654,
+     "average_write_bytes_per_sec": 477211187.11248654,
+     "peak_read_bytes_per_sec": 62296577946.76806,
+     "peak_write_bytes_per_sec": 36735426008.96861
+    },
+    "deep": {
+     "pipeline_version": "deep-v1",
+     "block_format": "DITDEEP2",
+     "compute_workers": 7,
+     "matrix_rounds": 4,
+     "max_inflight_batches": 2,
+     "compute_jobs_completed": 420,
+     "matrix_checks_completed": 6099,
+     "write_operations_completed": 40,
+     "read_soak_operations": 0,
+     "prepare_cpu_ns": 53910583,
+     "verify_cpu_ns": 40777102,
+     "write_io_ns": 4356742,
+     "read_io_ns": 678539,
+     "compute_wait_ns": 19112963,
+     "duration_target_ms": 0,
+     "duration_target_met": false
+    }
+   },
+   "worker_error": null
+  },
+  {
+   "device_id": "memory:nvme-2",
+   "report": {
+    "schema_version": 1,
+    "run_id": "sim-1790586040755-19987",
+    "module_id": "dit.cpu-nvme",
+    "device_id": "memory:nvme-2",
+    "verdict": "PASS",
+    "target_operations": 40,
+    "completed_operations": 40,
+    "bytes_written": 12492800,
+    "bytes_read": 12492800,
+    "bytes_verified": 12492800,
+    "seed_slots": 1,
+    "generations": 40,
+    "failure_count": 0,
+    "failures": [],
+    "completion_reason": "operation_target",
+    "performance": {
+     "elapsed_seconds": 0.026024555,
+     "average_read_bytes_per_sec": 480038947.8321531,
+     "average_write_bytes_per_sec": 480038947.8321531,
+     "peak_read_bytes_per_sec": 63813047711.78188,
+     "peak_write_bytes_per_sec": 57136878814.29817
+    },
+    "deep": {
+     "pipeline_version": "deep-v1",
+     "block_format": "DITDEEP2",
+     "compute_workers": 7,
+     "matrix_rounds": 4,
+     "max_inflight_batches": 2,
+     "compute_jobs_completed": 420,
+     "matrix_checks_completed": 6100,
+     "write_operations_completed": 40,
+     "read_soak_operations": 0,
+     "prepare_cpu_ns": 56249130,
+     "verify_cpu_ns": 43418098,
+     "write_io_ns": 4967318,
+     "read_io_ns": 692676,
+     "compute_wait_ns": 17653567,
+     "duration_target_ms": 0,
+     "duration_target_met": false
+    }
+   },
+   "worker_error": null
+  }
+ ]
+}

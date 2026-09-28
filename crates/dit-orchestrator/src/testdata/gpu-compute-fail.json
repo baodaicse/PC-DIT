@@ -1,0 +1,54 @@
+{
+ "schema_version": 1,
+ "module_id": "dit.vga",
+ "verdict": "FAIL",
+ "failure_count": 1,
+ "failures": [
+  {
+   "generation": 0,
+   "seed": 1346066267577507604,
+   "phase": "compute",
+   "detail": "CUDA unavailable: matrix mismatch at 2: expected 0xaf0e0b05, actual 0xaf0e0b85 (burst: 1 failed batches, 512 mismatching words)"
+  }
+ ],
+ "detection": {
+  "link": {
+   "available": true,
+   "pci_address": "0000:08:00.0",
+   "samples": 12,
+   "at_start": {
+    "speed_gts": 8.0,
+    "width": 16,
+    "max_speed_gts": 8.0,
+    "max_width": 16
+   },
+   "at_end": {
+    "speed_gts": 8.0,
+    "width": 16,
+    "max_speed_gts": 8.0,
+    "max_width": 16
+   },
+   "min_speed_seen_gts": 8.0,
+   "max_speed_seen_gts": 8.0,
+   "min_width_seen": 16,
+   "max_width_seen": 16,
+   "aer_at_start": {
+    "correctable": 0,
+    "nonfatal": 0,
+    "fatal": 0
+   },
+   "aer_delta": {
+    "correctable": 0,
+    "nonfatal": 0,
+    "fatal": 0
+   }
+  }
+ },
+ "async_compute": {
+  "failure_attribution": "corpus_intact"
+ },
+ "selected_device": {
+  "pci_address": "0000:08:00.0",
+  "name": "NVIDIA GeForce GTX 960"
+ }
+}

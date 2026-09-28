@@ -1,0 +1,15 @@
+{
+ "schema_version": 1,
+ "module_id": "dit.chain",
+ "verdict": "FAIL",
+ "failure_count": 1,
+ "failures": [
+  {
+   "phase": "chain-gpu",
+   "record": 45,
+   "attribution": "gpu_vram_pcie",
+   "detail": "matrix mismatch at 2: expected 0x507aea1, actual 0x507ae21 (burst: 1 failed batches, 64 mismatching words)",
+   "at_seconds": 0.534278945
+  }
+ ]
+}

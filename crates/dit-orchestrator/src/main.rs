@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod combined_layers;
 mod combined_run;
 mod combined_view;
+mod fault_single;
 
 /// Set by Ctrl+C while the menu runs. Single modules ignore it (their own watchdog handles the
 /// stop); the combined run reads it to drain every layer and end the session.
@@ -262,8 +263,16 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         write_new_json(&suite_dir.join("suite-report.json"), &report)?;
         format!(
-            "CPU-SSD completed with {}.",
-            verdict_name(report.aggregate_verdict)
+            "CPU-SSD completed with {}.\n{}",
+            verdict_name(report.aggregate_verdict),
+            fault_single::summarize(
+                fault_single::SingleModule::Ssd,
+                &nvme_report,
+                &args.results_root,
+                &suite_dir,
+                &suite_run_id,
+                verdict_name(report.aggregate_verdict),
+            )
         )
     } else if !nvme_status.success() {
         "CPU-SSD was aborted or failed before a final report was written.".to_owned()
@@ -517,6 +526,15 @@ fn launch_gpu(
             message.push('\n');
             message.push_str(&tensor_check_verdict(&report));
         }
+        message.push('\n');
+        message.push_str(&fault_single::summarize(
+            fault_single::SingleModule::Gpu,
+            &report_path,
+            &args.results_root,
+            &suite_dir,
+            &suite_run_id,
+            verdict_name(report.verdict),
+        ));
         message
     } else if status.success() {
         "GPU-VRAM stopped without a final report.".to_owned()
@@ -850,6 +868,33 @@ fn unique_id(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     format!("{prefix}-{stamp}-{}", std::process::id())
+}
+
+/// Local time as `YYYY-MM-DD HH:MM:SS +ZZZZ` (the image's clock; `date` keeps the zone rules).
+fn local_timestamp() -> String {
+    ProcessCommand::new("date")
+        .arg("+%Y-%m-%d %H:%M:%S %z")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or_else(
+            || {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+                    .to_string()
+            },
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )
+}
+
+/// The booted image's ID (`/etc/cpu-dit/image-id`), or `dev` outside the image.
+fn image_id() -> String {
+    fs::read_to_string("/etc/cpu-dit/image-id")
+        .map(|id| id.trim().to_owned())
+        .ok()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "dev".to_owned())
 }
 
 fn available_memory_bytes() -> Option<u64> {

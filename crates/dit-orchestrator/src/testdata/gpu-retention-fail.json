@@ -1,0 +1,42 @@
+{
+ "schema_version": 1,
+ "module_id": "dit.vga",
+ "verdict": "FAIL",
+ "failure_count": 5,
+ "failures": [
+  {
+   "generation": 5,
+   "seed": 8928214238356935090,
+   "phase": "retention",
+   "detail": "transfer mismatch at byte 5701632: expected=0xc9, actual=0x31"
+  },
+  {
+   "generation": 6,
+   "seed": 8928214238356935090,
+   "phase": "retention",
+   "detail": "transfer mismatch at byte 0: expected=0xb1, actual=0x04"
+  },
+  {
+   "generation": 7,
+   "seed": 8928214238356935090,
+   "phase": "retention",
+   "detail": "transfer mismatch at byte 0: expected=0x04, actual=0xca"
+  },
+  {
+   "generation": 13,
+   "seed": 8928214238356935090,
+   "phase": "retention",
+   "detail": "transfer mismatch at byte 5701632: expected=0xbd, actual=0x69"
+  },
+  {
+   "generation": 14,
+   "seed": 8928214238356935090,
+   "phase": "retention-final",
+   "detail": "transfer mismatch at byte 0: expected=0x41, actual=0xe2"
+  }
+ ],
+ "selected_device": {
+  "pci_address": "0000:08:00.0",
+  "name": "NVIDIA GeForce GTX 960"
+ }
+}

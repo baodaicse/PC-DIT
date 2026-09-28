@@ -1,0 +1,92 @@
+{
+ "schema_version": 1,
+ "module_id": "dit.vga",
+ "verdict": "FAIL",
+ "failure_count": 1,
+ "failures": [
+  {
+   "generation": 45,
+   "seed": 1346066267577507604,
+   "phase": "hardware",
+   "detail": "NVIDIA Xid 48"
+  }
+ ],
+ "hardware_status": "errors",
+ "detection": {
+  "link": {
+   "available": true,
+   "pci_address": "0000:08:00.0",
+   "samples": 47,
+   "at_start": {
+    "speed_gts": 8.0,
+    "width": 16,
+    "max_speed_gts": 8.0,
+    "max_width": 16
+   },
+   "at_end": {
+    "speed_gts": 8.0,
+    "width": 16,
+    "max_speed_gts": 8.0,
+    "max_width": 16
+   },
+   "min_speed_seen_gts": 8.0,
+   "max_speed_seen_gts": 8.0,
+   "min_width_seen": 16,
+   "max_width_seen": 16,
+   "aer_at_start": {
+    "correctable": 0,
+    "nonfatal": 0,
+    "fatal": 0
+   },
+   "aer_delta": {
+    "correctable": 0,
+    "nonfatal": 0,
+    "fatal": 0
+   },
+   "upstream_port": "0000:00:03.1",
+   "upstream_aer_delta": {
+    "correctable": 0,
+    "nonfatal": 0,
+    "fatal": 0
+   }
+  },
+  "ecc": {
+   "available": false,
+   "at_start": {
+    "mode": null,
+    "corrected_volatile": null,
+    "uncorrected_volatile": null,
+    "remapped_rows_pending": null,
+    "remapped_rows_failure": null
+   },
+   "at_end": {
+    "mode": null,
+    "corrected_volatile": null,
+    "uncorrected_volatile": null,
+    "remapped_rows_pending": null,
+    "remapped_rows_failure": null
+   },
+   "corrected_delta": null,
+   "uncorrected_delta": null,
+   "note": "ECC not reported by this card/driver (GeForce reports N/A; GDDR on-die ECC corrects silently)"
+  },
+  "hardware_health": {
+   "status": "errors",
+   "warnings": 0,
+   "errors": 1,
+   "reasons": [
+    "NVIDIA Xid 48"
+   ],
+   "sources_unavailable": [
+    "GPU ECC counters"
+   ]
+  }
+ },
+ "async_compute": {
+  "failure_attribution": null
+ },
+ "selected_device": {
+  "pci_address": "0000:08:00.0",
+  "name": "NVIDIA GeForce GTX 960"
+ }
+}

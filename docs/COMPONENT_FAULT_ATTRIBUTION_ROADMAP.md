@@ -238,7 +238,8 @@ V = vừa (log / điểm nối), C = cao (đường dữ liệu).
 | File | Loại | Thay đổi | Rủi ro |
 |---|---|---|---|
 | `crates/dit-orchestrator/src/fault_ledger.rs` | MỚI | ô, sự kiện, mức chắc chắn; bảng map attribution cũ → ô; đếm, khử trùng lặp, bão lỗi; dòng CSV; unit test | T |
-| `crates/dit-orchestrator/src/fault_sources.rs` | MỚI | đọc report từng lớp (CPU-RAM `system-report.json`, GPU `report.json`, SSD `events.jsonl`, chuỗi `report.json`) → sự kiện | T |
+| `crates/dit-orchestrator/src/fault_sources.rs` | MỚI | đọc report từng lớp (CPU-RAM `system-report.json`, GPU `report.json`, SSD `report.json`, chuỗi `report.json`) → sự kiện; nằm trong lib để test bằng report thật | T |
+| `crates/dit-orchestrator/src/fault_single.rs` | MỚI | test đơn lẻ GPU-VRAM / CPU-SSD: hai dòng sổ lỗi trên màn hình kết quả + dòng CSV | T |
 | `crates/dit-orchestrator/src/testdata/` | MỚI | report mẫu (có lỗi / không lỗi) cho test | T |
 | `crates/dit-orchestrator/src/lib.rs` (506) | SỬA | `pub mod fault_ledger;` | T |
 | `crates/dit-orchestrator/src/combined_run.rs` (1362) | SỬA | điểm nối: đưa sự kiện vào sổ khi mỗi lớp kết thúc; `fault_ledger` trong `combined-report.json`; ghi CSV | V |
@@ -328,3 +329,23 @@ Tổng: **9 file mới** (và thư mục `testdata/`), **25 file sửa**. 7 file
 
 Mỗi bước kết thúc bằng: `make test` → test phần cứng → chạy lại các bài kiểm của combined (chèn lỗi, crash, Ctrl+C) →
 build ISO → chạy trên máy thật → tag (`f0-done`, `f2-done`…). Image ổn định trong `dist/stable/` luôn sẵn để quay lại.
+
+## 8. Tiến độ
+
+### F0 — xong (2026-09-28, nhánh `f0-fault-ledger`)
+
+| Hạng mục | Kết quả |
+|---|---|
+| Sổ lỗi | `fault_ledger.rs`: ô, mức chắc chắn, đếm theo pha, giữ chi tiết tối đa 64 sự kiện mỗi ô (bão lỗi vẫn đếm đủ), hai dòng hiển thị, CSV |
+| Quy ô từ report | `fault_sources.rs`: CPU-RAM (KAT / coherency / SIMD / compute oracle → `CPU` xác định; mẫu RAM → `RAM` nghi ngờ, đếm theo vòng verify lỗi; EDAC UE → `RAM`; crash → `PLATFORM`); GPU (theo detector: sweep và vram-self-check → `VRAM` xác định; transfer / retention / checkpoint → `PCIe-GPU\|VRAM`; compute → `PCIe-GPU\|GPU\|VRAM`, đếm theo số batch trong burst; host corpus đổi → `RAM`; Xid 48/63/64/92/94/95 → `VRAM`, 79 → `PCIe-GPU\|PLATFORM`, AER → `PCIe-GPU`); SSD (mọi lỗi dữ liệu và I/O → `SSD\|SSD-path` cho tới F4); chuỗi (theo cây xác nhận của nó); lớp không có report → `PLATFORM`. Sự kiện phần cứng: AER hai đầu, link tụt độ rộng, ECC, cảnh báo kernel, EDAC CE, MCE, throttle, OOM |
+| COMBINED | quy ô khi mỗi lớp kết thúc; màn hình có `FAIL BY PART` (lỗi của lớp đang chạy hiện là `pending`) và `HW EVENTS`; `fault_ledger` trong `combined-report.json`; một dòng `fail-summary.csv` mỗi phiên trên phân vùng kết quả |
+| Test đơn lẻ | GPU-VRAM và CPU-SSD: hai dòng sổ lỗi dưới thông báo kết quả + dòng CSV |
+| Kiểm | 21 test lib (fixture là report thật: GPU compute lỗi, Xid 48, retention lỗi, chuỗi lỗi GPU, SSD bit-flip) + test đơn lẻ; phiên COMBINED thật với lỗi chèn vào CPU-RAM: `FAIL BY PART CPU 1`, CSV `cpu_fail=1, confirmed=1`; phiên PASS ghi toàn 0; `make test` pass |
+
+Giới hạn còn lại của F0:
+- Quy ô khi lớp kết thúc (đọc report); F1 sẽ quy ngay khi lỗi xảy ra.
+- CPU-RAM chạy đơn lẻ (UI bash) chưa ghi CSV.
+- Trên máy phát triển, driver NVIDIA chưa build cho kernel 7.0.0-34 nên phiên thật chưa có lớp GPU. Các luật GPU và chuỗi
+  được kiểm bằng report thật chụp trên GTX 960.
+
+Tiếp theo: **F2** (đo phần cứng và tương quan).
