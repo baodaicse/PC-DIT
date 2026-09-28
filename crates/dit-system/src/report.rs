@@ -127,6 +127,10 @@ pub struct SystemMismatch {
     pub xor_syndrome: u8,
     pub writer_cpu: Option<usize>,
     pub verifier_cpu: Option<usize>,
+    /// Confirmation of this mismatch (component fault ledger, step F4): `verifier_core`,
+    /// `transient`, `rewrite_fixed` or `cell_persistent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

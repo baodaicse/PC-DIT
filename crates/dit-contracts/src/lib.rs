@@ -122,6 +122,9 @@ pub enum Event {
         operation: u64,
         offset_bytes: u64,
         detail: String,
+        /// Result of the immediate confirmation (re-check, re-read), when it ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirm: Option<String>,
     },
     Warning {
         code: String,
@@ -177,6 +180,10 @@ pub struct FailureRecord {
     pub operation: u64,
     pub offset_bytes: u64,
     pub detail: String,
+    /// Result of the immediate confirmation (re-check, re-read), when it ran: `recheck_clean`,
+    /// `reread_clean`, `reread_same` or `reread_differs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

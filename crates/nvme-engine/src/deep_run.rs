@@ -34,6 +34,20 @@ impl Counters {
         detail: &str,
         emit: &mut impl FnMut(Event),
     ) {
+        self.fail_confirmed(config, kind, operation, offset, detail, None, emit);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_confirmed(
+        &mut self,
+        config: &RunConfig,
+        kind: FailureKind,
+        operation: u64,
+        offset: u64,
+        detail: &str,
+        confirm: Option<&str>,
+        emit: &mut impl FnMut(Event),
+    ) {
         record_failure(
             &mut self.failures,
             &mut self.failure_count,
@@ -42,6 +56,7 @@ impl Counters {
             operation,
             offset,
             detail,
+            confirm,
             emit,
         );
     }
@@ -63,8 +78,20 @@ impl Counters {
         result: &BatchResult,
         emit: &mut impl FnMut(Event),
     ) {
-        for (block, error) in &result.errors {
-            self.fail(
+        self.batch_errors_confirmed(config, operation, result, &[], emit);
+    }
+
+    /// `confirms[i]` is the confirmation of `result.errors[i]` (empty: none ran).
+    fn batch_errors_confirmed(
+        &mut self,
+        config: &RunConfig,
+        operation: &OperationSpec,
+        result: &BatchResult,
+        confirms: &[Option<&'static str>],
+        emit: &mut impl FnMut(Event),
+    ) {
+        for (position, (block, error)) in result.errors.iter().enumerate() {
+            self.fail_confirmed(
                 config,
                 if error.contains("panic") {
                     FailureKind::Internal
@@ -74,6 +101,7 @@ impl Counters {
                 operation.index,
                 operation.lba * BLOCK_SIZE as u64 + (*block * BLOCK_SIZE) as u64,
                 error,
+                confirms.get(position).copied().flatten(),
                 emit,
             );
         }
@@ -108,6 +136,73 @@ impl Counters {
             evidence: self.deep.clone(),
         });
     }
+}
+
+/// Confirmations of every failed block of a batch (empty when confirmation is off).
+fn confirmations<B: StorageBackend>(
+    backend: &mut B,
+    first: Option<&[u8]>,
+    result: &BatchResult,
+    operation: &OperationSpec,
+    config: &RunConfig,
+    offset: u64,
+) -> Vec<Option<&'static str>> {
+    let Some(first) = first.filter(|_| !result.errors.is_empty()) else {
+        return Vec::new();
+    };
+    let contexts = operation_contexts(operation, &config.device_id);
+    result
+        .errors
+        .iter()
+        .map(|(block, error)| {
+            (!error.contains("panic"))
+                .then(|| {
+                    confirm_block(
+                        backend,
+                        offset,
+                        *block,
+                        first,
+                        &contexts,
+                        config.matrix_rounds,
+                    )
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+/// Confirmation of a block that failed its check (fault ledger F4): the same bytes checked again
+/// (right now: the first check computed wrong, `recheck_clean`), then the block read again from
+/// the device (right: the first read went wrong on its way, `reread_clean`; the same wrong bytes:
+/// the stored data is wrong, `reread_same`; other wrong bytes: an unstable read path,
+/// `reread_differs`).
+fn confirm_block<B: StorageBackend>(
+    backend: &mut B,
+    offset: u64,
+    block: usize,
+    first: &[u8],
+    contexts: &[dit_source::BlockContext],
+    rounds: u32,
+) -> Option<&'static str> {
+    let range = block * BLOCK_SIZE..(block + 1) * BLOCK_SIZE;
+    let first_block = first.get(range)?;
+    let context = contexts.get(block)?;
+    if super::deep_block::verify(first_block, context, rounds, false, false, false).is_ok() {
+        return Some("recheck_clean");
+    }
+    let mut again = vec![0; BLOCK_SIZE];
+    backend
+        .read_exact_at(offset + (block * BLOCK_SIZE) as u64, &mut again)
+        .ok()?;
+    Some(
+        if super::deep_block::verify(&again, context, rounds, false, false, false).is_ok() {
+            "reread_clean"
+        } else if again == first_block {
+            "reread_same"
+        } else {
+            "reread_differs"
+        },
+    )
 }
 
 fn expired(config: &RunConfig, started: Instant) -> bool {
@@ -218,6 +313,8 @@ fn read_and_verify<B: StorageBackend>(
         phase: Phase::Verifying,
         operation: counters.completed,
     });
+    // Kept only for the confirmation of a block that fails (fault ledger F4).
+    let first = config.confirm_on_fail.then(|| buffer.clone());
     let ticket = pool
         .verify(
             operation_contexts(operation, &config.device_id),
@@ -238,7 +335,15 @@ fn read_and_verify<B: StorageBackend>(
         emit,
     )?;
     counters.compute(&result, false);
-    counters.batch_errors(config, operation, &result, emit);
+    let confirms = confirmations(
+        backend,
+        first.as_deref(),
+        &result,
+        operation,
+        config,
+        offset,
+    );
+    counters.batch_errors_confirmed(config, operation, &result, &confirms, emit);
     counters.verified += result.verified_blocks * BLOCK_SIZE as u64;
     counters.completed += 1;
     if soak {

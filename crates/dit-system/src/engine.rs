@@ -120,6 +120,7 @@ impl SeedSource {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // Independent run switches stay explicit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemRunConfig {
     pub test_id: String,
@@ -153,6 +154,9 @@ pub struct SystemRunConfig {
     pub fault_injection_compute_oracle_worker: Option<usize>,
     /// Step F1 of the component fault ledger: one JSON line per failure as it is found.
     pub fault_events_path: Option<PathBuf>,
+    /// Step F4: a RAM mismatch is re-read from other CPUs and rewritten to tell the verifying
+    /// core, a transient read, a value held wrong and a failing cell apart.
+    pub confirm_on_fail: bool,
 }
 
 impl SystemRunConfig {
@@ -261,6 +265,7 @@ pub fn run_system(
     // The rerun only reproduces; its failures are not new ones (no live fault records).
     let rerun_config = SystemRunConfig {
         fault_events_path: None,
+        confirm_on_fail: false,
         ..config.clone()
     };
     let rerun = run_system_once(source, &rerun_config);
@@ -345,6 +350,7 @@ fn run_system_once(
         + u64::from(coherency.actual != coherency.expected);
     counters.add(4, cpu_failures);
     let faults = FaultWriter::new(config.fault_events_path.as_deref());
+    let mut confirm_budget = MAX_CONFIRMATIONS;
     if cpu_tests_completed {
         for (failed, source) in [
             (!integer_kat, "cpu:integer_kat"),
@@ -570,7 +576,7 @@ fn run_system_once(
             &counters,
         );
         let read_buckets = distribute_for_verify(arenas, &worker_cpus);
-        let read_results = run_verify_phase(
+        let mut read_results = run_verify_phase(
             read_buckets,
             &worker_cpus,
             &source_bytes,
@@ -581,6 +587,13 @@ fn run_system_once(
             &control,
             &counters,
         )?;
+        if config.confirm_on_fail {
+            confirm_mismatches(
+                &mut read_results,
+                &inventory.cpu.allowed_cpu_ids,
+                &mut confirm_budget,
+            );
+        }
         emit_verify_faults(&faults, &read_results, round);
         let round_mismatch = read_results
             .iter()
@@ -1090,6 +1103,102 @@ fn write_worker(
     }
 }
 
+/// RAM mismatches confirmed per run, at most (each one pins and evicts; a storm stays cheap).
+const MAX_CONFIRMATIONS: usize = 8;
+/// Bytes of other arenas read between steps so the next read of the byte comes from DRAM.
+const EVICT_BYTES: usize = 128 << 20;
+
+/// Step F4: confirms the first mismatch of each failing worker of a verify phase.
+fn confirm_mismatches(results: &mut [BatchResult], allowed: &[usize], budget: &mut usize) {
+    for index in 0..results.len() {
+        let Some(mismatch) = results[index].mismatch.clone() else {
+            continue;
+        };
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let outcome = confirm_one(results, &mismatch, allowed);
+        if let Some(found) = results[index].mismatch.as_mut() {
+            found.confirm = outcome.map(str::to_owned);
+        }
+    }
+}
+
+fn locate_arena(results: &[BatchResult], arena_id: usize) -> Option<(usize, usize)> {
+    results.iter().enumerate().find_map(|(r, result)| {
+        result
+            .arenas
+            .iter()
+            .position(|arena| arena.id == arena_id)
+            .map(|a| (r, a))
+    })
+}
+
+/// Reads up to [`EVICT_BYTES`] of the other arenas (one byte per cache line).
+fn evict_caches(results: &[BatchResult], skip: (usize, usize)) {
+    let mut left = EVICT_BYTES;
+    let mut sum = 0_u64;
+    for (r, result) in results.iter().enumerate() {
+        for (a, arena) in result.arenas.iter().enumerate() {
+            if (r, a) == skip || left == 0 {
+                continue;
+            }
+            let take = arena.map.len().min(left);
+            for index in (0..take).step_by(64) {
+                sum = sum.wrapping_add(u64::from(arena.map[index]));
+            }
+            left -= take;
+        }
+    }
+    std::hint::black_box(sum);
+}
+
+/// Re-reads the byte from another CPU after evicting the caches; right there, reads it again
+/// from the verifying CPU (`verifier_core` when still wrong, else `transient`); wrong there too,
+/// rewrites it and reads it back (`rewrite_fixed` or `cell_persistent`). The thread's CPU set is
+/// restored afterwards; the next round rewrites every arena anyway.
+fn confirm_one(
+    results: &mut [BatchResult],
+    mismatch: &SystemMismatch,
+    allowed: &[usize],
+) -> Option<&'static str> {
+    let (r, a) = locate_arena(results, mismatch.arena_id)?;
+    let offset = usize::try_from(mismatch.arena_offset).ok()?;
+    let verifier = mismatch.verifier_cpu?;
+    let other = allowed
+        .iter()
+        .copied()
+        .find(|cpu| *cpu != verifier && Some(*cpu) != mismatch.writer_cpu)
+        .or_else(|| allowed.iter().copied().find(|cpu| *cpu != verifier))?;
+    let original = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).ok();
+    let read = |results: &[BatchResult]| std::hint::black_box(results[r].arenas[a].map[offset]);
+    let outcome = (|| {
+        pin_current_thread(other).ok()?;
+        evict_caches(results, (r, a));
+        if read(results) == mismatch.expected {
+            pin_current_thread(verifier).ok()?;
+            evict_caches(results, (r, a));
+            return Some(if read(results) == mismatch.expected {
+                "transient"
+            } else {
+                "verifier_core"
+            });
+        }
+        results[r].arenas[a].map[offset] = mismatch.expected;
+        evict_caches(results, (r, a));
+        Some(if read(results) == mismatch.expected {
+            "rewrite_fixed"
+        } else {
+            "cell_persistent"
+        })
+    })();
+    if let Some(set) = original {
+        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set);
+    }
+    outcome
+}
+
 /// Live fault records of one phase's worker results (step F1): the first RAM mismatch of each
 /// failing worker, SIMD/scalar disagreements and worker crashes.
 fn emit_verify_faults(faults: &FaultWriter, results: &[BatchResult], round: u32) {
@@ -1115,6 +1224,7 @@ fn emit_verify_faults(faults: &FaultWriter, results: &[BatchResult], round: u32)
                 )
                 .evidence("global_offset", m.global_offset.to_string())
                 .evidence("syndrome", m.xor_syndrome.to_string())
+                .evidence("confirm", m.confirm.clone().unwrap_or_default())
                 .evidence("verifier_cpu", m.verifier_cpu.map_or_else(String::new, |c| c.to_string()))
                 .evidence("writer_cpu", m.writer_cpu.map_or_else(String::new, |c| c.to_string())),
             );
@@ -1458,6 +1568,7 @@ fn window_mismatch(
         xor_syndrome: expected ^ actual,
         writer_cpu: arena.last_writer_cpu,
         verifier_cpu: Some(verifier_cpu),
+        confirm: None,
     }
 }
 
@@ -1872,6 +1983,7 @@ mod tests {
             compute_oracle_idle_sleep_ms: 0,
             fault_injection_compute_oracle_worker: None,
             fault_events_path: None,
+            confirm_on_fail: false,
         };
         assert!(config.validate().is_err());
     }

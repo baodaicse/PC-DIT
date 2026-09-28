@@ -628,6 +628,11 @@ pub fn ssd_confirmed(confirm: &str, ssd: u8) -> Option<(Attribution, &'static st
             Attribution::Confirmed(Component::Ssd(ssd)),
             "ssd/reread_stored",
         ),
+        // The same bytes passed when checked again: the first check was computed wrong.
+        "recheck_clean" => (
+            Attribution::Unresolved(vec![Component::Cpu, Component::Ram]),
+            "ssd/recheck_clean",
+        ),
         _ => return None,
     })
 }

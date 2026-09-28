@@ -81,6 +81,10 @@ PROFILE="${PROFILE:-menu}"
 if [[ "$PROFILE" == menu ]]; then
     if [[ -x /usr/local/bin/dit-suite ]]; then
         MENU_ARGS=(menu)
+        # Component fault ledger F3/F4 confirmation steps: off unless dit_attribution=1.
+        if [[ "$(cmdline_value dit_attribution || true)" == 1 ]]; then
+            MENU_ARGS+=(--attribution-checks)
+        fi
         BOOT_PARTITION="$(find_boot_device || true)"
         RESULT_PARTITION="$(find_result_partition || true)"
         if [[ -n "$BOOT_PARTITION" ]]; then

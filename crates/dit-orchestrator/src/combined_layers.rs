@@ -590,6 +590,7 @@ impl SsdTally {
                     kind,
                     offset_bytes,
                     detail,
+                    confirm,
                     ..
                 } => {
                     device.failure_events += 1;
@@ -605,6 +606,9 @@ impl SsdTally {
                         )
                         .device(stable_id),
                     );
+                    if let (Some(confirm), Some(record)) = (confirm, self.records.last_mut()) {
+                        record.evidence.insert("confirm".to_owned(), confirm);
+                    }
                 }
                 Event::Completed { failures, .. } => {
                     device.failures = device.failures.max(failures);
@@ -917,6 +921,7 @@ mod tests {
                 operation: 3,
                 offset_bytes: 0,
                 detail: "x".into(),
+                confirm: None,
             },
         );
         // The second line arrives in two pieces.

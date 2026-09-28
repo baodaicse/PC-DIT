@@ -69,6 +69,11 @@ struct MenuArgs {
     /// Device nodes belonging to the boot/results medium. Forwarded to CPU-SSD inventory.
     #[arg(long = "protected-device")]
     protected_devices: Vec<PathBuf>,
+    /// Confirmation steps that touch the data path of the tests (component fault ledger, F3
+    /// GPU boundary checks and F4 confirm-on-fail). Off until validated on real machines; the
+    /// boot menu turns it on with the kernel parameter `dit_attribution=1`.
+    #[arg(long)]
+    attribution_checks: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -247,6 +252,9 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
         .arg("interactive")
         .arg("--output-dir")
         .arg(&suite_dir);
+    if args.attribution_checks {
+        command.arg("--confirm-on-fail");
+    }
     for device in &args.protected_devices {
         command.arg("--protected-device").arg(device);
     }

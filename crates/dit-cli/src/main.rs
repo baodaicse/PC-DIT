@@ -428,6 +428,10 @@ struct SystemRunArgs {
     /// Appends one JSON line per failure as it is found (component fault ledger, step F1).
     #[arg(long)]
     fault_events: Option<PathBuf>,
+
+    /// Confirms a RAM mismatch at once from other CPUs (component fault ledger, step F4).
+    #[arg(long)]
+    confirm_on_fail: bool,
 }
 
 fn main() -> ExitCode {
@@ -719,6 +723,7 @@ fn system_run(args: &SystemRunArgs) -> u8 {
         compute_oracle_idle_sleep_ms: args.compute_oracle_idle_sleep_ms,
         fault_injection_compute_oracle_worker: args.inject_compute_oracle_worker,
         fault_events_path: args.fault_events.clone(),
+        confirm_on_fail: args.confirm_on_fail,
     };
     let report = match run_system(&source, &config) {
         Ok(report) => report,

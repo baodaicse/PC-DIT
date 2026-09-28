@@ -148,6 +148,9 @@ pub struct RunConfig {
     pub sustain_until_deadline: bool,
     pub compute_workers: usize,
     pub matrix_rounds: u32,
+    /// A block that fails its check is checked again and re-read at once, and the record says
+    /// which of the verifying CPU, the read path or the stored data was wrong (fault ledger F4).
+    pub confirm_on_fail: bool,
 }
 
 impl RunConfig {
@@ -163,6 +166,7 @@ impl RunConfig {
             sustain_until_deadline: false,
             compute_workers: 1,
             matrix_rounds: 4,
+            confirm_on_fail: false,
         }
     }
 }
@@ -289,6 +293,7 @@ fn record_failure<F>(
     operation: u64,
     offset_bytes: u64,
     detail: &str,
+    confirm: Option<&str>,
     emit: &mut F,
 ) where
     F: FnMut(Event),
@@ -299,6 +304,7 @@ fn record_failure<F>(
         operation,
         offset_bytes,
         detail: detail.to_owned(),
+        confirm: confirm.map(str::to_owned),
     });
     if failures.len() < max_records {
         failures.push(FailureRecord {
@@ -306,6 +312,7 @@ fn record_failure<F>(
             operation,
             offset_bytes,
             detail: detail.to_owned(),
+            confirm: confirm.map(str::to_owned),
         });
     }
 }

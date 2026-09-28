@@ -411,6 +411,10 @@ struct MultiSimulateArgs {
     events: Option<PathBuf>,
     #[arg(long)]
     report: PathBuf,
+    /// Check a failing block again and re-read it at once, and record which of the verifying
+    /// CPU, the read path or the stored data was wrong (component fault ledger, step F4).
+    #[arg(long)]
+    confirm_on_fail: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -451,6 +455,10 @@ struct RunPreservingMultiArgs {
     events: Option<PathBuf>,
     #[arg(long)]
     report: PathBuf,
+    /// Check a failing block again and re-read it at once, and record which of the verifying
+    /// CPU, the read path or the stored data was wrong (component fault ledger, step F4).
+    #[arg(long)]
+    confirm_on_fail: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -480,6 +488,9 @@ struct InteractiveArgs {
     max_workers: usize,
     #[arg(long, default_value_t = 8)]
     ui_fps: u32,
+    /// Confirm a failing block at once (component fault ledger, step F4).
+    #[arg(long)]
+    confirm_on_fail: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -943,6 +954,7 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         ui_fps: args.ui_fps,
         events: Some(events_path),
         report: report_path,
+        confirm_on_fail: args.confirm_on_fail,
     };
     let outcome = run_preserving_multi_command(&run_args);
     let cleanup = areas.cleanup();
@@ -1186,6 +1198,7 @@ fn multi_simulate_command(
             device_seed,
         );
         let mut config = RunConfig::new(run_id.clone(), device_id.clone(), plan);
+        config.confirm_on_fail = args.confirm_on_fail;
         config.wall_clock_limit = Some(Duration::from_secs(duration_seconds));
         config.sustain_until_deadline = args.operations.is_none();
         config.compute_workers = compute_workers;
@@ -1418,6 +1431,7 @@ fn run_preserving_multi_command(
                 device_seed,
             );
             let mut config = RunConfig::new(run_id.clone(), namespace.stable_id.clone(), coverage);
+            config.confirm_on_fail = args.confirm_on_fail;
             config.wall_clock_limit = Some(Duration::from_secs(duration_seconds));
             config.sustain_until_deadline = true;
             config.compute_workers = compute_workers;

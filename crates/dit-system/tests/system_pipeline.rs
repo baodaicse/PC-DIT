@@ -43,6 +43,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
         compute_oracle_idle_sleep_ms: 0,
         fault_injection_compute_oracle_worker: None,
         fault_events_path: None,
+        confirm_on_fail: false,
     }
 }
 
