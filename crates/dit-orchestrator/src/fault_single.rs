@@ -2,6 +2,7 @@
 //! counted on component cells, two lines for the completion screen and one `fail-summary.csv`
 //! row on the results volume, like a combined session.
 use dit_orchestrator::fault_ledger::{Component, CsvMeta, Ledger, append_csv};
+use dit_orchestrator::fault_signatures;
 use dit_orchestrator::fault_sources;
 use dit_ui_core::HostSampler;
 use serde_json::Value;
@@ -117,6 +118,8 @@ pub fn summarize(
     for event in &findings.hardware {
         ledger.add_hardware(event);
     }
+    // Step F6 on what the report gives: addresses, bits and hardware counts (no timing).
+    fault_signatures::rank(&mut ledger, &fault_signatures::Context::default());
     let system = HostSampler::detect().system_info();
     let meta = CsvMeta {
         time: super::local_timestamp(),
@@ -164,10 +167,10 @@ mod tests {
             "suite-gpu-1",
             "FAIL",
         );
+        // The rules leave retention failures on `PCIe-GPU1|VRAM1`; the five failures sit on two
+        // byte offsets only (0 and 5701632), so the ranking (F6) moves them to VRAM1 as suspected.
         assert!(
-            text.starts_with(
-                "FAIL BY PART  PCIe-GPU1 0 | GPU1 0 | VRAM1 0 | PLATFORM 0 | ? PCIe-GPU1|VRAM1 5"
-            ),
+            text.starts_with("FAIL BY PART  PCIe-GPU1 0 | GPU1 0 | VRAM1 5 (5 susp) | PLATFORM 0"),
             "{text}"
         );
         let csv = std::fs::read_to_string(dir.join("fail-summary.csv")).unwrap();

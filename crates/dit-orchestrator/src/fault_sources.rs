@@ -1035,14 +1035,18 @@ pub fn from_record(
                 ),
                 _ => (Attribution::Confirmed(Component::Cpu), "cpu-ram/cpu_check"),
             };
-            vec![FaultEvent::new(
-                CPU_RAM,
-                record.source.clone(),
-                record.count,
-                attribution,
-                rule,
-                record.detail.clone(),
-            )]
+            let number = |key: &str| evidence(key).and_then(|v| v.parse::<u64>().ok());
+            vec![
+                FaultEvent::new(
+                    CPU_RAM,
+                    record.source.clone(),
+                    record.count,
+                    attribution,
+                    rule,
+                    record.detail.clone(),
+                )
+                .located(number("global_offset"), number("syndrome")),
+            ]
         }
     }
 }

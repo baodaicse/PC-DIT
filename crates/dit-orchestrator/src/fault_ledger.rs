@@ -163,6 +163,11 @@ pub struct FaultEvent {
     /// Seconds since the session started, for failures seen live (step F1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_seconds: Option<f64>,
+    /// Where the failure was (byte offset) and which bits differed, when the source says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syndrome: Option<u64>,
     #[serde(skip)]
     attribution: Attribution,
 }
@@ -193,6 +198,8 @@ impl FaultEvent {
             rule,
             detail: detail.into(),
             at_seconds: None,
+            address: None,
+            syndrome: None,
             attribution,
         }
     }
@@ -206,6 +213,14 @@ impl FaultEvent {
     #[must_use]
     pub fn at(mut self, seconds: f64) -> Self {
         self.at_seconds = Some(seconds);
+        self
+    }
+
+    /// Byte offset and XOR syndrome given by the source's own evidence.
+    #[must_use]
+    pub const fn located(mut self, address: Option<u64>, syndrome: Option<u64>) -> Self {
+        self.address = address;
+        self.syndrome = syndrome;
         self
     }
 
@@ -265,12 +280,15 @@ pub struct Ledger {
 #[derive(Clone, Debug)]
 pub struct Occurrence {
     pub at_seconds: Option<f64>,
+    pub layer: &'static str,
     pub phase: String,
     pub source: String,
     pub candidates: Vec<Component>,
     pub confidence: Confidence,
     pub count: u64,
     pub detail: String,
+    pub address: Option<u64>,
+    pub syndrome: Option<u64>,
 }
 
 const OCCURRENCE_CAP: usize = 8192;
@@ -278,6 +296,7 @@ const OCCURRENCE_CAP: usize = 8192;
 /// An unresolved group moved to a suspected cell by the evidence ranking (step F6).
 #[derive(Clone, Debug, Serialize)]
 pub struct Ranking {
+    pub weights_version: u32,
     pub group: String,
     pub suspected: String,
     pub count: u64,
@@ -350,14 +369,18 @@ impl Ledger {
 
     pub fn add(&mut self, event: FaultEvent) {
         if self.occurrences.len() < OCCURRENCE_CAP {
+            let (address, syndrome) = crate::fault_signatures::locate(&event.detail);
             self.occurrences.push(Occurrence {
                 at_seconds: event.at_seconds,
+                layer: event.layer,
                 phase: event.phase.clone(),
                 source: event.source.clone(),
                 candidates: event.attribution().candidates(),
                 confidence: event.confidence,
                 count: event.count,
                 detail: event.detail.clone(),
+                address: event.address.or(address),
+                syndrome: event.syndrome.or(syndrome),
             });
         }
         match event.attribution() {

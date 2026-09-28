@@ -348,4 +348,54 @@ Giới hạn còn lại của F0:
 - Trên máy phát triển, driver NVIDIA chưa build cho kernel 7.0.0-34 nên phiên thật chưa có lớp GPU. Các luật GPU và chuỗi
   được kiểm bằng report thật chụp trên GTX 960.
 
-Tiếp theo: **F2** (đo phần cứng và tương quan).
+### F1 + F2 — xong (2026-09-28, commit `8710f3f`)
+
+| Hạng mục | Kết quả |
+|---|---|
+| Bản ghi lỗi trực tiếp | `dit-contracts::fault` (`FaultRecord`, `FaultWriter`, `FaultTail`): mỗi lỗi một dòng JSONL ngay khi xảy ra (`--fault-events`) ở `dit-cli system-run`, `gpu-dit` (kể cả từng worker nhiều GPU), `dit-chain`; SSD lấy từ sự kiện `failure` sẵn có. COMBINED đọc tiếp mỗi tick, quy ô ngay và ghi thời điểm (`at_seconds`); report cuối chỉ bù phần chênh (`reconcile:report`) |
+| Đo link | `dit-system::pcie`: tốc độ / độ rộng, AER theo loại ở **cả hai đầu** (thiết bị và port phía trên), replay (NVIDIA `nvidia-smi -q -d PCIE`, AMD `pcie_replay_count`); đọc không được là `unavailable`, không phải 0 |
+| Theo dõi trong phiên | `hw_events.rs` (`HwMonitor`): đọc mọi link GPU và SSD 5 s một lần, delta thành sự kiện phần cứng có thời điểm trên ô `PCIe-GPU n` / `SSD-path n`; report có `hardware_links` |
+| Kiểm | CPU-RAM chèn lỗi SIMD / RAM: đúng một bản ghi mỗi lỗi (lần chạy chẩn đoán lại không ghi); phiên COMBINED quy ô trực tiếp (`at_seconds` 66.7, luật `cpu-ram/cpu_check`); monitor đọc được link SSD và AER trên máy phát triển |
+
+### F4 — xong (2026-09-28, commit `0bfc2d4`, sau cờ `--attribution-checks` / boot `dit_attribution=1`)
+
+| Hạng mục | Kết quả |
+|---|---|
+| SSD (`--confirm-on-fail`) | block lỗi được kiểm lại (qua → `recheck_clean` → `CPU\|RAM`) và đọc lại từ thiết bị (sạch → `reread_clean` → `SSD-path`; sai y hệt → `reread_same` → `SSD`; sai khác → `reread_differs` → `SSD-path`) |
+| CPU-RAM (`--confirm-on-fail`) | mismatch đầu tiên của mỗi worker: đuổi cache qua các arena khác rồi đọc lại từ CPU khác (đúng ở CPU khác, sai ở CPU verify → `verifier_core` → `CPU`; đúng cả hai → `transient` → `CPU\|RAM`; sai → ghi lại và đọc: đúng → `rewrite_fixed` → `RAM` nghi ngờ, vẫn sai → `cell_persistent` → `RAM` xác định). Tối đa 8 lần mỗi lần chạy |
+| Kiểm | multi-simulate: bit-flip → `reread_same`, read-soak-bit-flip → `reread_clean`, read-compute → `recheck_clean`; CPU-RAM chèn lỗi ở một offset → `rewrite_fixed` (cả bản ghi trực tiếp lẫn report). Cờ tắt: không đổi gì |
+
+### F6 — xong (2026-09-28)
+
+`fault_signatures.rs`, chạy một lần cuối phiên COMBINED (và cuối test đơn lẻ GPU-VRAM / CPU-SSD, không có dữ liệu thời
+gian). Chỉ xét các nhóm `CHƯA TÁCH`; mỗi chữ ký cộng trọng số (phiên bản `WEIGHTS_VERSION = 1`) cho ô ứng viên của nhóm:
+
+| Chữ ký | Kiểm | Ô được cộng | Trọng số |
+|---|---|---|---|
+| Thời gian (2.4) | lỗi (đếm theo giây riêng biệt, bão lỗi tính một) nằm trong cửa sổ `[T-6, T+2]` quanh sự kiện link; so với tỉ lệ thời gian các cửa sổ phủ, binomial `p < 0,001` | link có sự kiện (`PCIe-GPU n`, `SSD-path n`) | 4 |
+| Phần cứng | ô có đếm sự kiện phần cứng trong phiên | ô đó | 1 |
+| Địa chỉ lặp (2.5) | ≥ 3 lỗi có địa chỉ, ≥ một nửa rơi vào địa chỉ lặp | ô nhớ (`RAM`, `VRAM n`, `SSD n`) | 3 |
+| Địa chỉ rải | > 3 lỗi, không địa chỉ nào lặp | đường (`CPU`, `PCIe-GPU n`, `GPU n`, `SSD-path n`) | 1 |
+| Bit cố định (2.5) | chỉ lỗi có địa chỉ; một bit có trong ≥ 80% syndrome, binomial `p < 0,01` | ô nhớ | 2 |
+| Chỉ lỗi khi tải đủ (2.5) | lỗi chỉ ở OVERLAP, không lỗi ở pha chạy riêng; Poisson `p < 0,01` | `PLATFORM` nếu có trong nhóm (không thì chỉ ghi chú) | 3 |
+
+Nhóm chuyển sang ô dẫn đầu, mức `NGHI NGỜ`, khi ô đó đạt ≥ 3 điểm **và** hơn ô thứ hai ≥ 2 điểm. Bằng chứng yếu (chỉ
+đếm phần cứng, chỉ địa chỉ rải) hoặc mâu thuẫn thì nhóm giữ nguyên `CHƯA TÁCH`. Tầng 2 không bao giờ tạo `XÁC ĐỊNH`.
+Mỗi lần chuyển được ghi trong `fault_ledger.rankings` (nhóm, ô, điểm từng ô, lý do). Địa chỉ và syndrome lấy từ chi tiết
+lỗi (`at byte N`, `global offset N`, `offset N:`, `expected/actual`, `syndrome`) hoặc evidence của bản ghi CPU-RAM.
+
+| Kiểm | Kết quả |
+|---|---|
+| Dữ liệu tổng hợp (mục 7.3) | 2000 phiên / 10 seed, 5 kịch bản (`PCIe-GPU` vs `VRAM` ở transfer, `VRAM` trong nhóm compute, `SSD` vs `SSD-path`), nhiễu AER nền tới 30 sự kiện, 20% lỗi nhớ ở địa chỉ ngẫu nhiên, 1/3 lỗi link không đọc được bộ đếm: **1663 đúng, 0 sai, 337 giữ CHƯA TÁCH** (độ chính xác 100% ≥ 90%; độ phủ 83%, phần còn lại chủ yếu là lỗi link không có bộ đếm) |
+| Report thật GTX 960 (retention) | 5 lỗi chỉ ở hai offset (0 và 5701632) → `VRAM1 5 (5 susp)` thay vì `? PCIe-GPU1\|VRAM1 5` |
+| Trường hợp giữ nguyên | lỗi compute không có địa chỉ, không sự kiện link → vẫn `CHƯA TÁCH`; Xid 79 chỉ ở OVERLAP sau 600 s baseline sạch → `PLATFORM` nghi ngờ |
+
+Trong quá trình chỉnh: ngưỡng 0,01 cho chữ ký thời gian từng đặt nhầm một lỗi VRAM sang `PCIe-GPU` do trùng ngẫu nhiên
+với nhiễu nền, nên hạ xuống 0,001; và chỉ riêng số đếm phần cứng từng đẩy lỗi SSD sang `SSD-path`, nên thêm ngưỡng điểm
+tối thiểu và khoảng cách.
+
+### F3 — chưa làm
+
+Cần driver NVIDIA chạy được trên máy phát triển (kernel 7.0.0-34 hiện chưa có module, `cuInit` trả 100) để kiểm kernel
+hash / verify trên GPU và hiệu năng GTX 960. Phần phía `dit-suite` đã sẵn: tag `[boundary: …]` trong chi tiết lỗi GPU
+được `fault_sources::boundary_attribution` đọc và quy ô xác định.

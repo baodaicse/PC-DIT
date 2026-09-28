@@ -18,6 +18,7 @@ use dit_orchestrator::combined::{
     PhaseKind, ThreadPlan,
 };
 use dit_orchestrator::fault_ledger::{Component, CsvMeta, FaultEvent, Ledger, LedgerReport};
+use dit_orchestrator::fault_signatures::{self, PhaseExposure};
 use dit_orchestrator::fault_sources;
 use dit_orchestrator::hw_events::{self, HwMonitor};
 use dit_ui_core::{InPlaceRenderer, TerminalSize};
@@ -579,12 +580,13 @@ fn run_session(
     }
     let cleanup = session.remove_chain_file();
     let release = release_storage(holder);
+    let ranked = session.rank_signatures();
     let (verdict, report_path) = session.write_report()?;
     let stored = session.persist();
     let csv = session.append_fail_summary(verdict, &report_path);
     let failures: u64 = session.totals.values().map(|t| t.failures).sum();
     let summary = format!(
-        "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\n{}\n{}\nReport: {}\n{stored}\n{csv}\n{cleanup}{release}",
+        "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\n{}\n{}\n{ranked}Report: {}\n{stored}\n{csv}\n{cleanup}{release}",
         session.settings.level.label(),
         session.settings.intensity.label(),
         combined::grade(
@@ -1145,6 +1147,45 @@ impl Session<'_> {
     }
 
     /// Counts the failures of a layer that just ended on their component cells, from its report.
+    /// Step F6: ranks the unresolved groups on the session's signatures (link events next to the
+    /// failures, addresses, bits, load dependence). Returns a line for the summary, or nothing.
+    fn rank_signatures(&mut self) -> String {
+        let mut hardware_times = BTreeMap::new();
+        for (group, _) in self.ledger.unresolved_groups() {
+            for cell in group {
+                let times = self.monitor.times(cell);
+                if !times.is_empty() {
+                    hardware_times.insert(cell, times);
+                }
+            }
+        }
+        let context = fault_signatures::Context {
+            hardware_times,
+            elapsed_seconds: self.started.elapsed().as_secs_f64(),
+            phases: self
+                .records
+                .iter()
+                .map(|record| PhaseExposure {
+                    label: record.label.clone(),
+                    seconds: record.seconds,
+                    load: matches!(record.phase, PhaseKind::Overlap),
+                    layers: record
+                        .layers
+                        .iter()
+                        .map(|l| layers::slug(l.layer))
+                        .collect(),
+                })
+                .collect(),
+        };
+        match fault_signatures::rank(&mut self.ledger, &context) {
+            0 => String::new(),
+            placed => format!(
+                "Evidence ranking (weights v{}) placed {placed} unresolved group(s) as SUSPECTED; see fault_ledger.rankings.\n",
+                fault_signatures::WEIGHTS_VERSION
+            ),
+        }
+    }
+
     fn attribute(&mut self, ended: &Running, outcome: LayerOutcome, detail: &str, phase: &str) {
         if outcome == LayerOutcome::Crashed {
             self.ledger.add(fault_sources::crash(

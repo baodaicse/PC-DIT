@@ -2,6 +2,7 @@
 
 pub mod combined;
 pub mod fault_ledger;
+pub mod fault_signatures;
 pub mod fault_sources;
 pub mod hw_events;
 
