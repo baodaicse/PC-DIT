@@ -1,0 +1,1039 @@
+{
+  "inventory": {
+    "captured_unix_ms": 1788172349702,
+    "kernel_release": "7.0.0-30-generic",
+    "memory": {
+      "installed_bytes": 67159707648,
+      "available_at_start_bytes": 66015887360,
+      "free_bytes": 66372243456,
+      "swap_total_bytes": 0,
+      "swap_free_bytes": 0,
+      "hardware_corrupted_bytes": 0,
+      "page_size_bytes": 4096,
+      "cgroup_limit_bytes": null,
+      "cgroup_current_bytes": null,
+      "effective_available_bytes": 66015887360
+    },
+    "cpu": {
+      "architecture": "x86_64",
+      "vendor_id": "GenuineIntel",
+      "model_name": "Intel(R) Core(TM) i9-14900KF",
+      "logical_cpu_count": 32,
+      "allowed_cpu_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "physical_core_count": 24,
+      "avx2": true,
+      "aes": true,
+      "fma": true,
+      "sse4_2": true,
+      "threads": [
+        {
+          "cpu_id": 0,
+          "package_id": 0,
+          "core_id": 0,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 1,
+          "package_id": 0,
+          "core_id": 0,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 2,
+          "package_id": 0,
+          "core_id": 4,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 3,
+          "package_id": 0,
+          "core_id": 4,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 4,
+          "package_id": 0,
+          "core_id": 8,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 5,
+          "package_id": 0,
+          "core_id": 8,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 6,
+          "package_id": 0,
+          "core_id": 12,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 7,
+          "package_id": 0,
+          "core_id": 12,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 8,
+          "package_id": 0,
+          "core_id": 16,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 9,
+          "package_id": 0,
+          "core_id": 16,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 10,
+          "package_id": 0,
+          "core_id": 20,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 11,
+          "package_id": 0,
+          "core_id": 20,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 12,
+          "package_id": 0,
+          "core_id": 24,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 13,
+          "package_id": 0,
+          "core_id": 24,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 14,
+          "package_id": 0,
+          "core_id": 28,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 15,
+          "package_id": 0,
+          "core_id": 28,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 16,
+          "package_id": 0,
+          "core_id": 32,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 17,
+          "package_id": 0,
+          "core_id": 33,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 18,
+          "package_id": 0,
+          "core_id": 34,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 19,
+          "package_id": 0,
+          "core_id": 35,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 20,
+          "package_id": 0,
+          "core_id": 36,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 21,
+          "package_id": 0,
+          "core_id": 37,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 22,
+          "package_id": 0,
+          "core_id": 38,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 23,
+          "package_id": 0,
+          "core_id": 39,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 24,
+          "package_id": 0,
+          "core_id": 40,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 25,
+          "package_id": 0,
+          "core_id": 41,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 26,
+          "package_id": 0,
+          "core_id": 42,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 27,
+          "package_id": 0,
+          "core_id": 43,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 28,
+          "package_id": 0,
+          "core_id": 44,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 29,
+          "package_id": 0,
+          "core_id": 45,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 30,
+          "package_id": 0,
+          "core_id": 46,
+          "numa_node": 0,
+          "allowed": true
+        },
+        {
+          "cpu_id": 31,
+          "package_id": 0,
+          "core_id": 47,
+          "numa_node": 0,
+          "allowed": true
+        }
+      ]
+    },
+    "numa_nodes": [
+      {
+        "node_id": 0,
+        "cpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "mem_total_bytes": 67159707648,
+        "mem_free_bytes": 66372243456
+      }
+    ]
+  },
+  "telemetry": {
+    "captured_unix_ms": 1788172349684,
+    "temperatures": [
+      {
+        "source": "/sys/class/hwmon/hwmon0/temp1_input",
+        "label": "acpitz:temp1",
+        "millidegrees_c": 27800,
+        "critical_millidegrees_c": null
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp10_input",
+        "label": "coretemp:Core 8",
+        "millidegrees_c": 32000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp14_input",
+        "label": "coretemp:Core 12",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp18_input",
+        "label": "coretemp:Core 16",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp1_input",
+        "label": "coretemp:Package id 0",
+        "millidegrees_c": 34000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp22_input",
+        "label": "coretemp:Core 20",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp26_input",
+        "label": "coretemp:Core 24",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp2_input",
+        "label": "coretemp:Core 0",
+        "millidegrees_c": 33000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp30_input",
+        "label": "coretemp:Core 28",
+        "millidegrees_c": 28000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp34_input",
+        "label": "coretemp:Core 32",
+        "millidegrees_c": 33000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp35_input",
+        "label": "coretemp:Core 33",
+        "millidegrees_c": 32000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp36_input",
+        "label": "coretemp:Core 34",
+        "millidegrees_c": 32000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp37_input",
+        "label": "coretemp:Core 35",
+        "millidegrees_c": 33000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp38_input",
+        "label": "coretemp:Core 36",
+        "millidegrees_c": 29000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp39_input",
+        "label": "coretemp:Core 37",
+        "millidegrees_c": 29000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp40_input",
+        "label": "coretemp:Core 38",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp41_input",
+        "label": "coretemp:Core 39",
+        "millidegrees_c": 29000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp42_input",
+        "label": "coretemp:Core 40",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp43_input",
+        "label": "coretemp:Core 41",
+        "millidegrees_c": 32000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp44_input",
+        "label": "coretemp:Core 42",
+        "millidegrees_c": 32000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp45_input",
+        "label": "coretemp:Core 43",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp46_input",
+        "label": "coretemp:Core 44",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp47_input",
+        "label": "coretemp:Core 45",
+        "millidegrees_c": 30000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp48_input",
+        "label": "coretemp:Core 46",
+        "millidegrees_c": 30000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp49_input",
+        "label": "coretemp:Core 47",
+        "millidegrees_c": 30000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon2/temp6_input",
+        "label": "coretemp:Core 4",
+        "millidegrees_c": 32000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp10_input",
+        "label": "nct6798:PCH_CHIP_CPU_MAX_TEMP",
+        "millidegrees_c": 0,
+        "critical_millidegrees_c": null
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp11_input",
+        "label": "nct6798:PCH_CHIP_TEMP",
+        "millidegrees_c": 0,
+        "critical_millidegrees_c": null
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp12_input",
+        "label": "nct6798:PCH_CPU_TEMP",
+        "millidegrees_c": 0,
+        "critical_millidegrees_c": null
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp1_input",
+        "label": "nct6798:SYSTIN",
+        "millidegrees_c": 29000,
+        "critical_millidegrees_c": 125000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp2_input",
+        "label": "nct6798:CPUTIN",
+        "millidegrees_c": 31500,
+        "critical_millidegrees_c": 125000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp3_input",
+        "label": "nct6798:AUXTIN0",
+        "millidegrees_c": 30000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp4_input",
+        "label": "nct6798:AUXTIN1",
+        "millidegrees_c": 4000,
+        "critical_millidegrees_c": 125000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp5_input",
+        "label": "nct6798:AUXTIN2",
+        "millidegrees_c": 127000,
+        "critical_millidegrees_c": 125000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp6_input",
+        "label": "nct6798:AUXTIN3",
+        "millidegrees_c": 31000,
+        "critical_millidegrees_c": 100000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp7_input",
+        "label": "nct6798:AUXTIN4",
+        "millidegrees_c": 127000,
+        "critical_millidegrees_c": 125000
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp8_input",
+        "label": "nct6798:PECI Agent 0",
+        "millidegrees_c": 33000,
+        "critical_millidegrees_c": null
+      },
+      {
+        "source": "/sys/class/hwmon/hwmon4/temp9_input",
+        "label": "nct6798:PECI Agent 0 Calibration",
+        "millidegrees_c": 31500,
+        "critical_millidegrees_c": null
+      },
+      {
+        "source": "/sys/class/thermal/thermal_zone0/temp",
+        "label": "acpitz",
+        "millidegrees_c": 27800,
+        "critical_millidegrees_c": 40000
+      },
+      {
+        "source": "/sys/class/thermal/thermal_zone2/temp",
+        "label": "x86_pkg_temp",
+        "millidegrees_c": 34000,
+        "critical_millidegrees_c": null
+      }
+    ],
+    "cpu_power": [
+      {
+        "source": "/sys/class/powercap/intel-rapl:0/energy_uj",
+        "label": "package-0",
+        "milliwatts": 15722,
+        "measurement": "powercap_energy_delta",
+        "sample_interval_ms": 264
+      }
+    ],
+    "edac_corrected": [],
+    "edac_uncorrected": [],
+    "throttle_core": [
+      {
+        "source": "/sys/devices/system/cpu/cpu21/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu11/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu9/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu7/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu28/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu18/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu5/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu26/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu16/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu3/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu24/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu14/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu1/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu22/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu12/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu30/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu20/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu10/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu8/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu29/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu19/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu6/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu27/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu17/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu4/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu25/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu15/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu2/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu23/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu13/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu31/thermal_throttle/core_throttle_count",
+        "value": 0
+      }
+    ],
+    "throttle_package": [
+      {
+        "source": "/sys/devices/system/cpu/cpu21/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu11/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu9/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu7/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu28/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu18/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu5/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu26/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu16/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu3/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu24/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu14/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu1/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu22/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu12/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu30/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu20/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu10/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu8/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu29/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu19/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu6/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu27/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu17/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu4/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu25/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu15/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu2/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu23/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu13/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count",
+        "value": 0
+      },
+      {
+        "source": "/sys/devices/system/cpu/cpu31/thermal_throttle/package_throttle_count",
+        "value": 0
+      }
+    ],
+    "cgroup_memory_events": {},
+    "machine_check_cpu_count": 32,
+    "machine_check_bank_count": 704
+  },
+  "availability": {
+    "temperature_sensors": true,
+    "cpu_power_sensors": true,
+    "edac_counters": false,
+    "throttle_counters": true,
+    "cgroup_memory_events": false,
+    "machine_check_configuration": true,
+    "machine_check_event_log": false,
+    "privileged_kernel_log": false,
+    "notes": [
+      "EDAC memory-controller counters are unavailable"
+    ]
+  },
+  "hwmon_chips": [
+    "acpitz",
+    "asus",
+    "coretemp",
+    "iwlwifi_1",
+    "nct6798"
+  ],
+  "powercap_zones": [
+    "core",
+    "package-0"
+  ],
+  "loaded_modules": [
+    "ac97_bus",
+    "acpi_ipmi",
+    "acpi_pad",
+    "acpi_power_meter",
+    "acpi_tad",
+    "aesni_intel",
+    "ahci",
+    "amdgpu",
+    "amdxcp",
+    "asus_armoury",
+    "asus_atk0110",
+    "asus_wmi",
+    "asus_wmi_sensors",
+    "autofs4",
+    "bluetooth",
+    "btbcm",
+    "btintel",
+    "btmtk",
+    "btrtl",
+    "btusb",
+    "cec",
+    "cfg80211",
+    "cmdlinepart",
+    "coretemp",
+    "crc8",
+    "dell_smm_hwmon",
+    "dmi_sysfs",
+    "drm_buddy",
+    "drm_display_helper",
+    "drm_exec",
+    "drm_gpuvm",
+    "drm_panel_backlight_quirks",
+    "drm_suballoc_helper",
+    "drm_ttm_helper",
+    "eeepc_wmi",
+    "efi_pstore",
+    "fam15h_power",
+    "firmware_attributes_class",
+    "ghash_clmulni_intel",
+    "gpu_sched",
+    "hid",
+    "hid_generic",
+    "hp_wmi_sensors",
+    "hwmon_vid",
+    "i2c_algo_bit",
+    "i2c_i801",
+    "i2c_mux",
+    "i2c_piix4",
+    "i2c_smbus",
+    "i915",
+    "idma64",
+    "igc",
+    "igen6_edac",
+    "input_leds",
+    "intel_cstate",
+    "intel_lpss",
+    "intel_lpss_pci",
+    "intel_pmc_core",
+    "intel_pmc_ssram_telemetry",
+    "intel_powerclamp",
+    "intel_rapl_common",
+    "intel_rapl_msr",
+    "intel_rapl_tpmi",
+    "intel_tcc_cooling",
+    "intel_uncore_frequency",
+    "intel_uncore_frequency_common",
+    "intel_vsec",
+    "intel_vsec_tpmi",
+    "ip_tables",
+    "ipmi_devintf",
+    "ipmi_msghandler",
+    "ipmi_ssif",
+    "irqbypass",
+    "iwlmvm",
+    "iwlwifi",
+    "joydev",
+    "k10temp",
+    "k8temp",
+    "kvm",
+    "kvm_intel",
+    "libahci",
+    "libarc4",
+    "mac80211",
+    "mac_hid",
+    "mei",
+    "mei_me",
+    "mfd_aaeon",
+    "msr",
+    "mtd",
+    "mxm_wmi",
+    "nct6775",
+    "nct6775_core",
+    "nfit",
+    "nfnetlink",
+    "nls_iso8859_1",
+    "nouveau",
+    "overlay",
+    "pinctrl_alderlake",
+    "platform_profile",
+    "pmt_class",
+    "pmt_discovery",
+    "pmt_telemetry",
+    "radeon",
+    "rapl",
+    "rc_core",
+    "sch_fq_codel",
+    "skx_edac_common",
+    "smsc47m192",
+    "snd",
+    "snd_compress",
+    "snd_hda_codec",
+    "snd_hda_codec_alc882",
+    "snd_hda_codec_generic",
+    "snd_hda_codec_hdmi",
+    "snd_hda_codec_nvhdmi",
+    "snd_hda_codec_realtek_lib",
+    "snd_hda_core",
+    "snd_hda_ext_core",
+    "snd_hda_intel",
+    "snd_hwdep",
+    "snd_intel_dspcfg",
+    "snd_intel_sdw_acpi",
+    "snd_pcm",
+    "snd_pcm_dmaengine",
+    "snd_soc_acpi",
+    "snd_soc_acpi_intel_match",
+    "snd_soc_acpi_intel_sdca_quirks",
+    "snd_soc_avs",
+    "snd_soc_core",
+    "snd_soc_hda_codec",
+    "snd_soc_hdac_hda",
+    "snd_soc_sdca",
+    "snd_soc_sdw_utils",
+    "snd_sof",
+    "snd_sof_intel_hda",
+    "snd_sof_intel_hda_common",
+    "snd_sof_intel_hda_generic",
+    "snd_sof_intel_hda_mlink",
+    "snd_sof_intel_hda_sdw_bpt",
+    "snd_sof_pci",
+    "snd_sof_pci_intel_cnl",
+    "snd_sof_pci_intel_tgl",
+    "snd_sof_utils",
+    "snd_sof_xtensa_dsp",
+    "snd_timer",
+    "soundcore",
+    "soundwire_bus",
+    "soundwire_cadence",
+    "soundwire_generic_allocation",
+    "soundwire_intel",
+    "sparse_keymap",
+    "spi_intel",
+    "spi_intel_pci",
+    "spi_nor",
+    "ttm",
+    "uas",
+    "usb_storage",
+    "usbhid",
+    "video",
+    "vmd",
+    "wmi",
+    "wmi_bmof",
+    "x86_pkg_temp_thermal",
+    "x_tables"
+  ]
+}

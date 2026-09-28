@@ -1,0 +1,6 @@
+image_id=CPU-DIT-01-NOBLE-20260831-1b6d7e0ca81b
+profile=safe
+reference_exit=0
+system_exit=2
+overall_exit=2
+utc_end=2026-08-31T10:32:59+00:00

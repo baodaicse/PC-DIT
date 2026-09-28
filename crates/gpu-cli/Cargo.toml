@@ -1,0 +1,25 @@
+[package]
+name = "gpu-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gpu-vram-dit"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+dit-contracts = { path = "../dit-contracts" }
+dit-system = { path = "../dit-system" }
+dit-ui-core = { path = "../dit-ui-core" }
+gpu-engine = { path = "../gpu-engine" }
+gpu-vulkan = { path = "../gpu-vulkan" }
+gpu-cuda = { path = "../gpu-cuda" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

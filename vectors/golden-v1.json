@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "test_id": "CPU-DIT-01-REF-v1",
+  "descriptor_version": 1,
+  "source_sha256": "b9cf106acdb9e550d6311cea214595a78a86dd8bcc612cf9ea5795cefc38c499",
+  "seed_hex": "0x0123456789abcdef",
+  "target_bytes": 1048579,
+  "block_sizes": [
+    65536,
+    131071,
+    4093
+  ],
+  "expected_generated_sha256": "ad5559e8461475f90cc18287fc7b1afe049d785c38f39ed4bd7f9ec44b2c5150",
+  "expected_encoded_sha256": "e9d09f223f531318a5a211b38b30b8308375155fc0778368cc014cd738211a2f",
+  "expected_final_sha256": "1f8d38ef46747379e0f46acb860a0df16dd91aee14bdf3a2225a376f81d76853"
+}

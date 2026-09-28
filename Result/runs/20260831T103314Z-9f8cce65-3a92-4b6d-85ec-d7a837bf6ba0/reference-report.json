@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "test_id": "CPU-DIT-01-REF-v1",
+  "status": "PASS",
+  "source": {
+    "source_id": "cpu-dit-source-v1",
+    "size_bytes": 451,
+    "sha256": "b9cf106acdb9e550d6311cea214595a78a86dd8bcc612cf9ea5795cefc38c499"
+  },
+  "config": {
+    "descriptor_version": 1,
+    "seed_hex": "0x0123456789abcdef",
+    "target_bytes": 1048579,
+    "block_sizes": [
+      65536,
+      131071,
+      4093
+    ],
+    "reference_memory_limit_bytes": 67108864
+  },
+  "fault_injection": null,
+  "coverage": {
+    "requested_payload_bytes": 1048579,
+    "generated_bytes": 1048579,
+    "allocated_unique_bytes": 1048580,
+    "touched_unique_bytes": 1048580,
+    "written_unique_bytes": 1048580,
+    "read_unique_bytes": 1048580,
+    "exact_verified_unique_bytes": 1048580,
+    "recovered_verified_bytes": 1048579,
+    "total_write_bytes": 1048580,
+    "total_read_bytes": 1048580,
+    "group_count": 4,
+    "block_count": 16,
+    "coverage_target_met": true,
+    "coverage_type": "reference_pipeline"
+  },
+  "checkpoints": [
+    {
+      "stage": "GENERATE",
+      "expected_sha256": "ad5559e8461475f90cc18287fc7b1afe049d785c38f39ed4bd7f9ec44b2c5150",
+      "actual_sha256": "ad5559e8461475f90cc18287fc7b1afe049d785c38f39ed4bd7f9ec44b2c5150",
+      "matched": true
+    },
+    {
+      "stage": "MATRIX_ENCODE",
+      "expected_sha256": "e9d09f223f531318a5a211b38b30b8308375155fc0778368cc014cd738211a2f",
+      "actual_sha256": "e9d09f223f531318a5a211b38b30b8308375155fc0778368cc014cd738211a2f",
+      "matched": true
+    },
+    {
+      "stage": "READBACK",
+      "expected_sha256": "e9d09f223f531318a5a211b38b30b8308375155fc0778368cc014cd738211a2f",
+      "actual_sha256": "e9d09f223f531318a5a211b38b30b8308375155fc0778368cc014cd738211a2f",
+      "matched": true
+    },
+    {
+      "stage": "RECOVER_JOIN",
+      "expected_sha256": "ad5559e8461475f90cc18287fc7b1afe049d785c38f39ed4bd7f9ec44b2c5150",
+      "actual_sha256": "ad5559e8461475f90cc18287fc7b1afe049d785c38f39ed4bd7f9ec44b2c5150",
+      "matched": true
+    },
+    {
+      "stage": "FINAL",
+      "expected_sha256": "1f8d38ef46747379e0f46acb860a0df16dd91aee14bdf3a2225a376f81d76853",
+      "actual_sha256": "1f8d38ef46747379e0f46acb860a0df16dd91aee14bdf3a2225a376f81d76853",
+      "matched": true
+    }
+  ],
+  "mismatch": null,
+  "failure_reason": null
+}

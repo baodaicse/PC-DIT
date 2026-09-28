@@ -1,0 +1,31 @@
+[package]
+name = "nvme-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cpu-nvme-dit"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+dit-contracts = { path = "../dit-contracts" }
+dit-ui-core = { path = "../dit-ui-core" }
+dit-source = { path = "../dit-source" }
+dit-system = { path = "../dit-system" }
+fs2.workspace = true
+nix = { workspace = true, features = ["signal"] }
+nvme-backend-file = { path = "../nvme-backend-file" }
+nvme-backend-linux = { path = "../nvme-backend-linux" }
+nvme-engine = { path = "../nvme-engine" }
+nvme-inventory = { path = "../nvme-inventory" }
+nvme-io = { path = "../nvme-io" }
+nvme-scheduler = { path = "../nvme-scheduler" }
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+=== uname ===
+Linux cpu-dit-01 7.0.0-30-generic #30~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:27:52 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+=== lscpu ===
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           39 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  32
+On-line CPU(s) list:                     0-31
+Vendor ID:                               GenuineIntel
+BIOS Vendor ID:                          Intel(R) Corporation
+Model name:                              Intel(R) Core(TM) i9-14900KF
+BIOS Model name:                         Intel(R) Core(TM) i9-14900KF To Be Filled By O.E.M. CPU @ 5.7GHz
+BIOS CPU family:                         207
+CPU family:                              6
+Model:                                   183
+Thread(s) per core:                      2
+Core(s) per socket:                      24
+Socket(s):                               1
+Stepping:                                1
+CPU(s) scaling MHz:                      21%
+CPU max MHz:                             6000.0000
+CPU min MHz:                             800.0000
+BogoMIPS:                                6374.40
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities
+Virtualization:                          VT-x
+L1d cache:                               896 KiB (24 instances)
+L1i cache:                               1.3 MiB (24 instances)
+L2 cache:                                32 MiB (12 instances)
+L3 cache:                                36 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-31
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Mitigation; Clear Register File
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+=== memory ===
+               total        used        free      shared  buff/cache   available
+Mem:     67159707648  1105358848 66410246144    10104832   223612928 66054348800
+Swap:              0           0           0
+=== block devices (read-only inventory) ===
+NAME   PATH       TYPE   SIZE RO RM TRAN LABEL       MODEL         SERIAL
+loop0  /dev/loop0 loop 877.5M  1  0                                
+sda    /dev/sda   disk  57.3G  0  1 usb              Ultra USB 3.0 0501e808f7af8f731d895cdb6b7e29fac38a2a78b189a3768de6b8dac26c38cbc61200000000000000000000c0a74175009c0a10915581075ba8d38f
+├─sda1 /dev/sda1  part     4M  0  1                                
+├─sda2 /dev/sda2  part   1.4G  0  1      DIT-BOOT                  
+└─sda3 /dev/sda3  part     1G  0  1      DIT-RESULTS               
+=== kernel command line ===
+BOOT_IMAGE=/live/vmlinuz boot=live components live-media-timeout=30 cpu_dit_profile=menu console=tty0 console=ttyS0,115200n8

@@ -1,0 +1,6 @@
+CPU-DIT-01 deterministic source corpus version 1.
+This source is intentionally small: the reference generator combines each source
+byte with a versioned counter-based stream derived from seed and global offset.
+The corpus includes text, digits 0123456789, alternating symbols !@#$%^&*(), and
+boundary markers [BEGIN-64B]......................................[END-64B].
+All runtime payload bytes remain reproducible without storing a RAM-sized source.

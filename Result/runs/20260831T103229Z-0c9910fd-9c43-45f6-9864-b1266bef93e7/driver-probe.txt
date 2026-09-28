@@ -1,0 +1,71 @@
+ready drm
+ready drm_kms_helper
+ready simpledrm
+ready i915
+ready amdgpu
+ready radeon
+ready nouveau
+ready msr
+ready coretemp
+ready k8temp
+ready k10temp
+ready fam15h_power
+modprobe: FATAL: Module amd_energy not found in directory /lib/modules/7.0.0-30-generic
+unavailable_or_not_applicable amd_energy
+ready intel_rapl_msr
+ready intel_rapl_tpmi
+ready i2c-i801
+ready i2c-piix4
+ready nct6775
+modprobe: ERROR: could not insert 'nct6683': No such device
+unavailable_or_not_applicable nct6683
+modprobe: ERROR: could not insert 'it87': No such device
+unavailable_or_not_applicable it87
+modprobe: ERROR: could not insert 'f71882fg': No such device
+unavailable_or_not_applicable f71882fg
+modprobe: ERROR: could not insert 'w83627ehf': No such device
+unavailable_or_not_applicable w83627ehf
+modprobe: ERROR: could not insert 'smsc47m1': No such device
+unavailable_or_not_applicable smsc47m1
+ready smsc47m192
+modprobe: ERROR: could not insert 'sch5627': No such device
+unavailable_or_not_applicable sch5627
+modprobe: ERROR: could not insert 'sch5636': No such device
+unavailable_or_not_applicable sch5636
+ready asus_atk0110
+ready asus_wmi_sensors
+modprobe: ERROR: could not insert 'asus_ec_sensors': No such device
+unavailable_or_not_applicable asus_ec_sensors
+ready hp_wmi_sensors
+ready dell_smm_hwmon
+modprobe: ERROR: could not insert 'lenovo_ec_sensors': No such device
+unavailable_or_not_applicable lenovo_ec_sensors
+ready acpi_power_meter
+modprobe: FATAL: Module amd64_edac_mod not found in directory /lib/modules/7.0.0-30-generic
+unavailable_or_not_applicable amd64_edac_mod
+modprobe: ERROR: could not insert 'i10nm_edac': No such device
+unavailable_or_not_applicable i10nm_edac
+ready igen6_edac
+modprobe: ERROR: could not insert 'ie31200_edac': No such device
+unavailable_or_not_applicable ie31200_edac
+modprobe: ERROR: could not insert 'sb_edac': No such device
+unavailable_or_not_applicable sb_edac
+modprobe: ERROR: could not insert 'skx_edac': No such device
+unavailable_or_not_applicable skx_edac
+modprobe: ERROR: could not insert 'pnd2_edac': No such device
+unavailable_or_not_applicable pnd2_edac
+modprobe: ERROR: could not insert 'ipmi_si': No such device
+unavailable_or_not_applicable ipmi_si
+ready ipmi_ssif
+ready ipmi_devintf
+ready acpi_ipmi
+not_installed nvidia
+not_installed nvidia_modeset
+not_installed nvidia_drm
+gpu_inventory_begin
+01:00.0 VGA compatible controller [0300]: NVIDIA Corporation AD102 [GeForce RTX 4090] [10de:2684] (rev a1)
+	Subsystem: ASUSTeK Computer Inc. AD102 [GeForce RTX 4090] [1043:88e6]
+	Kernel driver in use: nouveau
+	Kernel modules: nvidiafb, nouveau
+gpu_inventory_end
+completed_utc 2026-08-31T10:32:29+00:00

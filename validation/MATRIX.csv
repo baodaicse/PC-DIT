@@ -1,0 +1,10 @@
+matrix_id,required,cpu_vendor,ram_class_gib,ecc,numa,boot_mode,power_sensor_target,actual_cpu,actual_mainboard,actual_bios,actual_ram,status,record_path,reviewer,review_date,notes
+V1-AMD-16-NONECC,yes,AMD,16,no,single,UEFI,optional,,,,,PLANNED,,,,
+V1-INTEL-16-NONECC,yes,Intel,16,no,single,UEFI,optional,,,,,PLANNED,,,,
+V1-AMD-32-NONECC,yes,AMD,32,no,single,UEFI,available,,,,,PLANNED,,,,
+V1-INTEL-32-NONECC,yes,Intel,32,no,single,UEFI,available,,,,,PLANNED,,,,
+V1-AMD-64-NONECC,yes,AMD,64,no,single,UEFI,optional,,,,,PLANNED,,,,
+V1-INTEL-64-NONECC,yes,Intel,64,no,single,UEFI,optional,,,,,PLANNED,,,,
+V1-ECC-64,yes,Any,64,yes,single,UEFI,optional,,,,,PLANNED,,,,EDAC counters required
+V1-ECC-128-NUMA,yes,Any,128,yes,multi,UEFI,optional,,,,,PLANNED,,,,EDAC counters and per-node evidence required
+V1-LEGACY-BIOS,yes,Any,16+,any,any,BIOS,optional,,,,,PLANNED,,,,Required while legacy BIOS support is advertised

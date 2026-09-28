@@ -1,0 +1,24 @@
+[package]
+name = "gpu-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ash.workspace = true
+gpu-engine = { path = "../gpu-engine" }
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# Vulkan is an unsafe C FFI. Unsafe operations are confined to this crate.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

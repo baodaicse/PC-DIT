@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x=16, local_size_y=16, local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uint data[]; } a;
+layout(set=0,binding=1,std430) buffer Output { uint data[]; } c;
+layout(push_constant) uniform Params { uint jobs; uint inner; uint n; uint lo; uint hi; } p;
+shared uint left_tile[16][16];
+shared uint right_tile[16][16];
+void main() {
+    uint x=gl_LocalInvocationID.x, y=gl_LocalInvocationID.y;
+    uint row=gl_WorkGroupID.y*16u+y, col=gl_WorkGroupID.x*16u+x;
+    uint job=gl_WorkGroupID.z, base=job*2u*p.n*p.inner;
+    uint sum=0u;
+    for(uint k=0u;k<p.inner;k+=16u) {
+        left_tile[y][x]=(row<p.n && k+x<p.inner)?a.data[base+row*p.inner+k+x]:0u;
+        right_tile[y][x]=(col<p.n && k+y<p.inner)?a.data[base+p.n*p.inner+(k+y)*p.n+col]:0u;
+        barrier();
+        for(uint t=0u;t<16u;++t) sum+=left_tile[y][t]*right_tile[t][x];
+        barrier();
+    }
+    uint output_base=job*(p.n*p.n+4u);
+    if(row<p.n && col<p.n) {
+        uint epoch=p.lo ^ ((p.hi<<13u)|(p.hi>>19u));
+        uint value=sum ^ epoch;
+        c.data[output_base+2u+row*p.n+col]=((value<<7u)|(value>>25u)) ^ (job*0x9E3779B9u) ^ (row*p.n+col);
+        if(row==0u && col==0u) { c.data[output_base]=p.lo; c.data[output_base+1u]=p.hi; }
+    }
+    // Guard words at the end of each job must retain their initialization value.
+}

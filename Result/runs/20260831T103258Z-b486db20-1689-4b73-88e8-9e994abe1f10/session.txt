@@ -1,0 +1,5 @@
+Image ID: CPU-DIT-01-NOBLE-20260831-1b6d7e0ca81b
+Profile: safe
+Minimum duration override: 120
+Kernel: 7.0.0-30-generic
+UTC start: 2026-08-31T10:32:58+00:00

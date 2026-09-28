@@ -1,0 +1,5 @@
+Image ID: CPU-DIT-01-NOBLE-20260831-1b6d7e0ca81b
+Profile: full
+Minimum duration override: 1800
+Kernel: 7.0.0-30-generic
+UTC start: 2026-08-31T10:33:46+00:00

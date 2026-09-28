@@ -1,0 +1,19 @@
+[package]
+name = "nvme-backend-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dit-contracts = { path = "../dit-contracts" }
+memmap2.workspace = true
+libc.workspace = true
+nvme-inventory = { path = "../nvme-inventory" }
+nvme-io = { path = "../nvme-io" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

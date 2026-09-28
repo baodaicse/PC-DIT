@@ -1,0 +1,19 @@
+[Unit]
+Description=CPU-DIT-01 interactive hardware integrity test appliance
+After=local-fs.target
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/cpu-dit/boot-runner.sh
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+TimeoutStartSec=infinity
+# Reboot / power off must not wait: the UI exits on SIGTERM at once and every test process gets
+# SIGTERM too; whatever is still running after 10 s is killed.
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

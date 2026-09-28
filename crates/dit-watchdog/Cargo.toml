@@ -1,0 +1,16 @@
+[package]
+name = "dit-watchdog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dit-system = { path = "../dit-system" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ctrlc.workspace = true
+
+[lints]
+workspace = true

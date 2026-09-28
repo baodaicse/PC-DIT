@@ -1,0 +1,20 @@
+[package]
+name = "dit-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+dit-contracts = { path = "../dit-contracts" }
+dit-system = { path = "../dit-system" }
+dit-ui-core = { path = "../dit-ui-core" }
+nix = { workspace = true, features = ["signal"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

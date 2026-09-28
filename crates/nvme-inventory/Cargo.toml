@@ -1,0 +1,16 @@
+[package]
+name = "nvme-inventory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dit-contracts = { path = "../dit-contracts" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
