@@ -394,7 +394,7 @@ Trong quá trình chỉnh: ngưỡng 0,01 cho chữ ký thời gian từng đặ
 với nhiễu nền, nên hạ xuống 0,001; và chỉ riêng số đếm phần cứng từng đẩy lỗi SSD sang `SSD-path`, nên thêm ngưỡng điểm
 tối thiểu và khoảng cách.
 
-### F3 — đường GEMM xong (2026-09-29, sau cờ `--boundary-checks` / boot `dit_attribution=1`)
+### F3 — xong: đường GEMM và lane (2026-09-29, sau cờ `--boundary-checks` / boot `dit_attribution=1`)
 
 | Hạng mục | Kết quả |
 |---|---|
@@ -404,7 +404,8 @@ tối thiểu và khoảng cách.
 | Sau burst có lỗi | băm lại input và đáp án trên GPU (hai lần, phải trùng nhau): đổi so với lúc upload → `vram-input` / `vram-answers`, corpus được upload lại |
 | Hàm băm | tổng mod 2^32 của `từ XOR khoá(vị trí)` (chỉ nhân 32 bit, rẻ trên mọi GPU); một từ đổi luôn làm tổng đổi; chung CPU/GPU (`gpu_engine::gemm::boundary_mix`) |
 | Cờ tắt | chạy đúng `dit_gemm` / `dit_gemm_f32` cũ (PTX của chúng không đổi byte nào), report không có mục `boundary`, chi tiết lỗi như cũ |
-| `dit-suite` | lớp GPU và chain trong COMBINED, và GPU-VRAM đơn lẻ, nhận `--boundary-checks` khi `dit_attribution=1`; tag mới `host` → `CPU\|RAM`, `host-ram` → `RAM` |
+| Lane (transfer, retention, vram-checkpoint) | vùng lane còn nằm trong VRAM (planner khoá nó tới khi thao tác kết thúc), nên **chỉ khi CPU thấy sai** GPU mới băm vùng đó: vẫn đúng → `d2h` (ô RAM host không giữ được byte đúng → `host-ram`; host giống hệt bản GPU, hoặc so lần hai đúng → `host`); sai (băm hai lần như nhau) → transfer: upload lại vùng đó, đúng → `h2d`, vẫn sai → `h2d-persistent`; retention / checkpoint → `vram-rest` (đúng lúc ghi, sai khi đọc lại). Vùng sạch không tốn gì thêm |
+| `dit-suite` | lớp GPU và chain trong COMBINED, và GPU-VRAM đơn lẻ, nhận `--boundary-checks` khi `dit_attribution=1`; tag mới `host` → `CPU\|RAM`, `host-ram` → `RAM`, `vram-rest` → `VRAM` |
 
 Kiểm trên GTX 960 (`build/f3/`):
 
@@ -419,14 +420,21 @@ Kiểm trên GTX 960 (`build/f3/`):
 | input đổi trong VRAM sau khi kiểm (`vram-input`) | 7 batch lỗi, `vram-input=7` → `VRAM1` xác định |
 | đáp án đổi trong VRAM (`vram-answers`) | 32 batch GPU tự kiểm báo sai nhưng CPU đúng → kiểm lúc nghỉ → `vram-answers=1` → `VRAM1`, phiên FAIL |
 | buffer host đổi sau khi copy về (`host-buffer`) | `d2h=1` — giới hạn đã biết, xem dưới |
-| Sổ lỗi | test `injected_gpu_boundary_faults_land_on_their_cells` đưa đúng các dòng lỗi thật trên qua bộ quy ô |
+| Lane, chạy sạch cờ bật (GEMM + lane song song) | khoảng 7.600 thao tác transfer + retention mỗi 30 s, không lỗi giả |
+| Lane, byte hỏng ở host sau D2H (`--inject-hardware-fault transfer`) | `d2h=1` → `PCIe-GPU1` (cũng chứng minh hash GPU khớp mẫu CPU); cờ tắt: không tag → `PCIe-GPU1\|VRAM1` |
+| Lane, vùng hỏng trên GPU sau H2D (`lane-h2d`) / hỏng cả sau upload lại (`lane-h2d-persistent`) | `h2d=1` → `PCIe-GPU1` / `h2d-persistent=1` → `PCIe-GPU1\|VRAM1` |
+| Lane, vùng đổi trong VRAM giữa lúc ghi và lúc đọc lại (`lane-rest`) | `vram-rest=1` → `VRAM1` xác định |
+| Hiệu năng, GEMM + lane song song, cấu hình menu (3 cặp xen kẽ) | compute 285,4 → 281,5 GOPS (**−1,4 %**); lane kiểm 1.823 → 1.841 MiB/s (**không giảm**) |
+| Sổ lỗi | test `injected_gpu_boundary_faults_land_on_their_cells` và `injected_lane_boundary_faults_land_on_their_cells` đưa đúng các dòng lỗi thật trên qua bộ quy ô |
 
 Giới hạn còn lại:
 - Buffer host bị đổi **thoáng qua** sau khi copy về không tách được với lỗi trên đường về: ghi là `d2h`. Ô RAM host hỏng
   **cố định** thì được bắt (`host-ram`).
 - Lần đọc lại ngay sau khi ghi thường lấy từ L2 cache, nên một ô DRAM hỏng đúng trong vài micro-giây giữa lúc kiểm và
   lúc copy về cũng bị ghi là `d2h`.
-- Lane DMA (`lane.rs`: băm sau H2D và trước D2H để tách hai chiều của transfer / retention) chưa làm; lỗi lane vẫn là
-  `PCIe-GPU\|VRAM` và được F6 xếp hạng.
+- Bản đầu của lane băm mọi vùng trước D2H: kernel băm phải xếp hàng sau các block GEMM nên độ phủ lane giảm 53 %. Bản cuối
+  chỉ băm khi có lỗi (vùng vẫn còn trong VRAM), cùng kết luận mà không tốn gì trên vùng sạch.
+- Lỗi lane trong khoảng thời gian rất ngắn giữa lúc CPU so và lúc GPU băm lại (một ô VRAM hỏng đúng lúc đó) có thể bị ghi
+  sai loại; vùng bị khoá nên không có gì khác ghi đè nó.
 - Bộ điều khiển tải (có sẵn) xét tải theo nhịp 50 ms nhưng burst chỉ 10–20 ms và reset cửa sổ đo, nên hầu như luôn ở
   `WARMUP` với 2 batch trên GPU. Không do F3; khi bật cờ F3 cho phép 3 batch từ đầu để che độ trễ.

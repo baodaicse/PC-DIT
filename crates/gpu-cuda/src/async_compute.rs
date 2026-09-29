@@ -243,7 +243,8 @@ enum Done {
     },
     Compared {
         slot: usize,
-        mismatch: Option<(usize, u8, u8)>,
+        mismatch: Option<lane::Mismatch>,
+        evidence: Option<checkpoints::LaneEvidence>,
         seconds: f64,
         wait: f64,
     },
@@ -274,11 +275,13 @@ fn run_lane_action(action: Action, ready_at: Instant) -> Done {
             slot,
             expected,
             actual,
+            evidence,
         } => {
-            let mismatch = lane::run_compare(expected, actual);
+            let (mismatch, evidence) = lane::run_compare(expected, actual, evidence);
             Done::Compared {
                 slot,
                 mismatch,
+                evidence,
                 seconds: started.elapsed().as_secs_f64(),
                 wait,
             }
@@ -642,7 +645,7 @@ impl Pipeline {
         let mut lane = config
             .lane
             .active()
-            .then(|| Lane::new(backend, config.lane))
+            .then(|| Lane::new(backend, config.lane, config.boundary_checks))
             .transpose()?;
         if config.sweep.enabled
             && let Some(lane) = lane.as_mut()
@@ -1317,10 +1320,12 @@ impl Pipeline {
                                     Done::Compared {
                                         slot,
                                         mismatch,
+                                        evidence,
                                         seconds,
                                         wait,
                                     },
-                                ) => lane.on_compared(slot, mismatch, seconds, wait),
+                                ) => lane
+                                    .on_compared(backend, slot, mismatch, evidence, seconds, wait),
                                 _ => Err(Error::Request("lane worker failed")),
                             };
                             if let Err(error) = handled {

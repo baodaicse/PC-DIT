@@ -375,8 +375,9 @@ pub fn boundary_attribution(kind: &str, gpu: u8) -> Option<(Attribution, &'stati
             Attribution::Confirmed(Component::PcieGpu(gpu)),
             "gpu/boundary_d2h",
         ),
-        // The input or the answers held in VRAM changed after they were checked.
-        "vram-input" | "vram-answers" => (
+        // The input or the answers held in VRAM changed after they were checked, or a lane region
+        // was right when written and wrong on the GPU at its re-read.
+        "vram-input" | "vram-answers" | "vram-rest" => (
             Attribution::Confirmed(Component::Vram(gpu)),
             "gpu/boundary_vram_at_rest",
         ),
@@ -1155,6 +1156,55 @@ mod tests {
             false,
         );
         assert_eq!(plain[0].cell, "PCIe-GPU1|GPU1|VRAM1");
+    }
+
+    /// Lane failures from the GTX 960 with the boundary checks on (build/f3/lane-inj-*).
+    #[test]
+    fn injected_lane_boundary_faults_land_on_their_cells() {
+        let cases = [
+            (
+                "transfer",
+                "allocation 0 offset 0 bytes 65536: mismatch at byte 0: expected 0x4f, actual 0x4e [boundary: d2h=1]",
+                "PCIe-GPU1",
+                Confidence::Confirmed,
+            ),
+            (
+                "transfer",
+                "allocation 0 offset 0 bytes 65536: mismatch at byte 0: expected 0x4f, actual 0xef [boundary: h2d=1]",
+                "PCIe-GPU1",
+                Confidence::Confirmed,
+            ),
+            (
+                "transfer",
+                "allocation 0 offset 0 bytes 65536: mismatch at byte 0: expected 0x4f, actual 0xef [boundary: h2d-persistent=1]",
+                "PCIe-GPU1|VRAM1",
+                Confidence::Unresolved,
+            ),
+            (
+                "retention",
+                "allocation 0 offset 0 bytes 65536: mismatch at byte 0: expected 0x4f, actual 0xef [boundary: vram-rest=1]",
+                "VRAM1",
+                Confidence::Confirmed,
+            ),
+        ];
+        for (phase, detail, cell, confidence) in cases {
+            let events = gpu_failure_events(phase, detail, 1, 1, false);
+            assert_eq!(events.len(), 1, "{detail}");
+            assert_eq!(
+                (events[0].cell.as_str(), events[0].confidence),
+                (cell, confidence),
+                "{detail}"
+            );
+        }
+        // Without the checks a transfer failure stays on the link-or-VRAM group.
+        let plain = gpu_failure_events(
+            "transfer",
+            "allocation 0 offset 0 bytes 65536: mismatch at byte 0: expected 0x4f, actual 0x4e",
+            1,
+            1,
+            false,
+        );
+        assert_eq!(plain[0].cell, "PCIe-GPU1|VRAM1");
     }
 
     #[test]

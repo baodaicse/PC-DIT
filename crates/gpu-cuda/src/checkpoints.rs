@@ -113,6 +113,12 @@ pub(crate) enum Kind {
     Host,
     /// No valid tail (stale or damaged): nothing to go on.
     Unsealed,
+    /// Lane: wrong on the GPU right after the upload, right after a second upload.
+    H2d,
+    /// Lane: wrong on the GPU after both uploads (link or the VRAM cells).
+    H2dPersistent,
+    /// Lane: right when written, wrong on the GPU at the re-read (VRAM lost it at rest).
+    VramRest,
 }
 
 /// Classifies a failed batch on the worker that found it (`bytes`: the output, `tail`: the
@@ -138,6 +144,8 @@ pub struct BoundaryCounts {
     pub device: u64,
     pub vram_input: u64,
     pub vram_answers: u64,
+    /// Lane regions the VRAM lost while they rested (right when written, wrong at the re-read).
+    pub vram_rest: u64,
     pub host: u64,
     pub host_ram: u64,
     pub unsealed: u64,
@@ -151,6 +159,9 @@ impl BoundaryCounts {
             Kind::HostRam => self.host_ram += 1,
             Kind::Host => self.host += 1,
             Kind::Unsealed => self.unsealed += 1,
+            Kind::H2d => self.h2d += 1,
+            Kind::H2dPersistent => self.h2d_persistent += 1,
+            Kind::VramRest => self.vram_rest += 1,
         }
     }
 
@@ -161,6 +172,7 @@ impl BoundaryCounts {
         self.device += other.device;
         self.vram_input += other.vram_input;
         self.vram_answers += other.vram_answers;
+        self.vram_rest += other.vram_rest;
         self.host += other.host;
         self.host_ram += other.host_ram;
         self.unsealed += other.unsealed;
@@ -182,6 +194,7 @@ impl BoundaryCounts {
             ("device", self.device),
             ("vram-input", self.vram_input),
             ("vram-answers", self.vram_answers),
+            ("vram-rest", self.vram_rest),
             ("host", self.host),
             ("host-ram", self.host_ram),
         ] {
@@ -231,6 +244,12 @@ pub enum BoundaryFault {
     AfterCheck,
     /// One readback byte changed on the host after the copy landed.
     HostBuffer,
+    /// Lane: one word of the first transfer's region wrong on the GPU right after its upload.
+    LaneH2d,
+    /// Lane: the same, and again after the region's second upload.
+    LaneH2dPersistent,
+    /// Lane: one word of the first re-read region changed on the GPU while it rested.
+    LaneRest,
 }
 
 impl BoundaryFault {
@@ -243,6 +262,9 @@ impl BoundaryFault {
             "vram-answers" => Some(Self::VramAnswers),
             "after-check" => Some(Self::AfterCheck),
             "host-buffer" => Some(Self::HostBuffer),
+            "lane-h2d" => Some(Self::LaneH2d),
+            "lane-h2d-persistent" => Some(Self::LaneH2dPersistent),
+            "lane-rest" => Some(Self::LaneRest),
             _ => None,
         }
     }
@@ -542,6 +564,57 @@ pub(crate) fn upload_counts(outcomes: &[Upload]) -> (BoundaryCounts, bool) {
     (counts, broken)
 }
 
+/// What the worker that found a lane region wrong adds, on the failure path only: the hashes of
+/// the expected pattern and of what arrived, and whether a second comparison still differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaneEvidence {
+    pub expected_hash: u32,
+    pub actual_hash: u32,
+    pub still_wrong: bool,
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn lane_evidence(expected: &[u8], actual: &[u8]) -> LaneEvidence {
+    LaneEvidence {
+        expected_hash: boundary_hash_bytes(expected) as u32,
+        actual_hash: boundary_hash_bytes(actual) as u32,
+        still_wrong: gpu_engine::verifier::first_difference(expected, actual).is_some(),
+    }
+}
+
+/// First verdict on a failed lane region from the GPU's hash taken before the copy back.
+/// `None`: the GPU already held wrong data, which the owner confirms on the device.
+pub(crate) fn classify_lane(device_hash: u32, evidence: LaneEvidence) -> Option<Kind> {
+    if !evidence.still_wrong {
+        return Some(Kind::Host);
+    }
+    if device_hash != evidence.expected_hash {
+        return None;
+    }
+    Some(if evidence.actual_hash == device_hash {
+        Kind::Host
+    } else {
+        Kind::D2h
+    })
+}
+
+/// Whether byte `index` of a host buffer can hold `expected` (written and read back; the lane
+/// slot is idle). A host cell that cannot hold it is a RAM fault, not a link fault.
+pub(crate) fn host_holds_byte(buffer: &Pinned, index: usize, expected: u8) -> bool {
+    if index >= buffer.len {
+        return true;
+    }
+    // SAFETY: the slot is `Comparing`: no copy targets the buffer and no worker reads it.
+    unsafe {
+        let byte = buffer.address.cast::<u8>().add(index);
+        let before = ptr::read_volatile(byte);
+        ptr::write_volatile(byte, expected);
+        let held = ptr::read_volatile(byte) == expected;
+        ptr::write_volatile(byte, before);
+        held
+    }
+}
+
 /// Whether the word at `index` of a host readback can hold `expected`: written and read back
 /// (the batch is finished and its slot idle). A host RAM cell that cannot hold it is a RAM fault,
 /// not a link fault.
@@ -628,6 +701,32 @@ mod tests {
             Kind::Host,
             "second CPU check passed"
         );
+    }
+
+    #[test]
+    fn failed_lane_regions_are_placed_by_the_gpu_hash() {
+        let expected = vec![5_u8; 64];
+        let mut actual = expected.clone();
+        actual[3] ^= 1;
+        let evidence = lane_evidence(&expected, &actual);
+        assert!(evidence.still_wrong);
+        // The GPU had the right data before the copy back: changed on the way.
+        assert_eq!(
+            classify_lane(evidence.expected_hash, evidence),
+            Some(Kind::D2h)
+        );
+        // The GPU already had what the host got: wrong on the device, to confirm there.
+        assert_eq!(classify_lane(evidence.actual_hash, evidence), None);
+        // A second comparison that passes points at the CPU side.
+        let stable = lane_evidence(&expected, &expected);
+        assert_eq!(
+            classify_lane(stable.expected_hash, stable),
+            Some(Kind::Host)
+        );
+        let mut counts = BoundaryCounts::default();
+        counts.add_kind(Kind::VramRest);
+        counts.add_kind(Kind::H2d);
+        assert_eq!(counts.tag(), "[boundary: h2d=1 vram-rest=1]");
     }
 
     #[test]

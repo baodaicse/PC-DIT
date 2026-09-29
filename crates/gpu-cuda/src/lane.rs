@@ -8,6 +8,7 @@
 //! two operations from touching the same bytes at once.
 use crate::{
     CudaBackend, Error, Result,
+    checkpoints::{self, BoundaryCounts, BoundaryFault, Kind as Boundary, LaneEvidence},
     driver::{Handle, check},
     memory::{Buffer, Context, LIVE_EVENTS, LIVE_STREAMS, Pinned},
 };
@@ -80,6 +81,8 @@ pub(crate) enum Action {
         slot: usize,
         expected: Span,
         actual: Span,
+        /// Boundary checks: on a mismatch, also hash both sides and compare a second time.
+        evidence: bool,
     },
 }
 
@@ -110,17 +113,27 @@ pub(crate) fn run_prepare(
     }
 }
 
-/// Runs a `Compare` on a worker: the first differing byte as (index, expected, actual).
-pub(crate) fn run_compare(expected: Span, actual: Span) -> Option<(usize, u8, u8)> {
+/// First differing byte of a lane comparison as (index, expected, actual).
+pub(crate) type Mismatch = (usize, u8, u8);
+
+/// Runs a `Compare` on a worker: the first differing byte and, when asked and only on a
+/// mismatch, the boundary-check evidence.
+pub(crate) fn run_compare(
+    expected: Span,
+    actual: Span,
+    evidence: bool,
+) -> (Option<Mismatch>, Option<LaneEvidence>) {
     // SAFETY: the slot is `Comparing`; the D2H copy finished and nothing writes either buffer.
     let (e, a) = unsafe { (expected.bytes(), actual.bytes()) };
-    first_difference(e, a).map(|i| {
+    let mismatch = first_difference(e, a).map(|i| {
         (
             i,
             e.get(i).copied().unwrap_or(0),
             a.get(i).copied().unwrap_or(0),
         )
-    })
+    });
+    let evidence = (evidence && mismatch.is_some()).then(|| checkpoints::lane_evidence(e, a));
+    (mismatch, evidence)
 }
 
 /// Faults a test may inject to prove each detector fires.
@@ -205,6 +218,9 @@ pub struct LaneReport {
     pub overlap_with_compute_seconds: f64,
     pub failures_total: u64,
     pub conservation: String,
+    /// Where failed regions went wrong, when the boundary checks are on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<BoundaryCounts>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -221,6 +237,8 @@ struct Running {
     seed: u64,
     /// The end-of-run flush, reported as `retention-final`.
     flush: bool,
+    /// Boundary checks apply: a failure is placed by hashing the region on the GPU.
+    hashed: bool,
 }
 
 struct Slot {
@@ -324,13 +342,20 @@ pub(crate) struct Lane {
     half: Option<usize>,
     /// Transfer sweeps completed on each half before the halves were last traded.
     half_sweeps: [u64; 2],
+    /// Boundary checks (step F3): the GPU hashes every region before it is copied back.
+    checks: bool,
+    /// Test-only boundary injection (`DIT_GPU_BOUNDARY_FAULT=lane-h2d`, `lane-h2d-persistent`,
+    /// `lane-rest`).
+    boundary_fault: Option<BoundaryFault>,
+    /// Injection: the region's second upload is damaged too (`lane-h2d-persistent`).
+    corrupt_reupload: bool,
 }
 
 /// Counted allocation steps per lane slot (buffers, streams, events).
 pub(crate) const STEPS_PER_SLOT: usize = 8;
 
 impl Lane {
-    pub(crate) fn new(backend: &CudaBackend, config: LaneConfig) -> Result<Self> {
+    pub(crate) fn new(backend: &CudaBackend, config: LaneConfig, checks: bool) -> Result<Self> {
         config.validate().map_err(Error::Request)?;
         let bytes =
             usize::try_from(config.chunk_bytes).map_err(|_| Error::Request("lane chunk"))?;
@@ -357,12 +382,23 @@ impl Lane {
                 version: 1,
                 config,
                 pinned_bytes,
+                boundary: checks.then(BoundaryCounts::default),
                 ..LaneReport::default()
             },
             failures: Vec::new(),
             intervals: Vec::new(),
             half: None,
             half_sweeps: [0; 2],
+            checks,
+            boundary_fault: checks.then(BoundaryFault::from_env).flatten().filter(|f| {
+                matches!(
+                    f,
+                    BoundaryFault::LaneH2d
+                        | BoundaryFault::LaneH2dPersistent
+                        | BoundaryFault::LaneRest
+                )
+            }),
+            corrupt_reupload: false,
         })
     }
 
@@ -607,6 +643,7 @@ impl Lane {
                     op,
                     seed,
                     flush: false,
+                    hashed: false,
                 },
                 out,
             );
@@ -702,6 +739,27 @@ impl Lane {
         check("lane start", unsafe {
             (driver.event_record)(s.events[0], s.stream)
         })?;
+        // Boundary checks: a region found wrong is hashed on the GPU afterwards (it stays in VRAM,
+        // locked by the planner, until the operation finishes), so nothing runs on a clean one.
+        let hash = self.checks && len.is_multiple_of(4);
+        let corrupt = match (kind, op) {
+            (Kind::Dma, LaneOp::Write { .. }) => matches!(
+                self.boundary_fault,
+                Some(BoundaryFault::LaneH2d | BoundaryFault::LaneH2dPersistent)
+            ),
+            (Kind::Dma, LaneOp::Reread { .. }) => {
+                self.boundary_fault == Some(BoundaryFault::LaneRest)
+            }
+            _ => false,
+        } && hash;
+        if corrupt {
+            self.corrupt_reupload = self.boundary_fault == Some(BoundaryFault::LaneH2dPersistent);
+            self.boundary_fault = None;
+        }
+        let s = &mut self.slots[slot];
+        if let Some(running) = s.running.as_mut() {
+            running.hashed = hash && !(kind == Kind::Vram && matches!(op, LaneOp::Write { .. }));
+        }
         match (kind, op) {
             (Kind::Dma, LaneOp::Write { .. }) => {
                 check("lane H2D", unsafe {
@@ -710,6 +768,9 @@ impl Lane {
                 check("lane H2D end", unsafe {
                     (driver.event_record)(s.events[1], s.stream)
                 })?;
+                if corrupt {
+                    corrupt_word(backend, s.stream, device)?;
+                }
                 check("lane D2H", unsafe {
                     (driver.download)(s.download.address, device, len, s.stream)
                 })?;
@@ -718,6 +779,9 @@ impl Lane {
                 check("lane mark", unsafe {
                     (driver.event_record)(s.events[1], s.stream)
                 })?;
+                if corrupt {
+                    corrupt_word(backend, s.stream, device)?;
+                }
                 check("lane D2H", unsafe {
                     (driver.download)(s.download.address, device, len, s.stream)
                 })?;
@@ -937,10 +1001,12 @@ impl Lane {
         }
         let len = usize::try_from(bytes).map_err(|_| Error::Request("lane region"))?;
         self.slots[slot].state = State::Comparing;
+        let hashed = self.slots[slot].running.as_ref().is_some_and(|r| r.hashed);
         out.push(Action::Compare {
             slot,
             expected: Span::of(&self.slots[slot].upload, len),
             actual: Span::of(&self.slots[slot].download, len),
+            evidence: hashed,
         });
         Ok(())
     }
@@ -948,8 +1014,10 @@ impl Lane {
     /// A worker finished comparing.
     pub(crate) fn on_compared(
         &mut self,
+        backend: &CudaBackend,
         slot: usize,
-        mismatch: Option<(usize, u8, u8)>,
+        mismatch: Option<Mismatch>,
+        evidence: Option<LaneEvidence>,
         seconds: f64,
         wait: f64,
     ) -> Result<()> {
@@ -963,16 +1031,81 @@ impl Lane {
                 .running
                 .as_ref()
                 .map_or("transfer", Self::phase);
-            self.failure(
-                slot,
-                phase,
-                format!("mismatch at byte {index}: expected {expected:#04x}, actual {actual:#04x}"),
-            );
+            let mut detail =
+                format!("mismatch at byte {index}: expected {expected:#04x}, actual {actual:#04x}");
+            if let Some(evidence) = evidence {
+                let kind = self.place(backend, slot, evidence, index, expected)?;
+                let mut counts = BoundaryCounts::default();
+                counts.add_kind(kind);
+                if let Some(total) = self.report.boundary.as_mut() {
+                    total.add(&counts);
+                }
+                let tag = counts.tag();
+                if !tag.is_empty() {
+                    detail = format!("{detail} {tag}");
+                }
+            }
+            self.failure(slot, phase, detail);
             self.finish(slot, false);
         } else {
             self.finish(slot, true);
         }
         Ok(())
+    }
+
+    /// Where a failed region went wrong (boundary checks). The region is still in VRAM, locked
+    /// until the operation finishes, so the GPU hashes it now: still right means it changed on
+    /// the way back (or on the host). Wrong is hashed again (a GPU that hashes two ways is the
+    /// GPU); then a transfer's region is uploaded again (right the second time: the link; wrong
+    /// again: link or VRAM), while a re-read's region was right when written (VRAM lost it at
+    /// rest). Failure path only; waits on the slot's idle stream.
+    fn place(
+        &mut self,
+        backend: &CudaBackend,
+        slot: usize,
+        evidence: LaneEvidence,
+        index: usize,
+        expected: u8,
+    ) -> Result<Boundary> {
+        let s = &self.slots[slot];
+        let running = s
+            .running
+            .as_ref()
+            .ok_or(Error::Request("lane slot empty"))?;
+        let (op, region) = (running.op, running.op.region());
+        let buffer = backend
+            .pool
+            .get(region.allocation)
+            .ok_or(Error::Request("lane allocation"))?;
+        let device = buffer.address + region.offset;
+        let len = usize::try_from(region.bytes).map_err(|_| Error::Request("lane region"))?;
+        let device_hash = hash_now(backend, s, device, len)?;
+        match checkpoints::classify_lane(device_hash, evidence) {
+            Some(Boundary::D2h) if !checkpoints::host_holds_byte(&s.download, index, expected) => {
+                return Ok(Boundary::HostRam);
+            }
+            Some(kind) => return Ok(kind),
+            None => {}
+        }
+        if hash_now(backend, s, device, len)? != device_hash {
+            return Ok(Boundary::Device);
+        }
+        Ok(match op {
+            LaneOp::Write { .. } => {
+                check("lane re-upload", unsafe {
+                    (backend.context.driver.upload)(device, s.upload.address, len, s.stream)
+                })?;
+                if std::mem::take(&mut self.corrupt_reupload) {
+                    corrupt_word(backend, s.stream, device)?;
+                }
+                if hash_now(backend, s, device, len)? == evidence.expected_hash {
+                    Boundary::H2d
+                } else {
+                    Boundary::H2dPersistent
+                }
+            }
+            LaneOp::Reread { .. } => Boundary::VramRest,
+        })
     }
 
     /// Releases the slot and settles the planner and the counters.
@@ -1091,6 +1224,7 @@ impl Lane {
                         op,
                         seed,
                         flush: true,
+                        hashed: false,
                     },
                     &mut actions,
                 )?;
@@ -1135,10 +1269,18 @@ impl Lane {
                         slot,
                         expected,
                         actual,
+                        evidence,
                     } => {
                         let at = Instant::now();
-                        let mismatch = run_compare(expected, actual);
-                        self.on_compared(slot, mismatch, at.elapsed().as_secs_f64(), 0.0)?;
+                        let (mismatch, evidence) = run_compare(expected, actual, evidence);
+                        self.on_compared(
+                            backend,
+                            slot,
+                            mismatch,
+                            evidence,
+                            at.elapsed().as_secs_f64(),
+                            0.0,
+                        )?;
                     }
                 }
             }
@@ -1157,4 +1299,79 @@ impl Lane {
             }
         }
     }
+}
+
+/// Queues the GPU hash of `len` bytes at `device` into the slot's counter and its copy into
+/// `flag` (boundary checks), on the slot's stream.
+fn queue_hash(backend: &CudaBackend, s: &Slot, device: u64, len: usize) -> Result<()> {
+    let driver = &backend.context.driver;
+    check("lane hash clear", unsafe {
+        (driver.fill)(s.counter.address, 0, 1, s.stream)
+    })?;
+    let mut words_arg = device;
+    let mut count = (len / 4) as u64;
+    let mut out = s.counter.address;
+    let mut params = [
+        (&raw mut words_arg).cast::<c_void>(),
+        (&raw mut count).cast(),
+        (&raw mut out).cast(),
+    ];
+    let blocks = u32::try_from((len / 4).div_ceil(256))
+        .unwrap_or(u32::MAX)
+        .clamp(1, backend.sm_count * 16);
+    check("lane hash", unsafe {
+        (driver.launch)(
+            backend.hash_function,
+            blocks,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            s.stream,
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    })?;
+    check("lane hash readback", unsafe {
+        (driver.download)(s.flag.address, s.counter.address, 4, s.stream)
+    })
+}
+
+/// The GPU hash of `len` bytes at `device`, now (failure path: queued and waited on).
+fn hash_now(backend: &CudaBackend, s: &Slot, device: u64, len: usize) -> Result<u32> {
+    queue_hash(backend, s, device, len)?;
+    let started = Instant::now();
+    loop {
+        let status = unsafe { (backend.context.driver.stream_query)(s.stream) };
+        if status == 0 {
+            break;
+        }
+        if status != 600 || started.elapsed() > Duration::from_secs(30) {
+            backend.context.stopped.set(true);
+            return Err(if status == 600 {
+                Error::Timeout
+            } else {
+                Error::Api {
+                    call: "lane confirmation",
+                    status,
+                }
+            });
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    // SAFETY: the stream is idle, so the 4-byte copy landed; nothing else uses `flag` now.
+    Ok(u32::from_le_bytes(
+        unsafe { s.flag.completed_bytes(4) }
+            .try_into()
+            .unwrap_or([0; 4]),
+    ))
+}
+
+/// Injection only: one word of the region changes on the device (stream-ordered).
+fn corrupt_word(backend: &CudaBackend, stream: Handle, device: u64) -> Result<()> {
+    check("lane boundary injection", unsafe {
+        (backend.context.driver.fill)(device, 0xDEAD_BEEF, 1, stream)
+    })
 }
