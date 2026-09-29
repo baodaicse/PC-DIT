@@ -21,16 +21,16 @@ pub struct VolumePlan {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct Block {
-    name: PathBuf,
-    fstype: Option<String>,
-    label: Option<String>,
+pub(crate) struct Block {
+    pub name: PathBuf,
+    pub fstype: Option<String>,
+    pub label: Option<String>,
     parttype: Option<String>,
-    ro: bool,
-    size: u64,
+    pub ro: bool,
+    pub size: u64,
     uuid: Option<String>,
     #[serde(default)]
-    children: Vec<Self>,
+    pub children: Vec<Self>,
 }
 
 fn output(program: &str, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
@@ -50,8 +50,49 @@ fn output(program: &str, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
-/// `ntfs-3g.probe --readwrite`: an NTFS volume is written only when Windows left it closed.
-/// Nothing is forced; the refusal says what to do in Windows.
+/// An NTFS volume the safety probe would not let us write. Callers may offer
+/// [`repair_ntfs`] when [`NtfsRefused::repairable`] says it fits.
+#[derive(Debug)]
+pub struct NtfsRefused {
+    pub node: PathBuf,
+    pub code: Option<i32>,
+    /// What `ntfs-3g.probe` printed.
+    pub detail: String,
+}
+
+impl NtfsRefused {
+    /// Metadata left inconsistent or unclean by an interrupted writer (code 13 with `$MFTMirr`
+    /// differing from `$MFT`, or code 15): what a crash of this test leaves. Never a hibernated
+    /// Windows (code 14), whose session would be lost.
+    #[must_use]
+    pub fn repairable(&self) -> bool {
+        match self.code {
+            Some(13) => self.detail.contains("$MFTMirr does not match $MFT"),
+            Some(15) => true,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for NtfsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NTFS safety probe refused {}: {} The volume was left untouched.",
+            self.node.display(),
+            ntfs_refusal(self.code)
+        )?;
+        if !self.detail.is_empty() {
+            write!(f, " (ntfs-3g.probe: {})", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for NtfsRefused {}
+
+/// `ntfs-3g.probe --readwrite`: an NTFS volume is written only when it was closed cleanly.
+/// Nothing is forced; the refusal says what to do.
 fn ntfs_probe(node: &Path) -> Result<()> {
     let result = Command::new("timeout")
         .args([
@@ -67,12 +108,45 @@ fn ntfs_probe(node: &Path) -> Result<()> {
     if result.status.success() {
         return Ok(());
     }
-    Err(format!(
-        "NTFS {} not writable: {} The volume was left untouched.",
-        node.display(),
-        ntfs_refusal(result.status.code())
-    )
-    .into())
+    let detail = String::from_utf8_lossy(&result.stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(Box::new(NtfsRefused {
+        node: node.to_path_buf(),
+        code: result.status.code(),
+        detail,
+    }))
+}
+
+/// `ntfsfix -d`: copies `$MFT` over a differing `$MFTMirr`, empties the journal and clears the
+/// dirty flag, then checks that the safety probe now passes. It is not a full check (`chkdsk`);
+/// callers ask the operator first. Returns what `ntfsfix` printed.
+///
+/// # Errors
+///
+/// Fails when `ntfsfix` fails or the probe still refuses the volume.
+pub fn repair_ntfs(node: &Path) -> Result<String> {
+    let result = Command::new("timeout")
+        .args(["--signal=TERM", "--kill-after=5s", "120s", "ntfsfix", "-d"])
+        .arg(node)
+        .env("LC_ALL", "C")
+        .output()?;
+    let printed = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+    if !result.status.success() {
+        return Err(format!(
+            "ntfsfix failed ({}): {} {}",
+            result.status,
+            printed,
+            String::from_utf8_lossy(&result.stderr).trim()
+        )
+        .into());
+    }
+    ntfs_probe(node)?;
+    Ok(printed)
 }
 
 /// Operator guidance for an `ntfs-3g.probe` exit code (ntfs-3g `NTFS_VOLUME_*` values).
@@ -82,11 +156,11 @@ fn ntfs_refusal(code: Option<i32>) -> &'static str {
             "Windows hibernated it (code 14). Windows Fast Startup is on by default and makes 'Shut down' hibernate. In Windows: hold Shift while clicking Shut down, or choose Restart and boot this USB from the restart; to stop it for good, run 'powercfg /h off' as administrator or untick 'Turn on fast startup' in Power Options."
         }
         Some(15) => {
-            "Windows did not close it cleanly (code 15). Boot Windows, let it finish starting, then Shift + Shut down (or run 'chkdsk /f' on the drive)."
+            "it was not closed cleanly (code 15): Windows shut down uncleanly, or a test on this drive was interrupted (crash, power loss, reset). Run 'chkdsk /f' on the drive in Windows, or choose the ntfsfix repair when offered (after a crash of this test), or format the drive (F in the SSD selection) if it holds nothing you need."
         }
         Some(16) => "it is in use by another program or driver (code 16).",
         Some(13) => {
-            "its NTFS metadata is inconsistent (code 13). Run 'chkdsk /f' on the drive in Windows before testing it."
+            "its NTFS metadata is inconsistent (code 13), usually because a test writing to it was interrupted (crash, power loss, reset); the SSD itself is not necessarily at fault. Run 'chkdsk /f' on the drive in Windows, or choose the ntfsfix repair when offered, or format the drive (F in the SSD selection) if it holds nothing you need."
         }
         Some(12) => "it does not hold a valid NTFS file system (code 12).",
         Some(124) => "the safety probe timed out.",
@@ -94,7 +168,7 @@ fn ntfs_refusal(code: Option<i32>) -> &'static str {
     }
 }
 
-fn block_tree(node: &Path) -> Result<Block> {
+pub(crate) fn block_tree(node: &Path) -> Result<Block> {
     #[derive(Deserialize)]
     struct Listing {
         blockdevices: Vec<Block>,
@@ -127,7 +201,7 @@ fn protected_mount(path: &Path) -> bool {
             .any(|prefix| path.starts_with(prefix))
 }
 
-fn guard_namespace(device: &NvmeDevice, protected: &[PathBuf]) -> Result<()> {
+pub(crate) fn guard_namespace(device: &NvmeDevice, protected: &[PathBuf]) -> Result<()> {
     if device.serial.trim().is_empty()
         || device.serial == "unknown"
         || !device.holders.is_empty()
@@ -344,15 +418,22 @@ impl PreparedAreas {
             result?;
         }
         verify_mount(&mount, area.device_number, &plan.filesystem)?;
+        for removed in remove_stale(&mount, area.device_number, boot_time()) {
+            println!("  Removed leftovers of an interrupted test: {removed}");
+        }
         if fs2::available_space(&mount)? < required {
             return Err(format!("{} has insufficient free space; require {required} bytes including reserve. No test file was created", plan.node.display()).into());
         }
-        let directory = mount.join(format!(".cpu-nvme-dit-{session}-{}", plan.alias));
+        let directory = mount.join(format!("{STALE_PREFIX}{session}-{}", plan.alias));
         DirBuilder::new().mode(0o700).create(&directory)?;
         area.directory = Some(directory.clone());
         if directory.symlink_metadata()?.dev() != area.device_number {
             return Err("test directory moved off the confirmed filesystem".into());
         }
+        // The mount marked the volume in use and the directory is new: put both on the disk now
+        // (with NTFS this also brings `$MFTMirr` in line with `$MFT`), so a crash later in the
+        // test leaves consistent metadata behind.
+        sync_filesystem(&directory)?;
         Ok(directory)
     }
 
@@ -405,6 +486,155 @@ impl Drop for PreparedAreas {
             eprintln!("{error}");
         }
     }
+}
+
+/// Name prefix of every test directory (and test file) this tool creates.
+const STALE_PREFIX: &str = ".cpu-nvme-dit-";
+
+/// Flushes the whole filesystem holding `path` (`syncfs`): data, file metadata and, with NTFS,
+/// `$MFTMirr`.
+///
+/// # Errors
+///
+/// Fails when the path cannot be opened or the filesystem reports a write error.
+pub fn sync_filesystem(path: &Path) -> Result<()> {
+    let handle = fs::File::open(path)?;
+    nix::unistd::syncfs(&handle)?;
+    Ok(())
+}
+
+/// Keeps the test filesystems flushed while a test runs: `syncfs` on each every `period`, and
+/// once more when dropped. A crash mid-test then finds the metadata as of a few seconds before.
+pub struct SyncKeeper {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    paths: Vec<PathBuf>,
+}
+
+impl SyncKeeper {
+    #[must_use]
+    pub fn start(paths: Vec<PathBuf>, period: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let watched = paths.clone();
+        let thread = std::thread::Builder::new()
+            .name("fs-sync".into())
+            .spawn(move || {
+                let tick = std::time::Duration::from_millis(200);
+                let mut waited = std::time::Duration::ZERO;
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::sleep(tick);
+                    waited += tick;
+                    if waited >= period {
+                        waited = std::time::Duration::ZERO;
+                        for path in &watched {
+                            let _ = sync_filesystem(path);
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self {
+            stop,
+            thread,
+            paths,
+        }
+    }
+}
+
+impl Drop for SyncKeeper {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for path in &self.paths {
+            let _ = sync_filesystem(path);
+        }
+    }
+}
+
+/// Seconds since the epoch when this system booted (`btime` in `/proc/stat`).
+fn boot_time() -> Option<u64> {
+    fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Whether a directory entry is a test directory left by an earlier boot: our name prefix, a
+/// real directory on the same filesystem, last changed before this boot (so no test of this boot
+/// can own it).
+fn is_stale(name: &str, metadata: &fs::Metadata, device: u64, boot: Option<u64>) -> bool {
+    name.starts_with(STALE_PREFIX)
+        && metadata.is_dir()
+        && metadata.dev() == device
+        && boot.is_some_and(|boot| u64::try_from(metadata.mtime()).is_ok_and(|t| t < boot))
+}
+
+/// Whether a file inside a stale test directory is one of ours: a test file or a chain record
+/// file with its manifest.
+fn is_test_file(name: &str) -> bool {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("test") => name.starts_with(STALE_PREFIX),
+        Some("bin" | "json") => name.starts_with("dit-chain-"),
+        _ => false,
+    }
+}
+
+/// Removes test directories an interrupted test left at the top of `mount` (a crash or power
+/// loss skips the cleanup): only our own file names inside, then the directory if that emptied
+/// it. Anything else is left in place. Returns one line per directory handled.
+fn remove_stale(mount: &Path, device: u64, boot: Option<u64>) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(mount) else {
+        return Vec::new();
+    };
+    let mut report = Vec::new();
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(metadata) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !is_stale(&name, &metadata, device, boot) {
+            continue;
+        }
+        let mut bytes = 0_u64;
+        let mut files = 0_u64;
+        if let Ok(inside) = fs::read_dir(entry.path()) {
+            for file in inside.filter_map(std::result::Result::ok) {
+                let file_name = file.file_name().to_string_lossy().into_owned();
+                let Ok(meta) = file.path().symlink_metadata() else {
+                    continue;
+                };
+                if meta.is_file()
+                    && meta.dev() == device
+                    && is_test_file(&file_name)
+                    && fs::remove_file(file.path()).is_ok()
+                {
+                    bytes += meta.blocks() * 512;
+                    files += 1;
+                }
+            }
+        }
+        let emptied = fs::remove_dir(entry.path()).is_ok();
+        report.push(format!(
+            "{} ({files} file(s), {} MiB freed{})",
+            entry.path().display(),
+            bytes / (1024 * 1024),
+            if emptied {
+                ""
+            } else {
+                "; other content left in place"
+            }
+        ));
+    }
+    report
 }
 
 fn verify_signature(plan: &VolumePlan, signature: &str) -> Result<()> {
@@ -465,7 +695,58 @@ mod tests {
         assert!(super::ntfs_refusal(Some(14)).contains("Fast Startup"));
         assert!(super::ntfs_refusal(Some(14)).contains("powercfg /h off"));
         assert!(super::ntfs_refusal(Some(15)).contains("chkdsk"));
+        assert!(super::ntfs_refusal(Some(13)).contains("interrupted"));
         assert!(super::ntfs_refusal(None).contains("refused"));
+    }
+
+    #[test]
+    fn only_crash_leftovers_are_offered_the_ntfsfix_repair() {
+        let refused = |code, detail: &str| super::NtfsRefused {
+            node: "/dev/nvme0n1p1".into(),
+            code: Some(code),
+            detail: detail.into(),
+        };
+        assert!(refused(13, "$MFTMirr does not match $MFT (record 3).").repairable());
+        assert!(refused(15, "").repairable());
+        assert!(!refused(13, "some other corruption").repairable());
+        assert!(
+            !refused(14, "Windows is hibernated").repairable(),
+            "never a hibernated Windows"
+        );
+        assert!(
+            refused(13, "$MFTMirr does not match $MFT")
+                .to_string()
+                .contains("untouched")
+        );
+    }
+
+    #[test]
+    fn stale_test_directories_are_ours_from_an_earlier_boot_only() {
+        let root = std::env::temp_dir().join(format!("dit-stale-{}", std::process::id()));
+        let old = root.join(".cpu-nvme-dit-combined-1-2-1");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(".cpu-nvme-dit-run.test"), vec![0_u8; 8192]).unwrap();
+        std::fs::write(old.join("dit-chain-s.bin"), b"x").unwrap();
+        let other = root.join("photos");
+        std::fs::create_dir_all(&other).unwrap();
+        let kept = root.join(".cpu-nvme-dit-keep");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("user.docx"), b"keep me").unwrap();
+        let device = root.metadata().unwrap().dev();
+        // Everything was made "before boot" when the boot time lies in the future.
+        let future = Some(u64::MAX);
+        assert!(
+            super::remove_stale(&root, device, Some(0)).is_empty(),
+            "made after boot"
+        );
+        let report = super::remove_stale(&root, device, future);
+        assert_eq!(report.len(), 2, "{report:?}");
+        assert!(!old.exists(), "our leftovers are gone");
+        assert!(other.exists(), "other directories are never touched");
+        assert!(kept.join("user.docx").exists(), "foreign files stay");
+        assert!(report.iter().any(|line| line.contains("left in place")));
+        assert!(super::is_test_file("dit-chain-abc.json") && !super::is_test_file("a.bin"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     use super::*;

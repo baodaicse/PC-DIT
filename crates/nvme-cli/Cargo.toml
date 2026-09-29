@@ -16,7 +16,7 @@ dit-ui-core = { path = "../dit-ui-core" }
 dit-source = { path = "../dit-source" }
 dit-system = { path = "../dit-system" }
 fs2.workspace = true
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["fs", "signal"] }
 nvme-backend-file = { path = "../nvme-backend-file" }
 nvme-backend-linux = { path = "../nvme-backend-linux" }
 nvme-engine = { path = "../nvme-engine" }

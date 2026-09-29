@@ -115,6 +115,9 @@ impl DirectFileBackend {
             return Err(BackendError::UnsafeTarget(path));
         }
         file.set_len(capacity_bytes)?;
+        // The new file's record reaches the disk before the load starts: a crash mid-test then
+        // leaves a complete file entry behind, not a half-created one.
+        file.sync_all()?;
         Ok(Self {
             file,
             id: format!("preserving-file:{}", path.display()),

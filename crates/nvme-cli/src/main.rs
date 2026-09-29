@@ -1,5 +1,6 @@
 mod auto_storage;
 mod combined_storage;
+mod format_disk;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dit_contracts::{DeviceId, DeviceReport, Event, EventEnvelope, Phase, RunId, Verdict};
@@ -803,23 +804,30 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         .into());
     }
 
-    let inventory = scan(&scan_options(&args.flags))?;
+    let mut inventory = scan(&scan_options(&args.flags))?;
     if inventory.devices.is_empty() {
         return Err("no NVMe namespace was discovered".into());
     }
-    print!("\x1b[H\x1b[2J");
-    println!(
-        "{}",
-        render_picker(
-            &picker_entries(&inventory),
-            &BTreeSet::new(),
-            TerminalSize::current()
-        )
-    );
-    print!("Select NVMe aliases (example 1,2) or A for all: ");
-    io::stdout().flush()?;
-    let request = read_operator_line()?;
-    let selection = parse_selection(&inventory, request.trim())?;
+    let selection = loop {
+        print!("\x1b[H\x1b[2J");
+        println!(
+            "{}",
+            render_picker(
+                &picker_entries(&inventory),
+                &BTreeSet::new(),
+                TerminalSize::current()
+            )
+        );
+        print!("Select NVMe aliases (example 1,2), A for all, or F to format a disk: ");
+        io::stdout().flush()?;
+        let request = read_operator_line()?;
+        if request.trim().eq_ignore_ascii_case("f") {
+            format_disk::interactive(&inventory, &args.flags.protected_devices)?;
+            inventory = scan(&scan_options(&args.flags))?;
+            continue;
+        }
+        break parse_selection(&inventory, request.trim())?;
+    };
 
     let default_minutes = args.duration_seconds.max(60) / 60;
     print!(
@@ -884,6 +892,7 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     );
     let mut areas = auto_storage::PreparedAreas::default();
     let mut targets = Vec::with_capacity(plans.len());
+    let mut directories = Vec::with_capacity(plans.len());
     for plan in &plans {
         println!("Preparing [{}] {} ...", plan.alias, plan.node.display());
         let prepared = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -901,7 +910,7 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
             if &checked != plan {
                 return Err("volume plan changed during preparation; select again".into());
             }
-            areas.prepare(plan, &session, required)
+            prepare_offering_repair(&mut areas, plan, &session, required)
         })();
         let directory = match prepared {
             Ok(directory) => directory,
@@ -923,6 +932,7 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         };
         println!("  New test directory: {}", directory.display());
         targets.push(format!("{}={}", plan.alias, directory.display()));
+        directories.push(directory);
     }
     let run_args = RunPreservingMultiArgs {
         flags: InventoryFlags {
@@ -956,7 +966,10 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         report: report_path,
         confirm_on_fail: args.confirm_on_fail,
     };
+    // Flushed every few seconds while the test writes, so a crash leaves consistent metadata.
+    let keeper = auto_storage::SyncKeeper::start(directories, FS_SYNC_PERIOD);
     let outcome = run_preserving_multi_command(&run_args);
+    drop(keeper);
     let cleanup = areas.cleanup();
     write_setup_outcome(
         &args.output_dir,
@@ -1080,6 +1093,50 @@ fn parse_ssd_minutes(answer: &str, default_minutes: u64) -> u64 {
             .filter(|minutes| (1..=1440).contains(minutes))
             .unwrap_or(default_minutes),
     }
+}
+
+/// How often the test filesystems are flushed while a test writes to them.
+const FS_SYNC_PERIOD: Duration = Duration::from_secs(10);
+
+/// Prepares `plan`; when the NTFS safety probe refuses a volume in a state an interrupted test
+/// leaves behind, offers the `ntfsfix` repair (operator's choice) and tries once more.
+fn prepare_offering_repair(
+    areas: &mut auto_storage::PreparedAreas,
+    plan: &auto_storage::VolumePlan,
+    session: &str,
+    required: u64,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let error = match areas.prepare(plan, session, required) {
+        Ok(directory) => return Ok(directory),
+        Err(error) => error,
+    };
+    let Some(refused) = error
+        .downcast_ref::<auto_storage::NtfsRefused>()
+        .filter(|refused| refused.repairable())
+    else {
+        return Err(error);
+    };
+    println!("{refused}");
+    println!(
+        "  F) Repair with ntfsfix: rewrites $MFTMirr from $MFT, empties the journal and clears the dirty flag."
+    );
+    println!(
+        "     It is not a full check (chkdsk): use it after a crash of this test, or when the drive holds"
+    );
+    println!("     nothing you need. Otherwise run 'chkdsk /f' on the drive in Windows.");
+    print!("  F = repair and continue, Enter = leave the drive untouched > ");
+    io::stdout().flush()?;
+    if !read_operator_line()?.trim().eq_ignore_ascii_case("f") {
+        return Err(error);
+    }
+    let node = refused.node.clone();
+    let printed = auto_storage::repair_ntfs(&node)
+        .map_err(|repair| format!("ntfsfix repair of {} failed: {repair}", node.display()))?;
+    if let Some(last) = printed.lines().last() {
+        println!("  ntfsfix: {last}");
+    }
+    println!("  Repaired; preparing {} again ...", node.display());
+    areas.prepare(plan, session, required)
 }
 
 fn read_operator_line() -> io::Result<String> {

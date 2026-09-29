@@ -6,9 +6,10 @@
 //! Ctrl+C meant for the tests must not unmount their directories) and releases everything only
 //! on SIGTERM or when its parent disappears.
 use super::{
-    InventoryFlags, WriteLevel, auto_storage, automatic_plans, mib, parse_selection,
-    parse_write_level, picker_entries, read_operator_line, render_picker, revalidate, scan,
-    scan_options, write_selection_file, write_setup_outcome,
+    FS_SYNC_PERIOD, InventoryFlags, WriteLevel, auto_storage, automatic_plans, format_disk, mib,
+    parse_selection, parse_write_level, picker_entries, prepare_offering_repair,
+    read_operator_line, render_picker, revalidate, scan, scan_options, write_selection_file,
+    write_setup_outcome,
 };
 use dit_ui_core::TerminalSize;
 use serde::Serialize;
@@ -129,22 +130,30 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
         holder_pid: std::process::id(),
     };
 
-    let inventory = scan(&scan_options(&args.flags))?;
+    let mut inventory = scan(&scan_options(&args.flags))?;
     if inventory.devices.is_empty() {
         write_plan(&args.output_dir, &none("no NVMe namespace was discovered"))?;
         return Ok(ExitCode::SUCCESS);
     }
-    println!(
-        "{}",
-        render_picker(
-            &picker_entries(&inventory),
-            &BTreeSet::new(),
-            TerminalSize::current()
-        )
-    );
-    let request = prompt(
-        "COMBINED: select NVMe aliases for the SSD layer and data chain (1,2 / A = all / N = no SSD): ",
-    )?;
+    let request = loop {
+        println!(
+            "{}",
+            render_picker(
+                &picker_entries(&inventory),
+                &BTreeSet::new(),
+                TerminalSize::current()
+            )
+        );
+        let request = prompt(
+            "COMBINED: select NVMe aliases for the SSD layer and data chain (1,2 / A = all / N = no SSD / F = format a disk): ",
+        )?;
+        if request.trim().eq_ignore_ascii_case("f") {
+            format_disk::interactive(&inventory, &args.flags.protected_devices)?;
+            inventory = scan(&scan_options(&args.flags))?;
+            continue;
+        }
+        break request;
+    };
     if matches!(
         request.trim().to_ascii_lowercase().as_str(),
         "n" | "none" | ""
@@ -221,7 +230,7 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
         } else {
             required
         };
-        match areas.prepare(plan, &session, need) {
+        match prepare_offering_repair(&mut areas, plan, &session, need) {
             Ok(directory) => {
                 let selected = selection
                     .devices
@@ -291,10 +300,17 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
         return Err(error);
     }
     println!("Storage ready; the combined run takes over the screen.");
+    // Every layer and the chain write under these directories: keep their filesystems flushed,
+    // so a crash of the machine under test leaves consistent metadata (NTFS `$MFTMirr` too).
+    let keeper = auto_storage::SyncKeeper::start(
+        plan.devices.iter().map(|d| d.directory.clone()).collect(),
+        FS_SYNC_PERIOD,
+    );
     let parent = std::os::unix::process::parent_id();
     while !stop.load(Ordering::SeqCst) && std::os::unix::process::parent_id() == parent {
         std::thread::sleep(Duration::from_millis(200));
     }
+    drop(keeper);
     // The chain's files live in the directory prepared above for this session; remove them so
     // the directory can go, even when the session ended before it could (shutdown, crash).
     if let Some(chain_dir) = &plan.chain_dir {

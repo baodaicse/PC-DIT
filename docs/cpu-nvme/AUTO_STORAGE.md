@@ -28,6 +28,27 @@ Nếu một SSD chuẩn bị thất bại, không bắt đầu engine trên nh�
 - Mount ghi/tạo file có thể cập nhật metadata và journal. Không bảo đảm dữ liệu tuyệt đối khi thiết bị thật lỗi; backup dữ liệu quan trọng trước khi stress test.
 - Khi SIGINT/SIGKILL/mất điện kết thúc tiến trình trước cleanup, mount/thư mục/file có thể còn lại. Chưa có recovery tự động sau crash; kiểm tra log, chắc chắn process đã dừng và xác minh đúng file phiên trước khi dọn. Không xóa theo wildcard.
 
+## Khi máy treo giữa lúc test (NTFS mã 13/15) và Format nhanh
+
+Test mount NTFS bằng driver `ntfs3`. Lúc mount, driver đánh dấu volume đang dùng và sửa `$MFT`, nhưng bản sao
+`$MFTMirr` chỉ được ghi khi sync hoặc unmount. Máy treo giữa hai lúc đó (điều có thể xảy ra khi test một máy yếu)
+để lại `$MFTMirr does not match $MFT (record 0)`, và `ntfs-3g.probe` trả mã 13. Tái hiện trên loop image: chép
+ảnh đĩa khi volume còn mount (đúng thứ máy treo để lại) cho mã 13; cùng thao tác sau `syncfs` cho mã 0.
+
+| Biện pháp | Chi tiết |
+|---|---|
+| Sync ngay sau khi chuẩn bị | `syncfs` sau khi mount và tạo thư mục test; file test mới được `fsync` ngay sau khi tạo |
+| Sync định kỳ | `SyncKeeper`: `syncfs` 10 giây một lần trong suốt test (CPU-SSD đơn lẻ và holder của COMBINED, gồm cả file của chain), và một lần khi dừng |
+| Sửa bằng `ntfsfix` | Khi bị từ chối với mã 13 kèm `$MFTMirr does not match $MFT`, hoặc mã 15, màn hình hỏi `F = repair and continue`. Chỉ chạy khi người dùng chọn: `ntfsfix -d` (chép `$MFT` sang `$MFTMirr`, xoá journal, xoá cờ dirty), kiểm lại bằng probe rồi chuẩn bị lại. Không bao giờ đề nghị cho mã 14 (Windows ngủ đông). Không phải `chkdsk`: ổ có dữ liệu cần giữ thì chạy `chkdsk /f` trong Windows |
+| Dọn file của phiên bị treo | Sau khi mount: thư mục `.cpu-nvme-dit-*` ở gốc volume, sửa lần cuối **trước lần boot hiện tại**, trên đúng volume đó: chỉ xoá file của tool (`.cpu-nvme-dit-*.test`, `dit-chain-*.bin/.json`) rồi thư mục nếu đã rỗng; mọi thứ khác giữ nguyên. Màn hình in những gì đã xoá |
+| Thông báo mã 13/15 | Nói rõ nguyên nhân thường gặp (test bị ngắt), rằng SSD chưa chắc hỏng, và ba cách xử lý |
+
+**Format nhanh (phím F ở ô chọn SSD, cả CPU-SSD đơn lẻ và COMBINED):** xoá toàn bộ ổ, tạo GPT một phân vùng, format
+nhanh NTFS (mặc định, Windows đọc được) hoặc ext4, nhãn `SSD-TEST`. Từ chối ổ hệ thống/boot/kết quả DIT, ổ đang mount,
+có swap/holder, chỉ đọc hoặc không có serial ổn định. Phải gõ đúng 4 ký tự cuối số serial của ổ mới chạy; gõ khác là
+huỷ. Lệnh: `wipefs` (từng phân vùng, rồi cả ổ), `sfdisk --wipe always --wipe-partitions always`, `mkntfs --quick` hoặc
+`mkfs.ext4 -E nodiscard,lazy_itable_init=1`. Trên loop disk 2 GiB có phân vùng NTFS cũ: 0,6 giây, probe mã 0.
+
 ## Bằng chứng và kiểm thử
 
 Trong bundle kết quả cuối: `selection.json`, `auto-storage-plan.json` lưu target ID/UUID/filesystem/mount dự kiến; `auto-storage-outcome.json` lưu giai đoạn lỗi và kết quả cleanup khi tiến trình trả về bình thường. `report.json` vẫn là báo cáo engine, không thay thế bằng chứng setup/cleanup. Lỗi cleanup trả exit không thành công, kể cả khi engine đã PASS. `events.jsonl` được ghi ở tmpfs trong lúc test và chỉ copy sau khi file đã đóng.
