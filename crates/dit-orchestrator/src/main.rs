@@ -525,6 +525,8 @@ fn launch_gpu(
     .args(gpu_run_arguments(
         profile, *settings, &suite_dir, &heartbeat,
     ))
+    // Step F3: GPU failures carry where they went wrong (boot option `dit_attribution=1`).
+    .args(args.attribution_checks.then_some("--boundary-checks"))
     .status()?;
     let report_path = suite_dir.join("report.json");
     let completion = if report_path.is_file() {

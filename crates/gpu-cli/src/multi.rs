@@ -319,6 +319,9 @@ fn run_multi(
         if args.async_compute {
             command.arg("--async-compute");
         }
+        if args.boundary_checks {
+            command.arg("--boundary-checks");
+        }
         if let Some(jobs) = args.matrix_jobs {
             command.arg("--matrix-jobs").arg(jobs.to_string());
         }
@@ -1210,6 +1213,7 @@ mod tests {
             inject_vulkan_fault: None,
             progress_file: None,
             fault_events: None,
+            boundary_checks: false,
         };
         for count in [1, 2, 4] {
             let snapshots = devices(count)
@@ -1277,6 +1281,7 @@ mod tests {
             inject_vulkan_fault: None,
             progress_file: None,
             fault_events: None,
+            boundary_checks: false,
         };
         assert_eq!(multi_device_vram_percent(&integrated, &args, 1), 60);
         assert_eq!(multi_device_vram_percent(&integrated, &args, 2), 30);

@@ -617,6 +617,102 @@ pub fn tagged(dot: u32, generation: u64, job: u32, cell: u32) -> u32 {
     (dot ^ epoch).rotate_left(7) ^ job.wrapping_mul(0x9E37_79B9) ^ cell
 }
 
+/// One word's share of a boundary hash (step F3 of the fault attribution roadmap). Must equal
+/// `boundary_mix` in `gpu-cuda/kernels/gemm.cu`: the GPU hashes what it received or produced and
+/// the CPU hashes what it sent or got back, and the two are compared. The word is `XOR`ed with a
+/// key of its position (32-bit multiplies only, cheap on every GPU): a change of one word always
+/// changes the sum (the difference is non-zero mod 2^32), and so does moving words.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub const fn boundary_mix(index: u64, word: u32) -> u32 {
+    word ^ (index as u32).wrapping_mul(0x9E37_79B1)
+        ^ ((index >> 32) as u32).wrapping_mul(0x85EB_CA6B)
+}
+
+/// Boundary hash of a word array: the sum (mod 2^32) of `boundary_mix(index, word)`, so the GPU
+/// can add block results in any order. Any change of one word changes it.
+#[must_use]
+pub fn boundary_hash(words: &[u32]) -> u64 {
+    u64::from(words.iter().enumerate().fold(0_u32, |sum, (i, &w)| {
+        sum.wrapping_add(boundary_mix(i as u64, w))
+    }))
+}
+
+/// [`boundary_hash`] of little-endian bytes (a readback buffer).
+#[must_use]
+pub fn boundary_hash_bytes(bytes: &[u8]) -> u64 {
+    u64::from(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .fold(0_u32, |sum, (i, w)| {
+                sum.wrapping_add(boundary_mix(i as u64, u32::from_le_bytes(*w)))
+            }),
+    )
+}
+
+/// [`boundary_hash`] split over up to `threads` helper threads.
+#[must_use]
+pub fn boundary_hash_threads(words: &[u32], threads: usize) -> u64 {
+    const MIN_CHUNK: usize = 1 << 20;
+    let parts = threads
+        .clamp(1, 16)
+        .min(words.len().div_ceil(MIN_CHUNK))
+        .max(1);
+    if parts == 1 {
+        return boundary_hash(words);
+    }
+    let chunk = words.len().div_ceil(parts);
+    let sum = std::thread::scope(|scope| {
+        let handles: Vec<_> = words
+            .chunks(chunk)
+            .enumerate()
+            .map(|(part, slice)| {
+                scope.spawn(move || {
+                    let first = (part * chunk) as u64;
+                    slice.iter().enumerate().fold(0_u32, |sum, (i, &w)| {
+                        sum.wrapping_add(boundary_mix(first + i as u64, w))
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(0))
+            .fold(0_u32, u32::wrapping_add)
+    });
+    u64::from(sum)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn boundary_hash_vectors_and_properties() {
+        // Fixed vectors: the CUDA kernel must give the same (checked on hardware in gpu-cuda).
+        assert_eq!(boundary_mix(0, 0), 0);
+        assert_eq!(boundary_hash(&[]), 0);
+        let words: Vec<u32> = (0..10_000_u32)
+            .map(|i| i.wrapping_mul(0x9E37_79B9) ^ 7)
+            .collect();
+        let hash = boundary_hash(&words);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(boundary_hash_bytes(&bytes), hash);
+        assert_eq!(boundary_hash_threads(&words, 4), hash);
+        let mut changed = words.clone();
+        changed[1234] ^= 1;
+        assert_ne!(boundary_hash(&changed), hash, "one bit");
+        let mut swapped = words.clone();
+        swapped.swap(3, 4);
+        assert_ne!(boundary_hash(&swapped), hash, "two words swapped");
+        let big: Vec<u32> = (0..(3 << 20) + 17_u32).collect();
+        assert_eq!(boundary_hash_threads(&big, 5), boundary_hash(&big));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

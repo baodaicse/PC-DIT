@@ -1,5 +1,8 @@
 //! GPU-H first async adapter: bounded pinned slots, direct CPU comparison.
 //! A slot is reused only after its verifier returns. CUDA stays on the owner thread.
+use crate::checkpoints::{
+    self, BoundaryCounts, BoundaryFault, BoundaryReport, Checkpoints, GpuCheck, Kind,
+};
 use crate::{
     CudaBackend, Error, Result,
     driver::{Handle, check},
@@ -74,6 +77,11 @@ pub struct AsyncConfig {
     pub sweep: SweepConfig,
     /// Integer GEMM, FP32 FMA GEMM, or both in turn (switching at each corpus rotation).
     pub arith: ArithMix,
+    /// GPU boundary checks (fault attribution step F3): the GPU hashes every corpus upload and
+    /// checks its own output before the copy back, so a failed batch is placed on the link, the
+    /// GPU, its VRAM or the host. Off: nothing of it runs and the report is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub boundary_checks: bool,
 }
 impl Default for AsyncConfig {
     fn default() -> Self {
@@ -95,6 +103,7 @@ impl Default for AsyncConfig {
             lane: LaneConfig::default(),
             sweep: SweepConfig::default(),
             arith: ArithMix::U32,
+            boundary_checks: false,
         }
     }
 }
@@ -123,7 +132,8 @@ impl AsyncConfig {
         Ok(())
     }
     /// Counted allocation steps of one pipeline: input, upload staging, five per device slot
-    /// (buffer, stream, three events), one per host slot and the origin event.
+    /// (buffer, stream, three events), one per host slot, the boundary-check buffers and the
+    /// origin event.
     #[must_use]
     pub fn allocation_steps(self) -> usize {
         let lane = if self.lane.active() {
@@ -131,7 +141,12 @@ impl AsyncConfig {
         } else {
             0
         };
-        3 + 5 * self.device_slots + self.host_slots + lane
+        let checks = if self.boundary_checks {
+            Checkpoints::STEPS
+        } else {
+            0
+        };
+        3 + 5 * self.device_slots + self.host_slots + lane + checks
     }
     fn threads(self) -> usize {
         if self.corpus_threads == 0 {
@@ -180,6 +195,9 @@ pub struct AsyncReport {
     pub sweep: Option<SweepReport>,
     /// CPU share the verifier queue gave compute checks and lane checks.
     pub fairness: Fairness,
+    /// GPU boundary checks (absent when off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<BoundaryReport>,
 }
 
 /// One verifier verdict. Times are CPU core-seconds on the worker.
@@ -193,6 +211,10 @@ struct Verdict {
     hash_seconds: f64,
     queue_wait_seconds: f64,
     mismatch: Option<MismatchSummary>,
+    /// Boundary checks on: where a failed batch went wrong.
+    boundary: Option<Kind>,
+    /// Boundary checks on: the GPU found wrong words in a batch the CPU passed.
+    disagreement: bool,
 }
 
 /// Work for a verifier worker.
@@ -202,6 +224,8 @@ enum Job<'a> {
         bytes: &'a [u8],
         ready_at: Instant,
         hash: bool,
+        /// The GPU's sealed verdict on this output, when the boundary checks are on.
+        gpu_check: GpuCheck,
     },
     Lane {
         action: Action,
@@ -273,8 +297,10 @@ fn verify_batch(
     bytes: &[u8],
     ready_at: Instant,
     hash: bool,
+    gpu_check: GpuCheck,
 ) -> Verdict {
     let started = Instant::now();
+    let generation = batch.generation;
     let queue_wait_seconds = started.duration_since(ready_at).as_secs_f64();
     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match corpus.verify_bytes(batch.generation, bytes) {
@@ -319,6 +345,19 @@ fn verify_batch(
                 None,
             )
         });
+    // Boundary checks: a failure is checked a second time and placed; a pass the GPU disputes
+    // is noted (failure path and one flag only, nothing on a clean pass).
+    let (boundary, disagreement) = match gpu_check {
+        GpuCheck::Off => (None, false),
+        GpuCheck::On(tail) if result.is_err() => {
+            let still_wrong = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                corpus.verify_bytes(generation, bytes).is_err()
+            }))
+            .unwrap_or(true);
+            (Some(checkpoints::classify(bytes, tail, still_wrong)), false)
+        }
+        GpuCheck::On(tail) => (None, tail.is_some_and(|t| t.bad > 0)),
+    };
     Verdict {
         batch,
         result,
@@ -327,6 +366,8 @@ fn verify_batch(
         hash_seconds,
         queue_wait_seconds,
         mismatch,
+        boundary,
+        disagreement,
     }
 }
 
@@ -345,7 +386,7 @@ fn replay_of(seed: u64, generation: u64, jobs: usize, inner: u32) -> ReplayBatch
 }
 
 /// Kernel output plus the stream and events that order it. Released when the D2H copy lands.
-struct DeviceSlot {
+pub(crate) struct DeviceSlot {
     context: Rc<Context>,
     output: Buffer,
     stream: Handle,
@@ -457,6 +498,11 @@ pub(crate) struct Pipeline {
     /// `host_memory_changed` (unlike `failure_attribution`, reset every burst).
     burst_attribution: Option<&'static str>,
     fairness: Fairness,
+    /// Boundary checks (step F3), when on.
+    checks: Option<Checkpoints>,
+    /// The corpus on the device is known wrong (a check found it changed): upload it again
+    /// before the next burst.
+    reupload: bool,
 }
 
 /// A corpus being built on a helper thread for the next rotation.
@@ -488,8 +534,46 @@ impl Drop for Pipeline {
     }
 }
 
+/// Host readback and device bytes of one output slot. With the checks on, the GPU's sealed
+/// verdict rides behind every output; on the device the check's partials and counter follow it.
+fn slot_sizes(config: AsyncConfig, output: usize, jobs: usize) -> (usize, usize) {
+    if config.boundary_checks {
+        let readback = output + checkpoints::TAIL_RESERVE;
+        (readback, readback + checkpoints::partials_bytes(jobs))
+    } else {
+        (output, output)
+    }
+}
+
+/// The fused check's completion counter resets itself after every batch; it starts at zero here,
+/// once per slot.
+pub(crate) fn clear_check_counters(backend: &CudaBackend, devices: &[DeviceSlot]) -> Result<()> {
+    for slot in devices {
+        check("boundary counter clear", unsafe {
+            (backend.context.driver.fill)(
+                checkpoints::counter_address(slot.output.address, slot.output.len),
+                0,
+                4,
+                backend.stream,
+            )
+        })?;
+    }
+    wait_stream(backend, "boundary counter clear")
+}
+
+/// The load controller's configuration. The boundary checks add two short kernels to every
+/// batch's stream; one more batch on the device from the start hides them (the controller still
+/// lowers the limit on verifier backlog or memory pressure).
+fn control_config(config: AsyncConfig) -> ControlConfig {
+    let mut control = ControlConfig::new(config.device_slots, config.host_slots);
+    if config.boundary_checks {
+        control.warm_limit = (control.warm_limit + 1).min(control.device_slots);
+    }
+    control
+}
+
 /// Waits for the owner stream to go idle; bounded, marks the context stopped on timeout.
-fn wait_stream(backend: &CudaBackend, call: &'static str) -> Result<()> {
+pub(crate) fn wait_stream(backend: &CudaBackend, call: &'static str) -> Result<()> {
     let start = Instant::now();
     loop {
         let status = unsafe { (backend.context.driver.stream_query)(backend.stream) };
@@ -533,6 +617,7 @@ impl Pipeline {
         let (input, output, _) = gemm::workspace_per_job(inner);
         let input = usize::try_from(input).map_err(|_| Error::Request("input size"))? * jobs;
         let output = usize::try_from(output).map_err(|_| Error::Request("output size"))? * jobs;
+        let (output, device_output) = slot_sizes(config, output, jobs);
         // Every resource is an owner (RAII) until the pipeline exists, so a failure at any
         // step frees what was already allocated. The raw origin event is created last.
         backend.alloc_step()?;
@@ -540,7 +625,7 @@ impl Pipeline {
         backend.alloc_step()?;
         let upload = Pinned::new(&backend.context, input.len)?;
         let devices = (0..config.device_slots)
-            .map(|_| DeviceSlot::new(backend, output))
+            .map(|_| DeviceSlot::new(backend, device_output))
             .collect::<Result<Vec<_>>>()?;
         let hosts = (0..config.host_slots)
             .map(|_| {
@@ -550,6 +635,10 @@ impl Pipeline {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let checks = config
+            .boundary_checks
+            .then(|| Checkpoints::new(backend, jobs, &devices))
+            .transpose()?;
         let mut lane = config
             .lane
             .active()
@@ -585,10 +674,7 @@ impl Pipeline {
             jobs,
             inner,
             config,
-            controller: LoadController::new(ControlConfig::new(
-                config.device_slots,
-                config.host_slots,
-            )),
+            controller: LoadController::new(control_config(config)),
             scaler: WorkerScaler::new(config.workers, config.workers_max),
             pressure: RefCell::new(PressureSampler::new(PressureConfig {
                 min_available_bytes: config.min_available_bytes,
@@ -610,6 +696,8 @@ impl Pipeline {
             external: false,
             burst_attribution: None,
             fairness: Fairness::default(),
+            checks,
+            reupload: false,
         })
     }
 
@@ -688,8 +776,18 @@ impl Pipeline {
         self.prefetch = None;
         self.corpus.take();
         let corpus = Arc::new(corpus);
+        self.base_seed = Some(corpus.seed);
+        self.batches_on_corpus = 0;
+        self.external = true;
+        self.install(backend, &corpus)
+    }
+
+    /// Uploads `corpus` as the one in use and, with the boundary checks on, checks that the
+    /// device received it (c2). A copy found wrong fails with the boundary tag, after leaving the
+    /// corpus right on the device when a second upload could.
+    fn install(&mut self, backend: &CudaBackend, corpus: &Arc<Corpus>) -> Result<()> {
         self.upload.write_u32(&corpus.input);
-        check("external corpus upload", unsafe {
+        check("async corpus upload", unsafe {
             (backend.context.driver.upload)(
                 self.input.address,
                 self.upload.address,
@@ -697,12 +795,30 @@ impl Pipeline {
                 backend.stream,
             )
         })?;
-        wait_stream(backend, "external corpus upload")?;
-        self.base_seed = Some(corpus.seed);
-        self.batches_on_corpus = 0;
-        self.corpus = Some(corpus);
-        self.external = true;
-        Ok(())
+        wait_stream(backend, "corpus upload")?;
+        self.corpus = Some(Arc::clone(corpus));
+        self.reupload = false;
+        let threads = self.config.threads();
+        let Some(checks) = self.checks.as_mut() else {
+            return Ok(());
+        };
+        checks.prepare(corpus, threads);
+        let outcomes = checks.check_upload(backend, &self.input, &self.upload)?;
+        let (counts, broken) = checkpoints::upload_counts(&outcomes);
+        if counts.is_empty() {
+            return Ok(());
+        }
+        checks.report.counts.add(&counts);
+        self.reupload = broken;
+        Err(Error::Unavailable(format!(
+            "corpus upload check: {} {}",
+            if broken {
+                "the corpus on the GPU is still wrong after a second upload"
+            } else {
+                "the corpus arrived wrong on the GPU and right after a second upload"
+            },
+            counts.tag()
+        )))
     }
 
     pub(crate) fn burst_attribution(&self) -> Option<&'static str> {
@@ -733,6 +849,11 @@ impl Pipeline {
     /// Chooses the corpus for the next burst: reuse, a prefetched rotation, or a
     /// cold build. Only ever called with no batch outstanding.
     fn prepare(&mut self, backend: &CudaBackend, base: u64) -> Result<Prepared> {
+        if self.reupload
+            && let Some(corpus) = self.corpus.clone()
+        {
+            self.install(backend, &corpus)?;
+        }
         if self.external {
             let seed = self
                 .corpus
@@ -797,19 +918,9 @@ impl Pipeline {
         let wait_seconds = waited.elapsed().as_secs_f64();
         // No outstanding batches cross this boundary. Drop old corpus before replacement.
         self.corpus.take();
-        let corpus = Arc::new(corpus);
-        self.upload.write_u32(&corpus.input);
-        check("async corpus upload", unsafe {
-            (backend.context.driver.upload)(
-                self.input.address,
-                self.upload.address,
-                corpus.input.len() * 4,
-                backend.stream,
-            )
-        })?;
-        wait_stream(backend, "corpus upload")?;
-        self.corpus = Some(corpus);
+        let installed = self.install(backend, &Arc::new(corpus));
         self.start_prefetch(base);
+        installed?;
         Ok(Prepared {
             reused: false,
             seed,
@@ -820,7 +931,14 @@ impl Pipeline {
     }
 
     #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
-    fn launch(&self, backend: &CudaBackend, batch: &Batch, bytes: usize, fault: u32) -> Result<()> {
+    fn launch(
+        &self,
+        backend: &CudaBackend,
+        batch: &Batch,
+        bytes: usize,
+        fault: u32,
+        seal_fault: u32,
+    ) -> Result<()> {
         let slot = &self.devices[batch.device_slot];
         let host = &self.hosts[batch.slot];
         // Mark before the first queued operation; error paths retain referenced memory.
@@ -829,6 +947,7 @@ impl Pipeline {
         check("output guards", unsafe {
             (driver.fill)(slot.output.address, 0xA55A_1973, bytes / 4, slot.stream)
         })?;
+        let tail = slot.output.address + checkpoints::tail_offset(bytes) as u64;
         check("compute start", unsafe {
             (driver.event_record)(slot.events[0], slot.stream)
         })?;
@@ -842,10 +961,15 @@ impl Pipeline {
             .ok_or(Error::Request("corpus missing"))?;
         let mut dimension = corpus.n as u32;
         let arith = corpus.arith;
-        let function = match arith {
-            Arith::U32 => backend.function,
-            Arith::F32 => backend.function_f32,
-            Arith::I8 => backend.function_i8,
+        // With the checks on, the u32 and FP32 GEMMs check their own output in the same kernel
+        // (no extra launch); the INT8 tensor GEMM is followed by the separate check kernels.
+        let fused = self.checks.is_some() && arith != Arith::I8;
+        let function = match (arith, fused) {
+            (Arith::U32, false) => backend.function,
+            (Arith::U32, true) => backend.gemm_checked_function,
+            (Arith::F32, false) => backend.function_f32,
+            (Arith::F32, true) => backend.gemm_f32_checked_function,
+            (Arith::I8, _) => backend.function_i8,
         };
         // Tiled GEMMs: one 16x16 block per output tile. Tensor: 4 warps of 16x8 tiles per block.
         let (grid_x, grid_y, block_x, block_y) = if arith == Arith::I8 {
@@ -856,7 +980,13 @@ impl Pipeline {
         let mut lo = batch.generation as u32;
         let mut hi = (batch.generation >> 32) as u32;
         let mut fault = fault;
-        let mut params = [
+        let mut answers = self.checks.as_ref().map_or(0, Checkpoints::answers_address);
+        let mut tail_arg = tail;
+        let mut partials =
+            checkpoints::partials_address(slot.output.address, slot.output.len, self.jobs);
+        let mut counter = checkpoints::counter_address(slot.output.address, slot.output.len);
+        let mut seal = seal_fault;
+        let mut all_params = [
             (&raw mut input).cast::<c_void>(),
             (&raw mut output).cast(),
             (&raw mut jobs).cast(),
@@ -865,7 +995,14 @@ impl Pipeline {
             (&raw mut lo).cast(),
             (&raw mut hi).cast(),
             (&raw mut fault).cast(),
+            (&raw mut answers).cast(),
+            (&raw mut tail_arg).cast(),
+            (&raw mut partials).cast(),
+            (&raw mut counter).cast(),
+            (&raw mut seal).cast(),
         ];
+        // The plain GEMMs take the first eight parameters; the extra ones are then ignored.
+        let params = &mut all_params;
         check("async GEMM", unsafe {
             (driver.launch)(
                 function,
@@ -881,6 +1018,23 @@ impl Pipeline {
                 ptr::null_mut(),
             )
         })?;
+        let readback = match &self.checks {
+            Some(checks) => {
+                if !fused {
+                    self.launch_check(
+                        backend,
+                        slot,
+                        checks.answers_address(),
+                        tail,
+                        lo,
+                        hi,
+                        seal_fault,
+                    )?;
+                }
+                checkpoints::readback_len(bytes)
+            }
+            None => bytes,
+        };
         check("compute end", unsafe {
             (driver.event_record)(slot.events[1], slot.stream)
         })?;
@@ -888,7 +1042,7 @@ impl Pipeline {
             (driver.download)(
                 host.readback.address,
                 slot.output.address,
-                bytes,
+                readback,
                 slot.stream,
             )
         })?;
@@ -896,6 +1050,81 @@ impl Pipeline {
             (driver.event_record)(slot.events[2], slot.stream)
         })?;
         Ok(())
+    }
+
+    /// c3: the GPU checks the output of the batch against the answers and hashes it (one block
+    /// per job, each writing its partial behind the tail), then one block sums the partials and
+    /// seals the tail. Both are queued on the batch's stream, before the copy back.
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+    fn launch_check(
+        &self,
+        backend: &CudaBackend,
+        slot: &DeviceSlot,
+        answers: u64,
+        tail: u64,
+        lo: u32,
+        hi: u32,
+        seal_fault: u32,
+    ) -> Result<()> {
+        let driver = &backend.context.driver;
+        let corpus = self
+            .corpus
+            .as_ref()
+            .ok_or(Error::Request("corpus missing"))?;
+        let mut output = slot.output.address;
+        let mut answers = answers;
+        let mut jobs = self.jobs as u32;
+        let mut n = corpus.n as u32;
+        let mut partials =
+            checkpoints::partials_address(slot.output.address, slot.output.len, self.jobs);
+        let (mut lo, mut hi, mut tail, mut seal_fault) = (lo, hi, tail, seal_fault);
+        let mut params = [
+            (&raw mut output).cast::<c_void>(),
+            (&raw mut answers).cast(),
+            (&raw mut jobs).cast(),
+            (&raw mut n).cast(),
+            (&raw mut lo).cast(),
+            (&raw mut hi).cast(),
+            (&raw mut partials).cast(),
+        ];
+        check("boundary output check", unsafe {
+            (driver.launch)(
+                backend.check_function,
+                jobs,
+                1,
+                1,
+                128,
+                1,
+                1,
+                0,
+                slot.stream,
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        })?;
+        let mut seal = [
+            (&raw mut output).cast::<c_void>(),
+            (&raw mut lo).cast(),
+            (&raw mut tail).cast(),
+            (&raw mut partials).cast(),
+            (&raw mut jobs).cast(),
+            (&raw mut seal_fault).cast(),
+        ];
+        check("boundary seal", unsafe {
+            (driver.launch)(
+                backend.seal_function,
+                1,
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                slot.stream,
+                seal.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        })
     }
 
     #[allow(
@@ -1018,6 +1247,18 @@ impl Pipeline {
         let verified_before = self.verified_total;
         let epoch = self.epoch;
         let mut next_generation = start_generation;
+        // Boundary checks (F3): what each failed batch showed, and the one-shot injections.
+        let checks_on = self.checks.is_some();
+        let mut burst_counts = BoundaryCounts::default();
+        let mut disagreements = 0_u64;
+        let mut seal_fault_pending = self
+            .checks
+            .as_mut()
+            .is_some_and(|c| c.fire(BoundaryFault::AfterCheck));
+        let mut host_fault_pending = self
+            .checks
+            .as_mut()
+            .is_some_and(|c| c.fire(BoundaryFault::HostBuffer));
         // Scoped workers borrow pinned bytes. The owner cannot free them before scope joins.
         // Slot reuse is additionally guarded by the verifier completion ledger.
         thread::scope(|scope| {
@@ -1036,8 +1277,9 @@ impl Pipeline {
                                     bytes,
                                     ready_at,
                                     hash,
+                                    gpu_check,
                                 } => Done::Verdict(verify_batch(
-                                    &corpus, batch, bytes, ready_at, hash,
+                                    &corpus, batch, bytes, ready_at, hash, gpu_check,
                                 )),
                                 Job::Lane { action, ready_at } => run_lane_action(action, ready_at),
                             };
@@ -1093,6 +1335,23 @@ impl Pipeline {
                     wait_total += verdict.queue_wait_seconds;
                     wait_max = wait_max.max(verdict.queue_wait_seconds);
                     let batch = verdict.batch;
+                    if let Some(mut kind) = verdict.boundary {
+                        // Right on the GPU, wrong on the host: a host cell that cannot hold the
+                        // right word is RAM, not the link (the slot is idle until finish()).
+                        if kind == Kind::D2h
+                            && let Some(&(index, expected, _)) =
+                                verdict.mismatch.as_ref().and_then(|m| m.samples.first())
+                            && !checkpoints::host_holds(
+                                &self.hosts[batch.slot].readback,
+                                index,
+                                expected,
+                            )
+                        {
+                            kind = Kind::HostRam;
+                        }
+                        burst_counts.add_kind(kind);
+                    }
+                    disagreements += u64::from(verdict.disagreement);
                     if let Err(error) = ledger.finish(
                         &batch,
                         verdict.result.is_ok(),
@@ -1212,9 +1471,33 @@ impl Pipeline {
                         failure.get_or_insert_with(|| error.into());
                         break;
                     }
+                    if host_fault_pending {
+                        // Injection: one payload byte changes on the host after the copy landed.
+                        host_fault_pending = false;
+                        // SAFETY: the copy has landed and no worker has the slot yet.
+                        unsafe { *host.readback.address.cast::<u8>().add(8) ^= 0x10 };
+                    }
                     // SAFETY: event above completed D2H; no submission may reuse this slot
                     // until finish() consumes the verifier response. Scope keeps allocation alive.
-                    let bytes = unsafe { host.readback.completed_bytes(output_bytes) };
+                    let (bytes, gpu_check) = if checks_on {
+                        let all = unsafe {
+                            host.readback
+                                .completed_bytes(checkpoints::readback_len(output_bytes))
+                        };
+                        (
+                            &all[..output_bytes],
+                            GpuCheck::On(checkpoints::read_tail(
+                                all,
+                                output_bytes,
+                                pending.batch.generation,
+                            )),
+                        )
+                    } else {
+                        (
+                            unsafe { host.readback.completed_bytes(output_bytes) },
+                            GpuCheck::Off,
+                        )
+                    };
                     queue.push(
                         workers::COMPUTE,
                         output_bytes as u64,
@@ -1223,6 +1506,7 @@ impl Pipeline {
                             bytes,
                             ready_at: Instant::now(),
                             hash: hash_policy.should_hash(pending.batch.generation),
+                            gpu_check,
                         },
                     );
                 }
@@ -1341,11 +1625,14 @@ impl Pipeline {
                     match ledger.reserve(batch, output_bytes as u64, now_ms) {
                         Ok(batch) => {
                             let fault = u32::from(inject && next_generation == start_generation);
+                            let seal_fault = u32::from(std::mem::take(&mut seal_fault_pending));
                             next_generation += 1;
                             limit_min = limit_min.min(controller.in_flight_limit);
                             limit_max = limit_max.max(controller.in_flight_limit);
                             slot_generation[batch.slot] = Some(batch.generation);
-                            if let Err(error) = self.launch(backend, &batch, output_bytes, fault) {
+                            if let Err(error) =
+                                self.launch(backend, &batch, output_bytes, fault, seal_fault)
+                            {
                                 backend.context.stopped.set(true);
                                 failure.get_or_insert_with(|| error.to_string());
                             }
@@ -1413,6 +1700,39 @@ impl Pipeline {
         self.controller = controller.clone();
         if self.devices.iter().any(|s| s.in_flight.get()) {
             backend.context.stopped.set(true);
+        }
+        // Boundary checks: after a batch the GPU found wrong (or disputed), check whether the
+        // input or the answers changed in VRAM since their upload check.
+        if let Some(checks) = self.checks.as_mut() {
+            if (burst_counts.device > 0 || disagreements > 0) && !backend.submission_stopped() {
+                match checks.changed_at_rest(backend, &self.input) {
+                    Ok((input_changed, answers_changed)) => {
+                        if input_changed {
+                            burst_counts.vram_input += burst_counts.device;
+                            burst_counts.device = 0;
+                        }
+                        if answers_changed {
+                            burst_counts.vram_answers += 1;
+                            // The GPU's verdicts rested on wrong answers: they place nothing.
+                            if !input_changed {
+                                burst_counts.device = 0;
+                            }
+                        }
+                        self.reupload |= input_changed || answers_changed;
+                    }
+                    Err(error) => {
+                        failure.get_or_insert_with(|| error.to_string());
+                    }
+                }
+            }
+            checks.report.batches_checked += ledger.totals.submitted;
+            checks.report.device_disagreements += disagreements;
+            checks.report.counts.add(&burst_counts);
+            if burst_counts.vram_answers > 0 && ledger.totals.failed == 0 {
+                failure.get_or_insert_with(|| {
+                    "answers held in VRAM changed after their upload check".into()
+                });
+            }
         }
         // Prove the host copy of the corpus unchanged after any failed batch and periodically:
         // damaged host memory would otherwise be reported as a GPU fault.
@@ -1539,6 +1859,10 @@ impl Pipeline {
             );
             failure = Some(failure.map_or(detail.clone(), |e| format!("{e} ({detail})")));
         }
+        let tag = burst_counts.tag();
+        if !tag.is_empty() {
+            failure = failure.map(|e| format!("{e} {tag}"));
+        }
         self.cumulative.add_burst(burst.clone());
         let cells = burst.totals.verified * (self.jobs * corpus.n * corpus.n) as u64;
         match corpus.arith {
@@ -1614,7 +1938,8 @@ impl Pipeline {
                 + self.hosts.iter().map(|s| s.readback.len).sum::<usize>())
                 as u64
                 + self.lane.as_ref().map_or(0, Lane::pinned_bytes)
-                + self.sweeper.as_ref().map_or(0, Sweeper::pinned_bytes),
+                + self.sweeper.as_ref().map_or(0, Sweeper::pinned_bytes)
+                + self.checks.as_ref().map_or(0, Checkpoints::pinned_bytes),
             host_queue_bytes: self.hosts.iter().map(|s| s.readback.len as u64).sum(),
             device_output_bytes: self.devices.iter().map(|s| s.output.len as u64).sum(),
             oldest_pending_ms: ledger
@@ -1626,6 +1951,7 @@ impl Pipeline {
             lane: lane_report,
             sweep: sweep_report,
             fairness: self.fairness,
+            boundary: self.checks.as_ref().map(|c| c.report),
         };
         // An empty burst (deadline reached before any submit) must not look like work.
         *backend.profile.borrow_mut() = (!burst.is_empty()).then(|| ComputeProfile {
@@ -1644,7 +1970,8 @@ impl Pipeline {
             pipeline_reused: true,
             persistent_device_buffer_bytes: (self.input.len
                 + self.devices.iter().map(|s| s.output.len).sum::<usize>())
-                as u64,
+                as u64
+                + self.checks.as_ref().map_or(0, Checkpoints::device_bytes),
             persistent_host_buffer_bytes: report.pinned_bytes,
             host_upload_seconds: prepare_wall,
             submit_wait_seconds: burst.timing.burst_wall_seconds,

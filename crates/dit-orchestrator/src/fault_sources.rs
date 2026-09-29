@@ -390,6 +390,17 @@ pub fn boundary_attribution(kind: &str, gpu: u8) -> Option<(Attribution, &'stati
             Attribution::Unresolved(vec![Component::PcieGpu(gpu), Component::Vram(gpu)]),
             "gpu/boundary_h2d_persistent",
         ),
+        // Right on the GPU, wrong on the host, and the host buffer cannot hold the right word.
+        "host-ram" => (
+            Attribution::Confirmed(Component::Ram),
+            "gpu/boundary_host_ram",
+        ),
+        // The host holds exactly what the GPU checked right, or the CPU's second check passed:
+        // the host's own check or its copy of the answers.
+        "host" => (
+            Attribution::Unresolved(vec![Component::Cpu, Component::Ram]),
+            "gpu/boundary_host",
+        ),
         _ => return None,
     })
 }
@@ -1081,6 +1092,69 @@ mod tests {
             chain_cell("gpu_vram_pcie", "x [boundary: vram-input=2]", 1, 1).0,
             Attribution::Confirmed(Component::Vram(1))
         );
+    }
+
+    /// The failure details the GTX 960 produced for each injected boundary fault (step F3,
+    /// build/f3/inj-*) land on the cells of roadmap section 5.
+    #[test]
+    fn injected_gpu_boundary_faults_land_on_their_cells() {
+        let cases: [(&str, &str, Confidence); 7] = [
+            (
+                "CUDA unavailable: matrix mismatch at 2: expected 0x7bde4333, actual 0x7bde43b3 (burst: 1 failed batches, 64 mismatching words) [boundary: device=1]",
+                "GPU1",
+                Confidence::Suspected,
+            ),
+            (
+                "CUDA unavailable: matrix mismatch at 2: expected 0x7bde4333, actual 0x7bde4323 (burst: 1 failed batches, 1 mismatching words) [boundary: d2h=1]",
+                "PCIe-GPU1",
+                Confidence::Confirmed,
+            ),
+            (
+                "CUDA unavailable: corpus upload check: the corpus arrived wrong on the GPU and right after a second upload [boundary: h2d=1]",
+                "PCIe-GPU1",
+                Confidence::Confirmed,
+            ),
+            (
+                "CUDA unavailable: corpus upload check: the corpus on the GPU is still wrong after a second upload [boundary: h2d-persistent=1]",
+                "PCIe-GPU1|VRAM1",
+                Confidence::Unresolved,
+            ),
+            (
+                "CUDA unavailable: matrix mismatch at 2: expected 0x7bde4333, actual 0x46d9352 (burst: 7 failed batches, 448 mismatching words) [boundary: vram-input=7]",
+                "VRAM1",
+                Confidence::Confirmed,
+            ),
+            (
+                "CUDA unavailable: answers held in VRAM changed after their upload check [boundary: vram-answers=1]",
+                "VRAM1",
+                Confidence::Confirmed,
+            ),
+            (
+                "matrix mismatch (burst: 2 failed batches, 2 mismatching words) [boundary: host=1 host-ram=1]",
+                "CPU|RAM",
+                Confidence::Unresolved,
+            ),
+        ];
+        for (detail, cell, confidence) in cases {
+            let events = gpu_failure_events("compute", detail, 1, 1, false);
+            let placed = boundary_counts(detail).iter().map(|(_, n)| n).sum::<u64>();
+            let total: u64 = events.iter().map(|e| e.count).sum();
+            assert_eq!(total, placed.max(burst_batches(detail)).max(1), "{detail}");
+            assert_eq!(
+                (events[0].cell.as_str(), events[0].confidence),
+                (cell, confidence),
+                "{detail}"
+            );
+        }
+        // Without the checks the same failure stays on the unresolved compute group.
+        let plain = gpu_failure_events(
+            "compute",
+            "CUDA unavailable: matrix mismatch at 2: expected 0x7bde4333, actual 0x7bde43b3 (burst: 1 failed batches, 64 mismatching words)",
+            1,
+            1,
+            false,
+        );
+        assert_eq!(plain[0].cell, "PCIe-GPU1|GPU1|VRAM1");
     }
 
     #[test]

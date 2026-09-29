@@ -434,6 +434,11 @@ struct RunArgs {
     /// fault ledger); with several GPUs each worker writes `device-N/fault-events.jsonl`.
     #[arg(long)]
     fault_events: Option<PathBuf>,
+    /// Async CUDA only: GPU boundary checks (step F3 of the component fault ledger). The GPU
+    /// hashes every corpus upload and checks its own output before the copy back, so a failure is
+    /// placed on the `PCIe` link, the GPU, its VRAM or the host (`[boundary: …]` in its detail).
+    #[arg(long)]
+    boundary_checks: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1830,6 +1835,7 @@ fn pipeline_for_device(args: &RunArgs, device: Option<&VulkanDeviceInfo>) -> Run
         resolved.corpus_threads = None;
         resolved.quarantine_slots = None;
         resolved.bottleneck_log = None;
+        resolved.boundary_checks = false;
         resolved.lane = LaneArgs::default();
     }
     resolved
@@ -1879,6 +1885,7 @@ fn async_config(args: &RunArgs) -> gpu_cuda::AsyncConfig {
         share: args.lane.vram_sweep_share,
         ..gpu_cuda::SweepConfig::default()
     };
+    config.boundary_checks = args.boundary_checks;
     config.workers = config.workers.min(config.host_slots.max(1));
     config.workers_max = config.workers_max.max(config.workers);
     config
@@ -4020,6 +4027,7 @@ mod tests {
             inject_vulkan_fault: None,
             progress_file: None,
             fault_events: None,
+            boundary_checks: false,
         };
         assert_eq!(allocation_target_bytes(&info, &args), 760);
         args.vram_mib = Some(64);
@@ -4085,6 +4093,7 @@ mod tests {
             inject_vulkan_fault: None,
             progress_file: None,
             fault_events: None,
+            boundary_checks: false,
         };
         assert_eq!(effective_vram_percent(&info, &args), 60);
         assert_eq!(allocation_target_bytes(&info, &args), 480);
@@ -4152,6 +4161,7 @@ mod tests {
             inject_vulkan_fault: None,
             progress_file: None,
             fault_events: None,
+            boundary_checks: false,
         };
         assert_eq!(
             resolved_compute_rounds(&args),
@@ -4347,6 +4357,7 @@ mod tests {
             inject_vulkan_fault: None,
             progress_file: None,
             fault_events: None,
+            boundary_checks: false,
         };
         assert!(!should_stop(&args, u64::MAX, Duration::from_secs(1_799)));
         assert!(should_stop(&args, 0, Duration::from_mins(30)));

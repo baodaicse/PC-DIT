@@ -24,19 +24,21 @@ use std::{
 };
 use thiserror::Error;
 mod async_compute;
+mod checkpoints;
 mod driver;
 mod lane;
 mod memory;
 mod sweep;
 mod workers;
 pub use async_compute::{AsyncConfig, AsyncReport};
+pub use checkpoints::{BoundaryCounts, BoundaryFault, BoundaryReport};
 pub use gpu_engine::gemm::{Arith, ArithMix};
 pub use lane::{DmaReport, LaneFailure, LaneFault, LaneReport, VramReport};
 pub use memory::{LiveResources, live_resources};
 pub use sweep::{SweepConfig, SweepReport};
 pub use workers::Fairness;
 
-pub const KERNEL_SHA256: &str = "8a317ca8aaf2596c0916f6ba0428d46307c199ccd2cd07cd549ca857ed4c7e3e";
+pub const KERNEL_SHA256: &str = "6aba864d76585de426bd5732b8736a29a4fdae10975254da041d44e6739c10cb";
 const PTX: &[u8] = include_bytes!("../kernels/gemm.ptx");
 /// INT8 tensor-core GEMM (`kernels/tensor.cu`), built for `compute_80`: loaded only on devices of
 /// compute capability 8.0 or newer.
@@ -100,6 +102,14 @@ pub struct CudaBackend {
     /// GPU-DRAM sweep kernels (16-byte accesses).
     sweep_fill_function: Handle,
     sweep_verify_function: Handle,
+    /// Boundary-check kernels (step F3): hash of a word array, the GPU's check of its own output
+    /// and the seal of that check.
+    hash_function: Handle,
+    check_function: Handle,
+    seal_function: Handle,
+    /// The u32 and FP32 GEMMs with the boundary check fused in (no extra launch per batch).
+    gemm_checked_function: Handle,
+    gemm_f32_checked_function: Handle,
     /// Streaming multiprocessors, to size the sweep grid.
     sm_count: u32,
     /// Whether kernels from different streams can run at once (`CONCURRENT_KERNELS`); without it
@@ -286,6 +296,11 @@ impl CudaBackend {
             verify_function: ptr::null_mut(),
             sweep_fill_function: ptr::null_mut(),
             sweep_verify_function: ptr::null_mut(),
+            hash_function: ptr::null_mut(),
+            check_function: ptr::null_mut(),
+            seal_function: ptr::null_mut(),
+            gemm_checked_function: ptr::null_mut(),
+            gemm_f32_checked_function: ptr::null_mut(),
             sm_count: 1,
             concurrent_kernels: false,
             events: [ptr::null_mut(); 4],
@@ -352,7 +367,7 @@ impl CudaBackend {
         !self.function_i8.is_null()
     }
 
-    /// Every kernel of the module: the u32 and FP32 GEMM, the GPU-local and the sweep kernels.
+    /// Every kernel of the module: the u32 and FP32 GEMM, the GPU-local, sweep and boundary kernels.
     fn load_functions(&mut self) -> Result<()> {
         let context = Rc::clone(&self.context);
         let d = &context.driver;
@@ -365,6 +380,14 @@ impl CudaBackend {
             (
                 &raw mut self.sweep_verify_function,
                 c"dit_vram_sweep_verify",
+            ),
+            (&raw mut self.hash_function, c"dit_hash_words"),
+            (&raw mut self.check_function, c"dit_check_output"),
+            (&raw mut self.seal_function, c"dit_check_seal"),
+            (&raw mut self.gemm_checked_function, c"dit_gemm_checked"),
+            (
+                &raw mut self.gemm_f32_checked_function,
+                c"dit_gemm_f32_checked",
             ),
         ] {
             check("cuModuleGetFunction", unsafe {

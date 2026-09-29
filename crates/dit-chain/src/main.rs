@@ -167,6 +167,10 @@ struct RunArgs {
     keep_file: bool,
     #[command(flatten)]
     output: OutputArgs,
+    /// GPU boundary checks (step F3 of the component fault ledger): a GPU failure carries where
+    /// it went wrong (`[boundary: …]`), which places it apart from `gpu_vram_pcie`.
+    #[arg(long)]
+    boundary_checks: bool,
     /// Negative gate: one injected fault that must be caught and attributed.
     #[arg(long, value_enum)]
     inject: Option<InjectArg>,
@@ -655,7 +659,12 @@ fn check_space(ctx: &mut Ctx, dir: &Path, layout: &Layout, reserve_mib: u64) -> 
 
 /// Opens the first eligible CUDA GPU and prepares the async pipeline for `layout`'s shape
 /// (jobs must not back off: that shape is every record's shape).
-fn open_gpu(ctx: &mut Ctx, layout: &Layout, max_generations: u64) -> Result<CudaBackend, String> {
+fn open_gpu(
+    ctx: &mut Ctx,
+    layout: &Layout,
+    max_generations: u64,
+    boundary_checks: bool,
+) -> Result<CudaBackend, String> {
     ctx.phase("opening");
     let device =
         match CudaBackend::inventory().map(|all| all.into_iter().find(|d| d.hardware_eligible)) {
@@ -675,6 +684,7 @@ fn open_gpu(ctx: &mut Ctx, layout: &Layout, max_generations: u64) -> Result<Cuda
         .configure_async(AsyncConfig {
             batches: max_generations,
             rotate_every_batches: 0,
+            boundary_checks,
             ..AsyncConfig::default()
         })
         .and_then(|()| backend.prepare_matrix_resources(layout.jobs, layout.inner))
@@ -870,7 +880,7 @@ fn prefill_only(args: &PrefillArgs) -> ExitCode {
             return Err("prefill takes only --inject prefill-oracle".to_owned());
         }
         check_space(&mut ctx, &args.dir, &layout, args.shape.reserve_free_mib)?;
-        let backend = open_gpu(&mut ctx, &layout, 1)?;
+        let backend = open_gpu(&mut ctx, &layout, 1, false)?;
         let tensor = backend.tensor_available();
         drop(backend);
         let records = prefill_records(
@@ -959,7 +969,7 @@ fn run(args: &RunArgs) -> ExitCode {
                     cleanup.push(records.path.clone());
                     cleanup.push(manifest::path_for(&records.path));
                 }
-                let backend = open_gpu(&mut ctx, &layout, max_generations)?;
+                let backend = open_gpu(&mut ctx, &layout, max_generations, args.boundary_checks)?;
                 return Ok(read_phase(&mut ctx, args, &layout, &mut records, &backend));
             }
             Some(Err(error)) => return Err(error),
@@ -969,7 +979,7 @@ fn run(args: &RunArgs) -> ExitCode {
                     .as_deref()
                     .ok_or("--dir or --existing is required")?;
                 check_space(&mut ctx, dir, &layout, args.shape.reserve_free_mib)?;
-                let backend = open_gpu(&mut ctx, &layout, max_generations)?;
+                let backend = open_gpu(&mut ctx, &layout, max_generations, args.boundary_checks)?;
                 let records = prefill_records(
                     &mut ctx,
                     dir,

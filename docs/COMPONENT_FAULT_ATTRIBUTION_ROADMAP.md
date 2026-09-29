@@ -394,8 +394,39 @@ Trong quá trình chỉnh: ngưỡng 0,01 cho chữ ký thời gian từng đặ
 với nhiễu nền, nên hạ xuống 0,001; và chỉ riêng số đếm phần cứng từng đẩy lỗi SSD sang `SSD-path`, nên thêm ngưỡng điểm
 tối thiểu và khoảng cách.
 
-### F3 — chưa làm
+### F3 — đường GEMM xong (2026-09-29, sau cờ `--boundary-checks` / boot `dit_attribution=1`)
 
-Cần driver NVIDIA chạy được trên máy phát triển (kernel 7.0.0-34 hiện chưa có module, `cuInit` trả 100) để kiểm kernel
-hash / verify trên GPU và hiệu năng GTX 960. Phần phía `dit-suite` đã sẵn: tag `[boundary: …]` trong chi tiết lỗi GPU
-được `fault_sources::boundary_attribution` đọc và quy ô xác định.
+| Hạng mục | Kết quả |
+|---|---|
+| c2 — sau mỗi lần upload corpus | GPU băm input và đáp án vừa nhận (`dit_hash_words`), so với hash CPU tính trên bản đã gửi. Sai → băm lại (GPU băm hai kết quả khác nhau → `device`), rồi upload lại: đúng → `h2d`, vẫn sai → `h2d-persistent` |
+| c3 — sau mỗi GEMM, trước D2H | gộp vào kernel GEMM (`dit_gemm_checked`, `dit_gemm_f32_checked`; không thêm launch nào): mỗi thread đọc lại từ vừa ghi, so với đáp án đã gắn tag và băm; block xong cuối cùng cộng các phần, seal tail `{bad, seal, hash}` sau output và tự đặt lại bộ đếm. INT8 tensor dùng hai kernel riêng (`dit_check_output`, `dit_check_seal`) |
+| Khi một batch lỗi | CPU kiểm lại chính các byte đó và băm: GPU đã thấy sai → `device`; GPU thấy đúng, host khác → `d2h` (ô RAM host không giữ được từ đúng → `host-ram`); host giống hệt bản GPU đã kiểm, hoặc CPU kiểm lần hai đúng → `host` (`CPU\|RAM`) |
+| Sau burst có lỗi | băm lại input và đáp án trên GPU (hai lần, phải trùng nhau): đổi so với lúc upload → `vram-input` / `vram-answers`, corpus được upload lại |
+| Hàm băm | tổng mod 2^32 của `từ XOR khoá(vị trí)` (chỉ nhân 32 bit, rẻ trên mọi GPU); một từ đổi luôn làm tổng đổi; chung CPU/GPU (`gpu_engine::gemm::boundary_mix`) |
+| Cờ tắt | chạy đúng `dit_gemm` / `dit_gemm_f32` cũ (PTX của chúng không đổi byte nào), report không có mục `boundary`, chi tiết lỗi như cũ |
+| `dit-suite` | lớp GPU và chain trong COMBINED, và GPU-VRAM đơn lẻ, nhận `--boundary-checks` khi `dit_attribution=1`; tag mới `host` → `CPU\|RAM`, `host-ram` → `RAM` |
+
+Kiểm trên GTX 960 (`build/f3/`):
+
+| Kiểm | Kết quả |
+|---|---|
+| Chạy sạch, cờ bật | khoảng 48.000 batch mỗi 30 s, **0** lần GPU và CPU kết luận khác nhau; mọi hash upload trùng hash CPU |
+| Hiệu năng, cấu hình menu (k = 1024, 512 job; 3 cặp xen kẽ, chờ GPU < 50 °C) | 291,6 → 286,9 GOPS: **−1,6 %** (yêu cầu ≤ 5 %) |
+| Hiệu năng, lượt ngắn (k = 256, 64 job) | khoảng −6 %: phần kiểm cố định theo số ô, GEMM tỉ lệ với k |
+| `--inject-hardware-fault matrix` | `[boundary: device=1]` → `GPU1` nghi ngờ; cờ tắt: cùng lỗi, không tag → `PCIe-GPU1\|GPU1\|VRAM1` |
+| lỗi sau khi GPU kiểm, trước D2H (`after-check`) | `d2h=1` → `PCIe-GPU1` xác định |
+| input hỏng sau upload (`h2d`) / hỏng cả sau upload lại (`h2d-persistent`) | `h2d=1` → `PCIe-GPU1` xác định / `h2d-persistent=1` → `PCIe-GPU1\|VRAM1` |
+| input đổi trong VRAM sau khi kiểm (`vram-input`) | 7 batch lỗi, `vram-input=7` → `VRAM1` xác định |
+| đáp án đổi trong VRAM (`vram-answers`) | 32 batch GPU tự kiểm báo sai nhưng CPU đúng → kiểm lúc nghỉ → `vram-answers=1` → `VRAM1`, phiên FAIL |
+| buffer host đổi sau khi copy về (`host-buffer`) | `d2h=1` — giới hạn đã biết, xem dưới |
+| Sổ lỗi | test `injected_gpu_boundary_faults_land_on_their_cells` đưa đúng các dòng lỗi thật trên qua bộ quy ô |
+
+Giới hạn còn lại:
+- Buffer host bị đổi **thoáng qua** sau khi copy về không tách được với lỗi trên đường về: ghi là `d2h`. Ô RAM host hỏng
+  **cố định** thì được bắt (`host-ram`).
+- Lần đọc lại ngay sau khi ghi thường lấy từ L2 cache, nên một ô DRAM hỏng đúng trong vài micro-giây giữa lúc kiểm và
+  lúc copy về cũng bị ghi là `d2h`.
+- Lane DMA (`lane.rs`: băm sau H2D và trước D2H để tách hai chiều của transfer / retention) chưa làm; lỗi lane vẫn là
+  `PCIe-GPU\|VRAM` và được F6 xếp hạng.
+- Bộ điều khiển tải (có sẵn) xét tải theo nhịp 50 ms nhưng burst chỉ 10–20 ms và reset cửa sổ đo, nên hầu như luôn ở
+  `WARMUP` với 2 batch trên GPU. Không do F3; khi bật cờ F3 cho phép 3 batch từ đầu để che độ trễ.

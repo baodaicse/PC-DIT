@@ -317,6 +317,14 @@ struct Session<'a> {
     monitor: HwMonitor,
 }
 
+/// Steps F3/F4: the layer's boundary checks or confirmation on the data path.
+const fn attribution_flag(layer: Layer) -> &'static str {
+    match layer {
+        Layer::CpuRam | Layer::Ssd => "--confirm-on-fail",
+        Layer::Gpu | Layer::Chain => "--boundary-checks",
+    }
+}
+
 fn unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -773,9 +781,8 @@ impl Session<'_> {
                 Layer::Gpu | Layer::Ssd => {}
             }
         }
-        // Steps F3/F4: confirmation on the data path, when switched on.
-        if self.menu.attribution_checks && matches!(layer, Layer::CpuRam | Layer::Ssd) {
-            launch.args.push("--confirm-on-fail".into());
+        if self.menu.attribution_checks {
+            launch.args.push(attribution_flag(layer).into());
         }
         // Step F1: failures are written as they are found and counted on their cells live.
         if layer != Layer::Ssd {
