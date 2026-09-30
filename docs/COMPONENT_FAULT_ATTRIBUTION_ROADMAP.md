@@ -438,3 +438,21 @@ Giới hạn còn lại:
   sai loại; vùng bị khoá nên không có gì khác ghi đè nó.
 - Bộ điều khiển tải (có sẵn) xét tải theo nhịp 50 ms nhưng burst chỉ 10–20 ms và reset cửa sổ đo, nên hầu như luôn ở
   `WARMUP` với 2 batch trên GPU. Không do F3; khi bật cờ F3 cho phép 3 batch từ đầu để che độ trễ.
+
+### Mục boot riêng "DIT-01 Fault Attribution" (2026-09-30)
+
+Bật F3/F4 không cần sửa dòng lệnh kernel: menu GRUB (image và ISO) có mục riêng
+`DIT-01 Fault Attribution (control center + component checks)` (`--id fault-attribution`), là control center thường
+cộng `dit_attribution=1`. Mục mặc định vẫn là control center thường, không bật gì.
+
+| Trong chế độ này | Chạy thêm |
+|---|---|
+| Control center | tiêu đề `FAULT ATTRIBUTION`, hai dòng báo những kiểm nào đang bật |
+| COMBINED | lớp GPU và chain `--boundary-checks`; CPU-RAM và SSD `--confirm-on-fail` |
+| GPU-VRAM đơn lẻ | `--boundary-checks` |
+| CPU-SSD đơn lẻ | `--confirm-on-fail` |
+| CPU-RAM đơn lẻ (Safe / Full / Compute từ giao diện CPU) | `boot-runner.sh` thêm `--confirm-on-fail` cho `dit-cli system-run`; `session.txt` ghi `Fault attribution: on` |
+| Kết quả | cột `test` của `fail-summary.csv` có đuôi ` +ATTRIBUTION`; `combined-report.json` có `attribution_checks: true` |
+
+`tools/test_boot_policy.sh` kiểm: mục có mặt, `dit_attribution=1` chỉ nằm trong mục đó, mục thường không có, và
+`boot-runner.sh` truyền cờ cho CPU-RAM và control center.

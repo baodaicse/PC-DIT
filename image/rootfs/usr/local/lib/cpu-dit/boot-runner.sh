@@ -147,6 +147,8 @@ case "$TEMP_LIMIT_SETTING" in
 esac
 echo "Temperature limit: $([[ "$TEMP_LIMIT_ENABLED" == 1 ]] && echo on || echo off) (${TEMPERATURE_LIMIT_C} C)" \
     | tee -a "$RUN_DIR/session.txt"
+echo "Fault attribution: $([[ "$(cmdline_value dit_attribution || true)" == 1 ]] && echo on || echo off)" \
+    | tee -a "$RUN_DIR/session.txt"
 echo "Kernel: $(uname -r)" | tee -a "$RUN_DIR/session.txt"
 echo "UTC start: $(date -u --iso-8601=seconds)" | tee -a "$RUN_DIR/session.txt"
 
@@ -251,6 +253,11 @@ SYSTEM_ARGS=(
 )
 if [[ "$TEMP_LIMIT_ENABLED" == 1 ]]; then
     SYSTEM_ARGS+=(--enable-temperature-limit)
+fi
+# Fault Attribution boot entry (dit_attribution=1): a failing RAM word is re-checked from another
+# CPU and rewritten, so the failure is counted on CPU or RAM.
+if [[ "$(cmdline_value dit_attribution || true)" == 1 ]]; then
+    SYSTEM_ARGS+=(--confirm-on-fail)
 fi
 
 case "$PROFILE" in

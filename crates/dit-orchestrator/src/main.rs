@@ -124,7 +124,11 @@ fn registry(args: &MenuArgs) -> Vec<ModuleRegistration> {
 }
 
 fn render(args: &MenuArgs) -> String {
-    let mut frame = render_module_menu(&registry(args), usize::from(TerminalSize::current().cols));
+    let mut frame = render_module_menu(
+        &registry(args),
+        usize::from(TerminalSize::current().cols),
+        args.attribution_checks,
+    );
     if let Some(recovery) = interrupted_run_notice(&args.results_root) {
         frame.push_str("\nWATCHDOG RECOVERY: ");
         frame.push_str(&recovery);
@@ -297,6 +301,7 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &suite_dir,
                 &suite_run_id,
                 verdict_name(report.aggregate_verdict),
+                args.attribution_checks,
             )
         )
     } else if !nvme_status.success() {
@@ -561,6 +566,7 @@ fn launch_gpu(
             &suite_dir,
             &suite_run_id,
             verdict_name(report.verdict),
+            args.attribution_checks,
         ));
         message
     } else if status.success() {

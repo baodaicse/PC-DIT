@@ -349,15 +349,38 @@ pub fn aggregate_module_verdicts(results: &[ModuleResult]) -> Verdict {
 }
 
 #[must_use]
-pub fn render_module_menu(registry: &[ModuleRegistration], width: usize) -> String {
+/// The control center menu. `attribution`: booted with the Fault Attribution entry
+/// (`dit_attribution=1`), shown in the header so the operator knows which checks run.
+pub fn render_module_menu(
+    registry: &[ModuleRegistration],
+    width: usize,
+    attribution: bool,
+) -> String {
     let width = width.clamp(60, 180);
     let inner = width - 2;
     let mut lines = vec![
         format!("+{}+", "-".repeat(inner)),
-        menu_line("DIT CONTROL CENTER // SELECT TEST MODULE", inner),
+        menu_line(
+            if attribution {
+                "DIT CONTROL CENTER // FAULT ATTRIBUTION // SELECT TEST MODULE"
+            } else {
+                "DIT CONTROL CENTER // SELECT TEST MODULE"
+            },
+            inner,
+        ),
         menu_line("CPU-RAM, CPU-SSD and GPU-VRAM share one boot image", inner),
-        format!("+{}+", "-".repeat(inner)),
     ];
+    if attribution {
+        lines.push(menu_line(
+            "Fault attribution ON: GPU boundary checks, CPU-RAM and SSD re-check on failure",
+            inner,
+        ));
+        lines.push(menu_line(
+            "Each FAIL is counted on its part; results are marked +ATTRIBUTION",
+            inner,
+        ));
+    }
+    lines.push(format!("+{}+", "-".repeat(inner)));
     for (index, registration) in registry.iter().enumerate() {
         let state = if registration.available {
             "READY"
@@ -505,7 +528,7 @@ mod tests {
                 schema_version: 1,
             },
         ];
-        let frame = render_module_menu(&registry, 100);
+        let frame = render_module_menu(&registry, 100, false);
         assert!(frame.contains("CPU + RAM"));
         assert!(frame.contains("CPU + SSD"));
         assert!(frame.contains("NOT INSTALLED"));
@@ -514,7 +537,14 @@ mod tests {
             "format is a tool of the menu, not of a test"
         );
         assert!(frame.lines().all(|line| line.chars().count() == 100));
-        let narrow = render_module_menu(&registry, 60);
+        let narrow = render_module_menu(&registry, 60, false);
+        let attribution = render_module_menu(&registry, 100, true);
+        assert!(attribution.contains("FAULT ATTRIBUTION"));
+        assert!(attribution.contains("+ATTRIBUTION"));
+        assert!(
+            !frame.contains("FAULT ATTRIBUTION"),
+            "the plain entry does not claim it"
+        );
         assert!(narrow.contains("[F] Format SSD (quick, erases a whole disk)"));
     }
 }

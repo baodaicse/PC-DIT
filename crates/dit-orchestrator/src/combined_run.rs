@@ -268,6 +268,9 @@ struct CombinedReport<'a> {
     stopped_by_operator: bool,
     abort_reason: Option<String>,
     settings: Settings,
+    /// Booted with the Fault Attribution entry: GPU boundary checks and CPU-RAM / SSD
+    /// confirmation ran (`dit_attribution=1`).
+    attribution_checks: bool,
     available: Available,
     threads: ThreadPlan,
     gpu_host_budget_bytes: u64,
@@ -315,6 +318,11 @@ struct Session<'a> {
     phase_started: Instant,
     ledger: Ledger,
     monitor: HwMonitor,
+}
+
+/// Mark of a result from the Fault Attribution boot entry (`fail-summary.csv` test column).
+pub(super) const fn attribution_suffix(attribution: bool) -> &'static str {
+    if attribution { " +ATTRIBUTION" } else { "" }
 }
 
 /// Steps F3/F4: the layer's boundary checks or confirmation on the data path.
@@ -1334,9 +1342,10 @@ impl Session<'_> {
             time: super::local_timestamp(),
             image_id: super::image_id(),
             test: format!(
-                "COMBINED {} {}",
+                "COMBINED {} {}{}",
                 self.settings.level.label(),
-                self.settings.intensity.label()
+                self.settings.intensity.label(),
+                attribution_suffix(self.menu.attribution_checks)
             ),
             board: system.board.clone(),
             cpu: system.cpu.clone(),
@@ -1629,6 +1638,7 @@ impl Session<'_> {
             stopped_by_operator: stopped,
             abort_reason: self.abort.clone(),
             settings: self.settings,
+            attribution_checks: self.menu.attribution_checks,
             available: self.available,
             threads: self.threads,
             gpu_host_budget_bytes: self.gpu_budget,

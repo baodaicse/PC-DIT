@@ -22,6 +22,15 @@ impl SingleModule {
         }
     }
 
+    /// Test column of `fail-summary.csv`, marked when the Fault Attribution entry was booted.
+    fn test_label(self, attribution: bool) -> String {
+        format!(
+            "{}{}",
+            self.test(),
+            super::combined_run::attribution_suffix(attribution)
+        )
+    }
+
     const fn test(self) -> &'static str {
         match self {
             Self::Gpu => "GPU-VRAM",
@@ -46,6 +55,7 @@ pub fn summarize(
     run_dir: &Path,
     run_id: &str,
     verdict: &str,
+    attribution: bool,
 ) -> String {
     let Some(report) = std::fs::read(report_path)
         .ok()
@@ -124,7 +134,7 @@ pub fn summarize(
     let meta = CsvMeta {
         time: super::local_timestamp(),
         image_id: super::image_id(),
-        test: module.test().to_owned(),
+        test: module.test_label(attribution),
         board: system.board,
         cpu: system.cpu,
         memory: format!("{} MiB", system.memory_total_bytes / (1024 * 1024)),
@@ -166,6 +176,7 @@ mod tests {
             &dir,
             "suite-gpu-1",
             "FAIL",
+            true,
         );
         // The rules leave retention failures on `PCIe-GPU1|VRAM1`; the five failures sit on two
         // byte offsets only (0 and 5701632), so the ranking (F6) moves them to VRAM1 as suspected.
@@ -175,7 +186,13 @@ mod tests {
         );
         let csv = std::fs::read_to_string(dir.join("fail-summary.csv")).unwrap();
         assert_eq!(csv.lines().count(), 2);
-        assert!(csv.lines().nth(1).unwrap().contains("GPU-VRAM"));
+        assert!(
+            csv.lines()
+                .nth(1)
+                .unwrap()
+                .contains("GPU-VRAM +ATTRIBUTION"),
+            "a Fault Attribution run is marked in the CSV"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
