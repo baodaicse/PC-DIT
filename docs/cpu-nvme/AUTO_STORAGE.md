@@ -43,6 +43,20 @@ Test mount NTFS bằng driver `ntfs3`. Lúc mount, driver đánh dấu volume đ
 | Dọn file của phiên bị treo | Sau khi mount: thư mục `.cpu-nvme-dit-*` ở gốc volume, sửa lần cuối **trước lần boot hiện tại**, trên đúng volume đó: chỉ xoá file của tool (`.cpu-nvme-dit-*.test`, `dit-chain-*.bin/.json`) rồi thư mục nếu đã rỗng; mọi thứ khác giữ nguyên. Màn hình in những gì đã xoá |
 | Thông báo mã 13/15 | Nói rõ nguyên nhân thường gặp (test bị ngắt), rằng SSD chưa chắc hỏng, và ba cách xử lý |
 
+**Lớp SSD bị crash trong phiên (máy vẫn chạy):** file test của lớp đó còn trong thư mục phiên, nên trước đây bước
+dọn (`remove_dir` chỉ xoá thư mục rỗng) báo `SETUP CLEANUP INCOMPLETE … Directory not empty` và **không unmount**:
+volume ở lại `/run/cpu-nvme-dit-…`, chặn cả lần test sau lẫn FORMAT SSD. Nay:
+
+| Chỗ | Cách xử lý |
+|---|---|
+| Dọn của phiên | Trước khi xoá thư mục phiên, xoá file của chính tool trong đó (`.cpu-nvme-dit-*.test`, `dit-chain-*`), rồi unmount như thường |
+| Mount sót của phiên đã chết | Lúc mở CPU-SSD, COMBINED và FORMAT SSD: mount `/run/cpu-nvme-dit-<session>-<alias>` mà tiến trình chủ (PID trong tên phiên, kiểm là `cpu-nvme-dit`) không còn chạy thì được nhả: xoá file của tool trong thư mục test, `syncfs`, unmount, xoá mountpoint; màn hình in `Left by an interrupted test: …`. Mount của test đang chạy và mọi mount khác không bị đụng |
+| FORMAT SSD từ chối | Nói đúng lý do: `in use by a running test (…)`, hoặc `mounted on …; unmount it first` |
+| FORMAT SSD sau `sfdisk` | `partx --update`, rồi kiểm kernel thấy đúng một phân vùng gần trọn ổ trước khi format; nếu kernel còn giữ bảng cũ thì dừng, không format, và bảo khởi động lại |
+
+Kiểm trên loop device (root): volume ext4 mount ở `/run/cpu-nvme-dit-combined-<PID chết>-…-1` có file test của lớp crash,
+file chain và một file lạ → nhả được, 2 file của tool bị xoá, file lạ còn nguyên, volume đã unmount.
+
 **Format nhanh: mục `[F] Format SSD` ở menu chính (control center), ngoài mọi bài test** (lệnh
 `cpu-nvme-dit format-disk`; ổ boot/kết quả được truyền vào như ổ bảo vệ). Màn hình liệt kê từng ổ NVMe cùng phân vùng,
 file system, nhãn, chỗ mount và ghi rõ "can be formatted" hoặc "REFUSED: lý do". Format xoá toàn bộ ổ, tạo GPT một

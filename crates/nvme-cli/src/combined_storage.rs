@@ -8,8 +8,8 @@
 use super::{
     FS_SYNC_PERIOD, InventoryFlags, WriteLevel, auto_storage, automatic_plans, mib,
     parse_selection, parse_write_level, picker_entries, prepare_offering_repair,
-    read_operator_line, render_picker, revalidate, scan, scan_options, write_selection_file,
-    write_setup_outcome,
+    read_operator_line, render_picker, revalidate, scan, scan_options, scan_releasing_stale,
+    write_selection_file, write_setup_outcome,
 };
 use dit_ui_core::TerminalSize;
 use serde::Serialize;
@@ -130,7 +130,7 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
         holder_pid: std::process::id(),
     };
 
-    let inventory = scan(&scan_options(&args.flags))?;
+    let inventory = scan_releasing_stale(&args.flags)?;
     if inventory.devices.is_empty() {
         write_plan(&args.output_dir, &none("no NVMe namespace was discovered"))?;
         return Ok(ExitCode::SUCCESS);

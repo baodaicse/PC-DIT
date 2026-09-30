@@ -112,18 +112,38 @@ fn refusal(
     protected: &[PathBuf],
     tree: &auto_storage::Block,
 ) -> Option<String> {
-    if auto_storage::guard_namespace(device, protected).is_err() {
-        return Some("system, boot, results, swap or held disk, or no stable serial number".into());
-    }
-    if !device.mount_points.is_empty()
-        || device
-            .partition_details
-            .iter()
-            .any(|part| !part.mount_points.is_empty())
+    // Mounts first: the most common reason, and the one worth naming exactly.
+    let mounts: Vec<&String> = device
+        .mount_points
+        .iter()
+        .chain(
+            device
+                .partition_details
+                .iter()
+                .flat_map(|part| &part.mount_points),
+        )
+        .collect();
+    if let Some(mount) = mounts
+        .iter()
+        .find(|mount| auto_storage::held_by_running_test(mount))
     {
         return Some(format!(
-            "{} has a mounted file system; unmount it first",
-            device.device_node.display()
+            "in use by a running test ({mount}); stop that test first"
+        ));
+    }
+    if !mounts.is_empty() {
+        return Some(format!(
+            "mounted on {}; unmount it first",
+            mounts
+                .iter()
+                .map(|mount| mount.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Err(error) = auto_storage::guard_namespace(device, protected) {
+        return Some(format!(
+            "system, boot, results, swap or held disk, or no stable serial number ({error})"
         ));
     }
     if device
@@ -238,6 +258,21 @@ fn wait_for(node: &Path, limit: Duration) -> Result<()> {
     Ok(())
 }
 
+/// The kernel lists exactly one partition, `partition`, over (nearly) the whole disk: the new
+/// table is in use. Otherwise something still held an old partition and nothing is formatted.
+fn verify_new_partition(disk: &Path, partition: &Path) -> Result<()> {
+    let tree = auto_storage::block_tree(disk)?;
+    let whole = tree.size;
+    match tree.children.as_slice() {
+        [only] if only.name == partition && only.size >= whole / 100 * 99 => Ok(()),
+        _ => Err(format!(
+            "the kernel still uses the old partition table of {} (a partition was busy); nothing was formatted. Restart the machine and format again",
+            disk.display()
+        )
+        .into()),
+    }
+}
+
 /// Erases `device` and leaves one freshly formatted partition on it.
 fn format(
     device: &NvmeDevice,
@@ -275,6 +310,13 @@ fn format(
         60,
         Some(&sfdisk_script(filesystem)),
     )?;
+    // The kernel must see the new table, not keep the old partition under the same name.
+    let _ = run(
+        "partx",
+        &["--update".into(), disk.display().to_string()],
+        30,
+        None,
+    );
     let _ = run(
         "udevadm",
         &["settle".into(), "--timeout=15".into()],
@@ -283,6 +325,7 @@ fn format(
     );
     let partition = partition_node(&disk);
     wait_for(&partition, Duration::from_secs(15))?;
+    verify_new_partition(&disk, &partition)?;
     println!(
         "  Quick format {} as {} ...",
         partition.display(),
@@ -408,7 +451,7 @@ pub(super) fn command(flags: &super::InventoryFlags) -> Result<std::process::Exi
         return Err("the format screen requires a terminal".into());
     }
     loop {
-        let inventory = super::scan(&super::scan_options(flags))?;
+        let inventory = super::scan_releasing_stale(flags)?;
         print!("\x1b[H\x1b[2J");
         println!("FORMAT SSD (quick) // erases EVERYTHING on the chosen NVMe disk");
         println!(

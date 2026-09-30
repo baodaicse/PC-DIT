@@ -813,7 +813,7 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         .into());
     }
 
-    let inventory = scan(&scan_options(&args.flags))?;
+    let inventory = scan_releasing_stale(&args.flags)?;
     if inventory.devices.is_empty() {
         return Err("no NVMe namespace was discovered".into());
     }
@@ -1975,6 +1975,25 @@ fn picker_entries(inventory: &Inventory) -> Vec<PickerEntry> {
             }
         })
         .collect()
+}
+
+/// Scans the `NVMe` disks after releasing the test mounts a dead test left behind (a crashed
+/// layer or a failed cleanup keeps its volume mounted under `/run`, which blocks the next test
+/// and FORMAT SSD alike). What was released is printed.
+fn scan_releasing_stale(flags: &InventoryFlags) -> Result<Inventory, Box<dyn std::error::Error>> {
+    let inventory = scan(&scan_options(flags))?;
+    let released: Vec<String> = inventory
+        .devices
+        .iter()
+        .flat_map(auto_storage::release_stale_mounts)
+        .collect();
+    if released.is_empty() {
+        return Ok(inventory);
+    }
+    for line in &released {
+        println!("Left by an interrupted test: {line}");
+    }
+    Ok(scan(&scan_options(flags))?)
 }
 
 fn scan_options(flags: &InventoryFlags) -> ScanOptions {

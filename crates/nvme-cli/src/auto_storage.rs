@@ -464,7 +464,10 @@ impl OwnedArea {
             return Err("mount identity changed; leaving paths untouched".into());
         }
         if let Some(directory) = &self.directory {
-            // Empty directory only. Never recursively delete a test file or existing data.
+            // The directory is this session's own. A layer that crashed leaves its test file
+            // behind: remove this tool's own files (by name, on this filesystem), then the
+            // directory, which fails if anything else is in it. Nothing else is ever deleted.
+            remove_own_files(directory, self.device_number);
             fs::remove_dir(directory)?;
             self.directory = None;
         }
@@ -588,6 +591,100 @@ fn is_test_file(name: &str) -> bool {
     }
 }
 
+/// Removes this tool's own files (test files, chain records) from a test directory it created:
+/// regular files on `device` only. Returns how many files and bytes went.
+fn remove_own_files(directory: &Path, device: u64) -> (u64, u64) {
+    let (mut files, mut bytes) = (0, 0);
+    let Ok(inside) = fs::read_dir(directory) else {
+        return (files, bytes);
+    };
+    for file in inside.filter_map(std::result::Result::ok) {
+        let name = file.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = file.path().symlink_metadata() else {
+            continue;
+        };
+        if meta.is_file()
+            && meta.dev() == device
+            && is_test_file(&name)
+            && fs::remove_file(file.path()).is_ok()
+        {
+            bytes += meta.blocks() * 512;
+            files += 1;
+        }
+    }
+    (files, bytes)
+}
+
+/// Mount points this tool makes for a test: `/run/cpu-nvme-dit-<session>-<alias>`.
+const MOUNT_PREFIX: &str = "/run/cpu-nvme-dit-";
+
+/// Process that owns a test mount, from its name: the session is `combined-<pid>-<nanos>` (the
+/// COMBINED storage holder) or `<pid>-<nanos>` (a CPU-SSD run).
+fn mount_owner(mount: &str) -> Option<u32> {
+    let session = mount.strip_prefix(MOUNT_PREFIX)?;
+    let session = session.strip_prefix("combined-").unwrap_or(session);
+    session.split('-').next()?.parse().ok()
+}
+
+/// Whether `pid` is a live `cpu-nvme-dit` (a reused PID of another program does not count).
+fn owner_alive(pid: u32) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|command| String::from_utf8_lossy(&command).contains("cpu-nvme-dit"))
+}
+
+/// Whether a mount point is one of this tool's test mounts and its process is still running.
+#[must_use]
+pub fn held_by_running_test(mount: &str) -> bool {
+    mount_owner(mount).is_some_and(owner_alive)
+}
+
+/// Releases the test mounts of `device` whose process is gone (it crashed, or its cleanup
+/// failed and it exited): this tool's own files in the test directory, the directory, the mount
+/// and the mount point. Mounts of a running test and every other mount are left alone. Returns
+/// one line per mount handled.
+pub fn release_stale_mounts(device: &NvmeDevice) -> Vec<String> {
+    let mounts: Vec<&String> = device
+        .mount_points
+        .iter()
+        .chain(
+            device
+                .partition_details
+                .iter()
+                .flat_map(|part| &part.mount_points),
+        )
+        .collect();
+    let mut report = Vec::new();
+    for mount in mounts {
+        if mount_owner(mount).is_none_or(owner_alive) {
+            continue;
+        }
+        let path = Path::new(mount);
+        let released = (|| -> Result<(u64, u64)> {
+            let device_number = path.metadata()?.dev();
+            let name = path
+                .file_name()
+                .ok_or("mount point without a name")?
+                .to_string_lossy()
+                .into_owned();
+            let directory = path.join(format!(".{name}"));
+            let (files, bytes) = remove_own_files(&directory, device_number);
+            let _ = fs::remove_dir(&directory);
+            let _ = sync_filesystem(path);
+            output("umount", &["--".as_ref(), path.as_os_str()])?;
+            let _ = fs::remove_dir(path);
+            Ok((files, bytes))
+        })();
+        report.push(match released {
+            Ok((files, bytes)) => format!(
+                "{mount} released ({files} leftover file(s), {} MiB freed, unmounted)",
+                bytes / (1024 * 1024)
+            ),
+            Err(error) => format!("{mount} could not be released: {error}"),
+        });
+    }
+    report
+}
+
 /// Removes test directories an interrupted test left at the top of `mount` (a crash or power
 /// loss skips the cleanup): only our own file names inside, then the directory if that emptied
 /// it. Anything else is left in place. Returns one line per directory handled.
@@ -604,24 +701,7 @@ fn remove_stale(mount: &Path, device: u64, boot: Option<u64>) -> Vec<String> {
         if !is_stale(&name, &metadata, device, boot) {
             continue;
         }
-        let mut bytes = 0_u64;
-        let mut files = 0_u64;
-        if let Ok(inside) = fs::read_dir(entry.path()) {
-            for file in inside.filter_map(std::result::Result::ok) {
-                let file_name = file.file_name().to_string_lossy().into_owned();
-                let Ok(meta) = file.path().symlink_metadata() else {
-                    continue;
-                };
-                if meta.is_file()
-                    && meta.dev() == device
-                    && is_test_file(&file_name)
-                    && fs::remove_file(file.path()).is_ok()
-                {
-                    bytes += meta.blocks() * 512;
-                    files += 1;
-                }
-            }
-        }
+        let (files, bytes) = remove_own_files(&entry.path(), device);
         let emptied = fs::remove_dir(entry.path()).is_ok();
         report.push(format!(
             "{} ({files} file(s), {} MiB freed{})",
@@ -718,6 +798,109 @@ mod tests {
                 .to_string()
                 .contains("untouched")
         );
+    }
+
+    /// Root only (`sudo target/debug/deps/cpu_nvme_dit-* --ignored released`): a volume a dead
+    /// COMBINED holder left mounted, with a crashed layer's test file, a chain record and a file
+    /// that is not ours.
+    #[test]
+    #[ignore = "needs root: loop device, mkfs, mount"]
+    fn released_a_dead_tests_mount() {
+        use std::process::Command as Run;
+        let image = std::env::temp_dir().join(format!("dit-release-{}.img", std::process::id()));
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let loop_dev = String::from_utf8(
+            Run::new("losetup")
+                .args(["--find", "--show"])
+                .arg(&image)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        assert!(
+            Run::new("mkfs.ext4")
+                .args(["-q", "-F", &loop_dev])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mount = "/run/cpu-nvme-dit-combined-999999999-1790767807532051466-1";
+        std::fs::create_dir_all(mount).unwrap();
+        assert!(
+            Run::new("mount")
+                .args([&loop_dev, mount])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let directory =
+            Path::new(mount).join(".cpu-nvme-dit-combined-999999999-1790767807532051466-1");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join(".cpu-nvme-dit-run-1.test"),
+            vec![7_u8; 1 << 20],
+        )
+        .unwrap();
+        std::fs::write(directory.join("dit-chain-s.bin"), b"records").unwrap();
+        std::fs::write(Path::new(mount).join("user-file.txt"), b"not ours").unwrap();
+        let mut disk = device();
+        disk.mount_points = vec![mount.to_owned()];
+        let report = super::release_stale_mounts(&disk);
+        let unmounted = !Path::new(mount).join("user-file.txt").exists();
+        // Look at what is on the volume now.
+        let check = std::env::temp_dir().join(format!("dit-release-check-{}", std::process::id()));
+        std::fs::create_dir_all(&check).unwrap();
+        Run::new("mount")
+            .arg(&loop_dev)
+            .arg(&check)
+            .status()
+            .unwrap();
+        let kept = check.join("user-file.txt").exists();
+        let gone = !check
+            .join(".cpu-nvme-dit-combined-999999999-1790767807532051466-1")
+            .exists();
+        Run::new("umount").arg(&check).status().unwrap();
+        Run::new("losetup")
+            .args(["-d", &loop_dev])
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_dir(&check);
+        let _ = std::fs::remove_file(&image);
+        println!("{report:?}");
+        assert!(
+            report.len() == 1 && report[0].contains("released"),
+            "{report:?}"
+        );
+        assert!(
+            unmounted && !Path::new(mount).exists(),
+            "mount released and its point removed"
+        );
+        assert!(gone, "the dead test's directory and files are gone");
+        assert!(kept, "a file that is not ours stays");
+    }
+
+    #[test]
+    fn test_mounts_name_their_owner() {
+        assert_eq!(
+            super::mount_owner("/run/cpu-nvme-dit-combined-265187-1790767807532051466-1"),
+            Some(265_187)
+        );
+        assert_eq!(
+            super::mount_owner("/run/cpu-nvme-dit-4242-17907-2"),
+            Some(4242)
+        );
+        assert_eq!(super::mount_owner("/mnt/data"), None);
+        assert_eq!(super::mount_owner("/run/other"), None);
+        assert!(!super::held_by_running_test(
+            "/run/cpu-nvme-dit-combined-999999999-1-1"
+        ));
+        assert!(!super::held_by_running_test("/media/usb"));
     }
 
     #[test]
