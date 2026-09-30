@@ -43,6 +43,8 @@ DIAGNOSTIC_PACKAGES=(
     smartmontools
     nvme-cli
     ntfs-3g
+    fdisk
+    e2fsprogs
     dmidecode
     ethtool
 )
@@ -201,6 +203,20 @@ bootstrap_rootfs() {
     sudo rm -f "$ROOTFS/usr/sbin/policy-rc.d"
     unmount_chroot_filesystems
     sudo touch "$ROOTFS_MARKER"
+}
+
+# Programs the SSD tools run inside the image (FORMAT SSD, NTFS probe/repair, mounts). On Ubuntu
+# 24.04 sfdisk is in the separate `fdisk` package, not util-linux: without it FORMAT SSD failed
+# with exit status 127 after wiping the old table.
+IMAGE_STORAGE_TOOLS=(sfdisk wipefs partx mkntfs mkfs.ext4 ntfsfix ntfs-3g.probe udevadm blkid lsblk findmnt mount umount)
+
+verify_image_storage_tools() {
+    local missing=() tool
+    for tool in "${IMAGE_STORAGE_TOOLS[@]}"; do
+        sudo chroot "$ROOTFS" /bin/sh -c "command -v $tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    (( ${#missing[@]} == 0 )) || die "image rootfs lacks storage tools: ${missing[*]}"
+    log "Storage tools present: ${IMAGE_STORAGE_TOOLS[*]}"
 }
 
 ensure_diagnostic_packages() {
@@ -475,6 +491,7 @@ main() {
     "$ROOT_DIR/tools/build_image_extension.sh"
     bootstrap_rootfs
     ensure_diagnostic_packages
+    verify_image_storage_tools
     disable_nouveau
     configure_gpu_driver_profile
     refresh_pci_ids

@@ -273,6 +273,30 @@ fn verify_new_partition(disk: &Path, partition: &Path) -> Result<()> {
     }
 }
 
+/// Programs the format runs; all are looked up before the disk is touched, so a missing one
+/// never leaves a wiped disk without a partition table.
+fn required_programs(filesystem: Filesystem) -> [&'static str; 5] {
+    [
+        "wipefs",
+        "sfdisk",
+        "partx",
+        "udevadm",
+        filesystem.mkfs(Path::new("/dev/null")).0,
+    ]
+}
+
+/// Programs of `names` that are not on `PATH` (or `/sbin`, `/usr/sbin`).
+fn missing_programs<'a>(names: &[&'a str]) -> Vec<&'a str> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut directories: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    directories.extend(["/sbin", "/usr/sbin", "/bin", "/usr/bin"].map(PathBuf::from));
+    names
+        .iter()
+        .copied()
+        .filter(|name| !directories.iter().any(|dir| dir.join(name).is_file()))
+        .collect()
+}
+
 /// Erases `device` and leaves one freshly formatted partition on it.
 fn format(
     device: &NvmeDevice,
@@ -280,6 +304,14 @@ fn format(
     filesystem: Filesystem,
 ) -> Result<PathBuf> {
     let disk = device.device_node.clone();
+    let missing = missing_programs(&required_programs(filesystem));
+    if !missing.is_empty() {
+        return Err(format!(
+            "this image lacks {} (packages fdisk / util-linux / ntfs-3g / e2fsprogs); nothing was changed. Use an image built after this fix",
+            missing.join(", ")
+        )
+        .into());
+    }
     println!("  Clearing old signatures ...");
     // Best effort per partition (wipefs may decline a nested signature); the whole-disk wipe and
     // sfdisk's own wipe of the new partition below are what count.
@@ -476,6 +508,17 @@ pub(super) fn command(flags: &super::InventoryFlags) -> Result<std::process::Exi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_programs_are_found_before_the_disk_is_touched() {
+        assert!(missing_programs(&["sh"]).is_empty());
+        assert_eq!(
+            missing_programs(&["sh", "no-such-program-dit"]),
+            vec!["no-such-program-dit"]
+        );
+        assert!(required_programs(Filesystem::Ntfs).contains(&"sfdisk"));
+        assert!(required_programs(Filesystem::Ext4).contains(&"mkfs.ext4"));
+    }
 
     #[test]
     fn partitions_scripts_and_confirmation() {

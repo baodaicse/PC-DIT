@@ -59,6 +59,16 @@ class UnifiedProjectTests(unittest.TestCase):
         self.assertIn('"gpu_pipeline": "GPU-G3-1"', extension)
         self.assertIn('gpu_cuda_kernel_sha256', extension)
 
+    def test_image_carries_the_storage_tools(self):
+        # FORMAT SSD needs sfdisk, which Ubuntu 24.04 ships in `fdisk`, not util-linux
+        # (missing it failed with exit status 127 after the old table was wiped).
+        builder = (ROOT / "tools/build_boot_image.sh").read_text()
+        for package in ("fdisk", "ntfs-3g", "e2fsprogs"):
+            self.assertIn(f"\n    {package}\n", builder)
+        self.assertIn("verify_image_storage_tools\n", builder)
+        for tool in ("sfdisk", "wipefs", "partx", "mkntfs", "mkfs.ext4", "ntfsfix"):
+            self.assertIn(tool, builder.split("IMAGE_STORAGE_TOOLS=(", 1)[1].split(")", 1)[0])
+
     def test_image_tools_agree_on_filename(self):
         for name in ("build_boot_image.sh", "burn_usb.sh", "run_image_local.sh", "test_boot_image_qemu.sh"):
             self.assertIn("dit-01-noble-amd64.img", (ROOT / "tools" / name).read_text())
