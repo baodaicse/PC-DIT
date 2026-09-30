@@ -1,5 +1,6 @@
-//! Quick format of a whole SSD from the SSD selection (key F): after a crash left a test
-//! volume unusable, or to give a blank drive a filesystem to test on. It erases everything on
+//! Quick format of a whole SSD, from its own screen in the control center (key F, outside any
+//! test): after a crash left a test volume unusable, or to give a blank drive a file system to
+//! test on. It erases everything on
 //! the disk, so it runs only when the operator types the last characters of the disk's serial
 //! number, and never on a system, boot, results, swap or mounted disk.
 //!
@@ -111,8 +112,8 @@ fn refusal(
     protected: &[PathBuf],
     tree: &auto_storage::Block,
 ) -> Option<String> {
-    if let Err(error) = auto_storage::guard_namespace(device, protected) {
-        return Some(error.to_string());
+    if auto_storage::guard_namespace(device, protected).is_err() {
+        return Some("system, boot, results, swap or held disk, or no stable serial number".into());
     }
     if !device.mount_points.is_empty()
         || device
@@ -167,9 +168,16 @@ fn describe(device: &NvmeDevice, tree: &auto_storage::Block) -> String {
         );
     }
     for part in &tree.children {
+        let mounted = device
+            .partition_details
+            .iter()
+            .find(|detail| detail.device_node == part.name)
+            .map(|detail| detail.mount_points.join(","))
+            .filter(|mounts| !mounts.is_empty())
+            .map_or_else(String::new, |mounts| format!("  mounted on {mounts}"));
         let _ = writeln!(
             text,
-            "      {}  {}  {}  {:.1} GiB",
+            "      {}  {}  {}  {:.1} GiB{mounted}",
             part.name.display(),
             part.fstype.as_deref().unwrap_or("-"),
             part.label.as_deref().unwrap_or("-"),
@@ -292,70 +300,134 @@ fn format(
     Ok(partition)
 }
 
-/// The F key of the SSD selection: pick a disk, confirm, format. Errors are printed, never
-/// fatal to the caller, which rescans afterwards.
-pub(super) fn interactive(inventory: &Inventory, protected: &[PathBuf]) -> io::Result<()> {
-    println!();
-    println!("FORMAT DISK (quick): erases EVERYTHING on the chosen NVMe disk and leaves one");
-    println!("partition with a new file system labelled {LABEL}. System, boot, results, swap and");
-    println!("mounted disks are refused.");
-    let answer = ask("Disk alias to format (Enter = cancel) > ")?;
-    let Ok(alias) = answer.trim().parse::<usize>() else {
-        println!("Format cancelled.");
-        return Ok(());
-    };
-    let Some(device) = inventory
-        .devices
-        .iter()
-        .find(|device| device.index == alias)
-    else {
-        println!("No NVMe disk has alias {alias}; format cancelled.");
-        return Ok(());
-    };
-    let tree = match auto_storage::block_tree(&device.device_node) {
-        Ok(tree) => tree,
-        Err(error) => {
-            println!(
-                "Cannot read the partitions of {}: {error}",
-                device.device_node.display()
-            );
-            return Ok(());
+/// The disks of the format screen: each with its partitions and whether it may be formatted.
+fn render_disks(inventory: &Inventory, protected: &[PathBuf]) -> String {
+    let rule = "-".repeat(78);
+    let mut text = format!("{rule}\n");
+    for device in &inventory.devices {
+        match auto_storage::block_tree(&device.device_node) {
+            Ok(tree) => {
+                text.push_str(&describe(device, &tree));
+                let _ = writeln!(
+                    text,
+                    "      -> {}",
+                    refusal(device, protected, &tree).map_or_else(
+                        || "can be formatted".to_owned(),
+                        |reason| format!("REFUSED: {reason}")
+                    )
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    text,
+                    "  [{}] {}  {}  -> REFUSED: partitions unreadable ({error})",
+                    device.index,
+                    device.device_node.display(),
+                    device.model.trim()
+                );
+            }
         }
-    };
-    if let Some(reason) = refusal(device, protected, &tree) {
-        println!("Format refused: {reason}");
-        return Ok(());
     }
-    print!("{}", describe(device, &tree));
-    let Some(filesystem) = Filesystem::parse(&ask(
-        "File system: N) NTFS (default; Windows reads it afterwards)  E) ext4 > ",
-    )?) else {
-        println!("Unknown file system; format cancelled.");
-        return Ok(());
-    };
-    let code = confirm_code(&device.serial);
-    let answer = ask(&format!(
-        "ALL DATA on {} will be lost. Type the last {CONFIRM_CHARS} characters of its serial number ({}) to format it as {}, anything else cancels > ",
-        device.device_node.display(),
-        "*".repeat(CONFIRM_CHARS),
-        filesystem.label()
-    ))?;
-    if !confirmed(&answer, &device.serial) || code.len() < CONFIRM_CHARS {
-        println!("Serial does not match; nothing was changed.");
-        return Ok(());
+    let _ = writeln!(text, "{rule}");
+    text
+}
+
+/// One pass of the screen: pick a disk, confirm, format. `Ok(false)` when the operator goes
+/// back to the control center (Enter at the disk prompt).
+fn format_one(inventory: &Inventory, protected: &[PathBuf]) -> io::Result<bool> {
+    let answer = ask("Disk alias to format (Enter = back to the control center) > ")?;
+    if answer.trim().is_empty() {
+        return Ok(false);
     }
-    match format(device, &tree, filesystem) {
-        Ok(partition) => println!(
-            "Format done: {} ({} {LABEL}). The disk is listed again below.",
-            partition.display(),
+    let outcome = (|| -> io::Result<String> {
+        let Ok(alias) = answer.trim().parse::<usize>() else {
+            return Ok(format!(
+                "'{}' is not a disk alias; nothing was changed.",
+                answer.trim()
+            ));
+        };
+        let Some(device) = inventory
+            .devices
+            .iter()
+            .find(|device| device.index == alias)
+        else {
+            return Ok(format!(
+                "No NVMe disk has alias {alias}; nothing was changed."
+            ));
+        };
+        let tree = match auto_storage::block_tree(&device.device_node) {
+            Ok(tree) => tree,
+            Err(error) => {
+                return Ok(format!(
+                    "Cannot read the partitions of {}: {error}",
+                    device.device_node.display()
+                ));
+            }
+        };
+        if let Some(reason) = refusal(device, protected, &tree) {
+            return Ok(format!("Format refused: {reason}"));
+        }
+        print!("{}", describe(device, &tree));
+        let Some(filesystem) = Filesystem::parse(&ask(
+            "File system: N) NTFS (default; Windows reads it afterwards)  E) ext4 > ",
+        )?) else {
+            return Ok("Unknown file system; nothing was changed.".into());
+        };
+        let answer = ask(&format!(
+            "ALL DATA on {} will be lost. Type the last {CONFIRM_CHARS} characters of its serial number ({}) to format it as {}, anything else cancels > ",
+            device.device_node.display(),
+            "*".repeat(CONFIRM_CHARS),
             filesystem.label()
-        ),
-        Err(error) => println!(
-            "FORMAT FAILED: {error}. The disk may hold no usable partition now; run F again."
-        ),
-    }
+        ))?;
+        if confirm_code(&device.serial).chars().count() < CONFIRM_CHARS
+            || !confirmed(&answer, &device.serial)
+        {
+            return Ok("Serial does not match; nothing was changed.".into());
+        }
+        Ok(match format(device, &tree, filesystem) {
+            Ok(partition) => format!(
+                "Format done: {} ({} {LABEL}); it can be tested now.",
+                partition.display(),
+                filesystem.label()
+            ),
+            Err(error) => format!(
+                "FORMAT FAILED: {error}. The disk may hold no usable partition now; format it again."
+            ),
+        })
+    })()?;
+    println!("{outcome}");
     ask("Press Enter to continue > ")?;
-    Ok(())
+    Ok(true)
+}
+
+/// `cpu-nvme-dit format-disk`: the FORMAT SSD screen of the control center (key F there). Lists
+/// the `NVMe` disks, formats the chosen one, and lists them again until the operator goes back.
+pub(super) fn command(flags: &super::InventoryFlags) -> Result<std::process::ExitCode> {
+    use std::io::IsTerminal as _;
+    if !io::stdin().is_terminal() {
+        return Err("the format screen requires a terminal".into());
+    }
+    loop {
+        let inventory = super::scan(&super::scan_options(flags))?;
+        print!("\x1b[H\x1b[2J");
+        println!("FORMAT SSD (quick) // erases EVERYTHING on the chosen NVMe disk");
+        println!(
+            "One GPT partition with a new NTFS or ext4 file system labelled {LABEL} is left on it."
+        );
+        println!(
+            "System, boot, results, swap, mounted and read-only disks are refused; the last {CONFIRM_CHARS}"
+        );
+        println!("characters of the disk's serial number must be typed to confirm.");
+        if inventory.devices.is_empty() {
+            println!("\nNo NVMe disk was found.");
+            ask("Press Enter to go back > ")?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        print!("{}", render_disks(&inventory, &flags.protected_devices));
+        if !format_one(&inventory, &flags.protected_devices)? {
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+    }
 }
 
 #[cfg(test)]

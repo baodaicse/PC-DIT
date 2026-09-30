@@ -6,7 +6,7 @@
 //! Ctrl+C meant for the tests must not unmount their directories) and releases everything only
 //! on SIGTERM or when its parent disappears.
 use super::{
-    FS_SYNC_PERIOD, InventoryFlags, WriteLevel, auto_storage, automatic_plans, format_disk, mib,
+    FS_SYNC_PERIOD, InventoryFlags, WriteLevel, auto_storage, automatic_plans, mib,
     parse_selection, parse_write_level, picker_entries, prepare_offering_repair,
     read_operator_line, render_picker, revalidate, scan, scan_options, write_selection_file,
     write_setup_outcome,
@@ -130,30 +130,22 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
         holder_pid: std::process::id(),
     };
 
-    let mut inventory = scan(&scan_options(&args.flags))?;
+    let inventory = scan(&scan_options(&args.flags))?;
     if inventory.devices.is_empty() {
         write_plan(&args.output_dir, &none("no NVMe namespace was discovered"))?;
         return Ok(ExitCode::SUCCESS);
     }
-    let request = loop {
-        println!(
-            "{}",
-            render_picker(
-                &picker_entries(&inventory),
-                &BTreeSet::new(),
-                TerminalSize::current()
-            )
-        );
-        let request = prompt(
-            "COMBINED: select NVMe aliases for the SSD layer and data chain (1,2 / A = all / N = no SSD / F = format a disk): ",
-        )?;
-        if request.trim().eq_ignore_ascii_case("f") {
-            format_disk::interactive(&inventory, &args.flags.protected_devices)?;
-            inventory = scan(&scan_options(&args.flags))?;
-            continue;
-        }
-        break request;
-    };
+    println!(
+        "{}",
+        render_picker(
+            &picker_entries(&inventory),
+            &BTreeSet::new(),
+            TerminalSize::current()
+        )
+    );
+    let request = prompt(
+        "COMBINED: select NVMe aliases for the SSD layer and data chain (1,2 / A = all / N = no SSD): ",
+    )?;
     if matches!(
         request.trim().to_ascii_lowercase().as_str(),
         "n" | "none" | ""

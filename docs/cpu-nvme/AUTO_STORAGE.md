@@ -43,11 +43,15 @@ Test mount NTFS bằng driver `ntfs3`. Lúc mount, driver đánh dấu volume đ
 | Dọn file của phiên bị treo | Sau khi mount: thư mục `.cpu-nvme-dit-*` ở gốc volume, sửa lần cuối **trước lần boot hiện tại**, trên đúng volume đó: chỉ xoá file của tool (`.cpu-nvme-dit-*.test`, `dit-chain-*.bin/.json`) rồi thư mục nếu đã rỗng; mọi thứ khác giữ nguyên. Màn hình in những gì đã xoá |
 | Thông báo mã 13/15 | Nói rõ nguyên nhân thường gặp (test bị ngắt), rằng SSD chưa chắc hỏng, và ba cách xử lý |
 
-**Format nhanh (phím F ở ô chọn SSD, cả CPU-SSD đơn lẻ và COMBINED):** xoá toàn bộ ổ, tạo GPT một phân vùng, format
-nhanh NTFS (mặc định, Windows đọc được) hoặc ext4, nhãn `SSD-TEST`. Từ chối ổ hệ thống/boot/kết quả DIT, ổ đang mount,
-có swap/holder, chỉ đọc hoặc không có serial ổn định. Phải gõ đúng 4 ký tự cuối số serial của ổ mới chạy; gõ khác là
-huỷ. Lệnh: `wipefs` (từng phân vùng, rồi cả ổ), `sfdisk --wipe always --wipe-partitions always`, `mkntfs --quick` hoặc
-`mkfs.ext4 -E nodiscard,lazy_itable_init=1`. Trên loop disk 2 GiB có phân vùng NTFS cũ: 0,6 giây, probe mã 0.
+**Format nhanh: mục `[F] Format SSD` ở menu chính (control center), ngoài mọi bài test** (lệnh
+`cpu-nvme-dit format-disk`; ổ boot/kết quả được truyền vào như ổ bảo vệ). Màn hình liệt kê từng ổ NVMe cùng phân vùng,
+file system, nhãn, chỗ mount và ghi rõ "can be formatted" hoặc "REFUSED: lý do". Format xoá toàn bộ ổ, tạo GPT một
+phân vùng, format nhanh NTFS (mặc định, Windows đọc được) hoặc ext4, nhãn `SSD-TEST`. Từ chối ổ hệ thống/boot/kết quả
+DIT, ổ đang mount, có swap/holder, chỉ đọc hoặc không có serial ổn định. Phải gõ đúng 4 ký tự cuối số serial của ổ mới
+chạy; gõ khác là huỷ. Enter ở ô chọn ổ quay về menu. Lệnh: `wipefs` (từng phân vùng, cố gắng; rồi cả ổ),
+`sfdisk --wipe always --wipe-partitions always`, `mkntfs --quick` hoặc `mkfs.ext4 -E nodiscard,lazy_itable_init=1`.
+Trên loop disk 2 GiB có phân vùng NTFS cũ: 0,6 giây, probe mã 0. Màn hình chọn SSD của CPU-SSD và COMBINED không có
+lựa chọn format.
 
 ## Bằng chứng và kiểm thử
 

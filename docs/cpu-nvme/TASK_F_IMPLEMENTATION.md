@@ -17,6 +17,7 @@ Binary `dit-suite` là control center khởi chạy khi image chứa extension:
 |  [2] CPU + SSD            READY         dit.cpu-nvme                                                                 |
 |  [3] VGA (future module)  NOT INSTALLED dit.vga                                                                      |
 |  [I] NVMe inventory (read-only)                                                                                      |
+|  [F] Format SSD (quick, erases a whole disk)                                                                         |
 |  [D] Diagnostic shell                                                                                                |
 |  [R] Reboot          [P] Power off                                                                                   |
 +----------------------------------------------------------------------------------------------------------------------+

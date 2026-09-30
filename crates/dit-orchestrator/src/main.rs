@@ -174,6 +174,7 @@ fn dispatch(
                     .status()?;
                 pause("Read-only NVMe inventory completed.")?;
             }
+            "f" => launch_format(args)?,
             "d" => {
                 let _ = ProcessCommand::new("/bin/bash")
                     .args(["--noprofile", "--norc"])
@@ -192,6 +193,22 @@ fn dispatch(
         }
     }
     Ok(false)
+}
+
+/// FORMAT SSD: its own screen (`cpu-nvme-dit format-disk`), outside every test. The boot and
+/// results media are passed as protected, like for the CPU-SSD test.
+fn launch_format(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
+    require_file(&args.nvme_binary, "CPU-SSD binary")?;
+    let mut command = ProcessCommand::new(&args.nvme_binary);
+    command.arg("format-disk");
+    for device in &args.protected_devices {
+        command.arg("--protected-device").arg(device);
+    }
+    let status = command.status()?;
+    if !status.success() {
+        pause("The format screen ended with an error; see the message above.")?;
+    }
+    Ok(())
 }
 
 fn launch_cpu(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {

@@ -376,6 +376,10 @@ pub fn render_module_menu(registry: &[ModuleRegistration], width: usize) -> Stri
         ));
     }
     lines.push(menu_line(" [I] NVMe inventory (read-only)", inner));
+    lines.push(menu_line(
+        " [F] Format SSD (quick, erases a whole disk)",
+        inner,
+    ));
     lines.push(menu_line(" [D] Diagnostic shell", inner));
     lines.push(menu_line(" [R] Reboot          [P] Power off", inner));
     lines.push(format!("+{}+", "-".repeat(inner)));
@@ -505,6 +509,12 @@ mod tests {
         assert!(frame.contains("CPU + RAM"));
         assert!(frame.contains("CPU + SSD"));
         assert!(frame.contains("NOT INSTALLED"));
+        assert!(
+            frame.contains("[F] Format SSD"),
+            "format is a tool of the menu, not of a test"
+        );
         assert!(frame.lines().all(|line| line.chars().count() == 100));
+        let narrow = render_module_menu(&registry, 60);
+        assert!(narrow.contains("[F] Format SSD (quick, erases a whole disk)"));
     }
 }

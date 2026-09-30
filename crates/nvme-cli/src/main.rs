@@ -119,6 +119,8 @@ enum Command {
     /// Combined run: pick SSDs, prepare their test directories (with room for the data chain)
     /// and hold them until SIGTERM, publishing the plan for the combined scheduler.
     CombinedStorage(combined_storage::CombinedStorageArgs),
+    /// FORMAT SSD screen of the control center: quick-format a whole `NVMe` disk (erases it).
+    FormatDisk(FormatDiskArgs),
     /// Run the integrity engine against a regular simulation file only.
     Simulate(SimulateArgs),
     /// Run the positive and full negative campaign in memory.
@@ -135,6 +137,12 @@ struct InventoryFlags {
     /// Mark an extra device node as boot/results protected. Repeat as needed.
     #[arg(long = "protected-device")]
     protected_devices: Vec<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+struct FormatDiskArgs {
+    #[command(flatten)]
+    flags: InventoryFlags,
 }
 
 #[derive(Debug, clap::Args)]
@@ -573,6 +581,7 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::RunPreservingMulti(args) => run_preserving_multi_command(&args),
         Command::Interactive(args) => interactive_command(&args),
         Command::CombinedStorage(args) => combined_storage::command(&args),
+        Command::FormatDisk(args) => format_disk::command(&args.flags),
         Command::Simulate(args) => simulate(&args),
         Command::Campaign(args) => campaign(&args),
         Command::Golden => {
@@ -804,30 +813,23 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         .into());
     }
 
-    let mut inventory = scan(&scan_options(&args.flags))?;
+    let inventory = scan(&scan_options(&args.flags))?;
     if inventory.devices.is_empty() {
         return Err("no NVMe namespace was discovered".into());
     }
-    let selection = loop {
-        print!("\x1b[H\x1b[2J");
-        println!(
-            "{}",
-            render_picker(
-                &picker_entries(&inventory),
-                &BTreeSet::new(),
-                TerminalSize::current()
-            )
-        );
-        print!("Select NVMe aliases (example 1,2), A for all, or F to format a disk: ");
-        io::stdout().flush()?;
-        let request = read_operator_line()?;
-        if request.trim().eq_ignore_ascii_case("f") {
-            format_disk::interactive(&inventory, &args.flags.protected_devices)?;
-            inventory = scan(&scan_options(&args.flags))?;
-            continue;
-        }
-        break parse_selection(&inventory, request.trim())?;
-    };
+    print!("\x1b[H\x1b[2J");
+    println!(
+        "{}",
+        render_picker(
+            &picker_entries(&inventory),
+            &BTreeSet::new(),
+            TerminalSize::current()
+        )
+    );
+    print!("Select NVMe aliases (example 1,2) or A for all: ");
+    io::stdout().flush()?;
+    let request = read_operator_line()?;
+    let selection = parse_selection(&inventory, request.trim())?;
 
     let default_minutes = args.duration_seconds.max(60) / 60;
     print!(
