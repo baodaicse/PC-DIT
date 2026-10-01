@@ -43,6 +43,14 @@ Test mount NTFS bằng driver `ntfs3`. Lúc mount, driver đánh dấu volume đ
 | Dọn file của phiên bị treo | Sau khi mount: thư mục `.cpu-nvme-dit-*` ở gốc volume, sửa lần cuối **trước lần boot hiện tại**, trên đúng volume đó: chỉ xoá file của tool (`.cpu-nvme-dit-*.test`, `dit-chain-*.bin/.json`) rồi thư mục nếu đã rỗng; mọi thứ khác giữ nguyên. Màn hình in những gì đã xoá |
 | Thông báo mã 13/15 | Nói rõ nguyên nhân thường gặp (test bị ngắt), rằng SSD chưa chắc hỏng, và ba cách xử lý |
 
+**Volume còn cờ dirty (mount exit status 32):** sau một lần test bị hỏng giữa chừng, `ntfs3` đánh dấu volume dirty.
+`ntfs-3g.probe` vẫn cho qua, nhưng `ntfs3` từ chối mount ghi (`volume is dirty and "force" flag is not set!`, `mount`
+trả 32). Nay sau probe còn đọc cờ bằng `ntfsinfo -f -m` (chỉ đọc): dirty thì từ chối **trước khi mount** với lý do rõ
+ràng và đề nghị `F = repair` (`ntfsfix -d`, kiểm lại probe và cờ, chuẩn bị lại). Nếu mount vẫn lỗi, tool đọc log kernel
+`ntfs3(<phân vùng>)`: gặp `volume is dirty` cũng đề nghị sửa, lỗi khác thì in kèm dòng log kernel; mountpoint vừa tạo
+được gỡ để lần thử lại không vướng. Kiểm bằng root trên loop device: volume dirty → bị từ chối có đề nghị sửa →
+`ntfsfix -d` → chuẩn bị và dọn bình thường. Không bao giờ mount với `force`.
+
 **Lớp SSD bị crash trong phiên (máy vẫn chạy):** file test của lớp đó còn trong thư mục phiên, nên trước đây bước
 dọn (`remove_dir` chỉ xoá thư mục rỗng) báo `SETUP CLEANUP INCOMPLETE … Directory not empty` và **không unmount**:
 volume ở lại `/run/cpu-nvme-dit-…`, chặn cả lần test sau lẫn FORMAT SSD. Nay:

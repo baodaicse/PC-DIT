@@ -208,7 +208,7 @@ bootstrap_rootfs() {
 # Programs the SSD tools run inside the image (FORMAT SSD, NTFS probe/repair, mounts). On Ubuntu
 # 24.04 sfdisk is in the separate `fdisk` package, not util-linux: without it FORMAT SSD failed
 # with exit status 127 after wiping the old table.
-IMAGE_STORAGE_TOOLS=(sfdisk wipefs partx mkntfs mkfs.ext4 ntfsfix ntfs-3g.probe udevadm blkid lsblk findmnt mount umount)
+IMAGE_STORAGE_TOOLS=(sfdisk wipefs partx mkntfs mkfs.ext4 ntfsfix ntfsinfo ntfs-3g.probe udevadm blkid lsblk findmnt mount umount dmesg)
 
 verify_image_storage_tools() {
     local missing=() tool

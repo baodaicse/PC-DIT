@@ -56,6 +56,9 @@ fn output(program: &str, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
 pub struct NtfsRefused {
     pub node: PathBuf,
     pub code: Option<i32>,
+    /// The volume is marked dirty: `ntfs-3g.probe` lets it through, but the kernel's `ntfs3`
+    /// driver refuses to mount it read-write (`mount` exit status 32).
+    pub dirty: bool,
     /// What `ntfs-3g.probe` printed.
     pub detail: String,
 }
@@ -66,6 +69,9 @@ impl NtfsRefused {
     /// Windows (code 14), whose session would be lost.
     #[must_use]
     pub fn repairable(&self) -> bool {
+        if self.dirty {
+            return true;
+        }
         match self.code {
             Some(13) => self.detail.contains("$MFTMirr does not match $MFT"),
             Some(15) => true,
@@ -78,12 +84,17 @@ impl std::fmt::Display for NtfsRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "NTFS safety probe refused {}: {} The volume was left untouched.",
+            "NTFS safety check refused {}: {} The volume was left untouched.",
             self.node.display(),
-            ntfs_refusal(self.code)
+            if self.dirty {
+                NTFS_DIRTY
+            } else {
+                ntfs_refusal(self.code)
+            }
         )?;
         if !self.detail.is_empty() {
-            write!(f, " (ntfs-3g.probe: {})", self.detail)?;
+            let source = if self.dirty { "found" } else { "ntfs-3g.probe" };
+            write!(f, " ({source}: {})", self.detail)?;
         }
         Ok(())
     }
@@ -118,8 +129,71 @@ fn ntfs_probe(node: &Path) -> Result<()> {
     Err(Box::new(NtfsRefused {
         node: node.to_path_buf(),
         code: result.status.code(),
+        dirty: false,
         detail,
     }))
+}
+
+const NTFS_DIRTY: &str = "it is marked dirty, so the kernel's ntfs3 driver will not mount it for writing (mount exit status 32). A test interrupted on it (crash, reset, corruption it found) or Windows scheduling a disk check leaves this mark. Run 'chkdsk /f' on the drive in Windows, or choose the ntfsfix repair when offered, or FORMAT SSD in the control center if it holds nothing you need.";
+
+/// The `Volume Flags` line of `ntfsinfo -f -m` when it says DIRTY (read-only; `-f` only lets
+/// ntfsinfo open a dirty volume). `None` when clean or when ntfsinfo cannot tell.
+fn ntfs_dirty_flags(node: &Path) -> Option<String> {
+    let result = Command::new("timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=2s",
+            "15s",
+            "ntfsinfo",
+            "-f",
+            "-m",
+        ])
+        .arg(node)
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Volume Flags:"))
+        .filter(|line| line.contains("DIRTY"))
+        .map(str::to_owned)
+}
+
+/// The safety checks of an NTFS volume before it is mounted: `ntfs-3g.probe`, then the dirty
+/// flag `ntfs3` refuses.
+fn ntfs_check(node: &Path) -> Result<()> {
+    ntfs_probe(node)?;
+    if let Some(flags) = ntfs_dirty_flags(node) {
+        return Err(Box::new(NtfsRefused {
+            node: node.to_path_buf(),
+            code: None,
+            dirty: true,
+            detail: flags,
+        }));
+    }
+    Ok(())
+}
+
+/// Recent kernel lines of the `ntfs3` driver about `node` (why a mount failed).
+fn ntfs3_kernel_lines(node: &Path) -> String {
+    let name = node
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tag = format!("ntfs3({name})");
+    output("dmesg", &[]).map_or_else(
+        |_| String::new(),
+        |bytes| {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let lines: Vec<&str> = text.lines().filter(|line| line.contains(&tag)).collect();
+            lines[lines.len().saturating_sub(3)..]
+                .iter()
+                .map(|line| line.split_once("] ").map_or(*line, |(_, rest)| rest))
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+    )
 }
 
 /// `ntfsfix -d`: copies `$MFT` over a differing `$MFTMirr`, empties the journal and clears the
@@ -145,7 +219,7 @@ pub fn repair_ntfs(node: &Path) -> Result<String> {
         )
         .into());
     }
-    ntfs_probe(node)?;
+    ntfs_check(node)?;
     Ok(printed)
 }
 
@@ -375,7 +449,7 @@ impl PreparedAreas {
             return Err("planned volume is no longer a direct block device".into());
         }
         if plan.filesystem == "ntfs" && plan.existing_mount.is_none() {
-            ntfs_probe(&plan.node)?;
+            ntfs_check(&plan.node)?;
         }
         let mount = plan.existing_mount.clone().unwrap_or_else(|| {
             PathBuf::from("/run").join(format!("cpu-nvme-dit-{session}-{}", plan.alias))
@@ -415,8 +489,37 @@ impl PreparedAreas {
             );
             // Capture successful mounts even if the helper exits nonzero afterwards.
             area.mounted = mount.metadata()?.dev() == area.device_number;
-            result?;
+            if let Err(error) = result {
+                if !area.mounted {
+                    // Nothing was mounted: take the mount point back, so a retry (after a
+                    // repair) makes it again.
+                    let _ = fs::remove_dir(&mount);
+                    self.areas.pop();
+                }
+                let kernel = if plan.filesystem == "ntfs" {
+                    ntfs3_kernel_lines(&plan.node)
+                } else {
+                    String::new()
+                };
+                if kernel.contains("volume is dirty") {
+                    return Err(Box::new(NtfsRefused {
+                        node: plan.node.clone(),
+                        code: None,
+                        dirty: true,
+                        detail: kernel,
+                    }));
+                }
+                return Err(if kernel.is_empty() {
+                    error
+                } else {
+                    format!("{error} Kernel: {kernel}").into()
+                });
+            }
         }
+        let area = self
+            .areas
+            .last_mut()
+            .ok_or("missing preparation ownership record")?;
         verify_mount(&mount, area.device_number, &plan.filesystem)?;
         for removed in remove_stale(&mount, area.device_number, boot_time()) {
             println!("  Removed leftovers of an interrupted test: {removed}");
@@ -784,8 +887,20 @@ mod tests {
         let refused = |code, detail: &str| super::NtfsRefused {
             node: "/dev/nvme0n1p1".into(),
             code: Some(code),
+            dirty: false,
             detail: detail.into(),
         };
+        let dirty = super::NtfsRefused {
+            node: "/dev/nvme0n1p1".into(),
+            code: None,
+            dirty: true,
+            detail: "Volume Flags: 0x0001 DIRTY".into(),
+        };
+        assert!(
+            dirty.repairable(),
+            "the dirty mark ntfs3 refuses is offered the repair"
+        );
+        assert!(dirty.to_string().contains("mount exit status 32"));
         assert!(refused(13, "$MFTMirr does not match $MFT (record 3).").repairable());
         assert!(refused(15, "").repairable());
         assert!(!refused(13, "some other corruption").repairable());
@@ -883,6 +998,88 @@ mod tests {
         );
         assert!(gone, "the dead test's directory and files are gone");
         assert!(kept, "a file that is not ours stays");
+    }
+
+    /// Root only: a dirty NTFS volume (what an interrupted test leaves) passes ntfs-3g.probe but
+    /// ntfs3 refuses a read-write mount (exit status 32). `prepare` must say so as a repairable
+    /// refusal, before mounting; after `repair_ntfs` it prepares normally.
+    #[test]
+    #[ignore = "needs root: loop device, mkntfs, mount"]
+    fn a_dirty_ntfs_volume_is_offered_the_repair_and_then_prepared() {
+        use std::process::Command as Run;
+        let image = std::env::temp_dir().join(format!("dit-dirty-{}.img", std::process::id()));
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(256 << 20)
+            .unwrap();
+        let loop_dev = String::from_utf8(
+            Run::new("losetup")
+                .args(["--find", "--show"])
+                .arg(&image)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let node = PathBuf::from(&loop_dev);
+        assert!(
+            Run::new("mkntfs")
+                .args(["--quick", "--force", &loop_dev])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        // ntfsfix without -d sets the dirty flag (as a crash or a scheduled chkdsk leaves it).
+        Run::new("ntfsfix").arg(&loop_dev).output().unwrap();
+        let uuid = String::from_utf8(
+            Run::new("blkid")
+                .args(["-o", "value", "-s", "UUID", &loop_dev])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let plan = super::VolumePlan {
+            alias: 1,
+            namespace_id: DeviceId("fixture".into()),
+            target_id: DeviceId("fixture-p1".into()),
+            node: node.clone(),
+            filesystem: "ntfs".into(),
+            uuid,
+            capacity_bytes: 256 << 20,
+            existing_mount: None,
+        };
+        let session = format!("dirtytest-{}", std::process::id());
+        let mut areas = super::PreparedAreas::default();
+        let first = areas.prepare(&plan, &session, 1 << 20);
+        let refused = first
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<super::NtfsRefused>())
+            .map(|refused| (refused.dirty, refused.repairable(), refused.to_string()));
+        let repaired = super::repair_ntfs(&node).map_err(|error| error.to_string());
+        let second = areas
+            .prepare(&plan, &session, 1 << 20)
+            .map_err(|error| error.to_string());
+        let cleanup = areas.cleanup().map_err(|error| error.to_string());
+        Run::new("losetup")
+            .args(["-d", &loop_dev])
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_file(&image);
+        println!(
+            "refused: {refused:?}\nrepaired: {repaired:?}\nsecond: {second:?}\ncleanup: {cleanup:?}"
+        );
+        let (dirty, repairable, text) = refused.expect("a dirty volume is refused before mounting");
+        assert!(dirty && repairable, "{text}");
+        assert!(repaired.is_ok(), "{repaired:?}");
+        assert!(second.is_ok(), "{second:?}");
+        assert!(cleanup.is_ok(), "{cleanup:?}");
     }
 
     #[test]
