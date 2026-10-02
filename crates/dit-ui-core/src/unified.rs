@@ -1,7 +1,8 @@
 //! One visual contract for every active DIT engine.
 
 use super::{
-    CYAN, GRAY, GREEN, RED, RESET, TerminalSize, YELLOW, bar, sanitize_and_clip, unicode_terminal,
+    CYAN, GRAY, GREEN, RED, RESET, TerminalSize, YELLOW, bar, linux_console, sanitize_and_clip,
+    unicode_terminal,
 };
 
 /// State badges: the state word on a coloured background.
@@ -9,6 +10,14 @@ const BADGE_RUN: &str = "\x1b[30;46m";
 const BADGE_PASS: &str = "\x1b[30;42m";
 const BADGE_FAIL: &str = "\x1b[97;41m";
 const BADGE_WARN: &str = "\x1b[30;43m";
+/// The title row, as a band across the screen.
+const TITLE_BAND: &str = "\x1b[30;46m";
+/// Bar fills. The Linux console has 16 colours: plain green (not the bright one) and its colour 3,
+/// which it draws orange-brown. Other terminals get a softer green and a true orange.
+const BAR_GREEN_CONSOLE: &str = "\x1b[32m";
+const BAR_GREEN_256: &str = "\x1b[38;5;71m";
+const ORANGE_CONSOLE: &str = "\x1b[33m";
+const ORANGE_256: &str = "\x1b[38;5;208m";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DashboardMeter {
@@ -71,11 +80,18 @@ pub fn render_unified_dashboard(
 ) -> String {
     let width = usize::from(size.cols).clamp(40, 240);
     let height = usize::from(size.rows).saturating_sub(1).max(1);
-    let mut lines = if width >= 110 && size.rows >= 29 {
-        render_wide(dashboard, width)
-    } else {
-        render_compact(dashboard, width)
+    let layout = |spaced: bool| {
+        if width >= 110 && size.rows >= 29 {
+            render_wide(dashboard, width, spaced)
+        } else {
+            render_compact(dashboard, width, spaced)
+        }
     };
+    // Blank rows between groups when the screen has room for them; packed otherwise.
+    let mut lines = layout(true);
+    if lines.len() > height {
+        lines = layout(false);
+    }
     if lines.len() > height {
         lines.truncate(height.saturating_sub(2));
         lines.push(full_row(&dashboard.footer, width));
@@ -99,22 +115,46 @@ pub fn render_unified_dashboard(
     }
 }
 
-fn render_wide(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
+/// Meter rows of the live panel: each meter and its detail, a blank row between meters when
+/// `spaced`; every bar starts in the same column.
+fn meter_rows(meters: &[DashboardMeter], width: usize, spaced: bool) -> Vec<String> {
+    let label_width = meters
+        .iter()
+        .map(|metric| metric.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut rows = Vec::new();
+    for (index, metric) in meters.iter().enumerate() {
+        if spaced && index > 0 {
+            rows.push(String::new());
+        }
+        rows.push(meter(metric, width, label_width));
+        if let Some(detail) = &metric.detail {
+            rows.push(format!("  {detail}"));
+        }
+    }
+    rows
+}
+
+/// The title row: the engine's name, centred (painted as a band).
+fn title_row(width: usize) -> String {
+    let inner = width.saturating_sub(4);
+    full_row(
+        &format!("{:^inner$}", "DIT-01 / DATA INTEGRITY TEST ENGINE"),
+        width,
+    )
+}
+
+fn render_wide(dashboard: &UnifiedDashboard, width: usize, spaced: bool) -> Vec<String> {
     let gap = 2;
     let left_width = (width - gap) / 2;
     let right_width = width - gap - left_width;
     let right_inner = right_width.saturating_sub(4);
-    let mut live_rows = Vec::new();
-    for metric in &dashboard.live_meters {
-        live_rows.push(meter(metric, right_inner));
-        if let Some(detail) = &metric.detail {
-            live_rows.push(detail.clone());
-        }
-    }
+    let live_rows = meter_rows(&dashboard.live_meters, right_inner, spaced);
     let panel_rows = dashboard.hardware_rows.len().max(live_rows.len());
     let mut lines = vec![
         border("", width),
-        full_row("DIT-01 / DATA INTEGRITY TEST ENGINE", width),
+        title_row(width),
         full_row(
             &format!(
                 "ENGINE {}    REPORT ABI {}    PROFILE {}",
@@ -142,14 +182,14 @@ fn render_wide(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
         ));
     }
     lines.push(pair(&border("", left_width), &border("", right_width), gap));
-    lines.extend(render_running(dashboard, width));
+    lines.extend(render_running(dashboard, width, spaced));
     lines
 }
 
-fn render_compact(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
+fn render_compact(dashboard: &UnifiedDashboard, width: usize, spaced: bool) -> Vec<String> {
     let mut lines = vec![
         border("", width),
-        full_row("DIT-01 / DATA INTEGRITY TEST ENGINE", width),
+        title_row(width),
         full_row(
             &format!(
                 "ENGINE {} / ABI {} / PROFILE {}",
@@ -163,18 +203,16 @@ fn render_compact(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
         lines.push(full_row(hardware, width));
     }
     let inner = width.saturating_sub(4);
-    for metric in &dashboard.live_meters {
-        lines.push(full_row(&meter(metric, inner), width));
-        if let Some(detail) = &metric.detail {
-            lines.push(full_row(detail, width));
-        }
+    for row in meter_rows(&dashboard.live_meters, inner, spaced) {
+        lines.push(full_row(&row, width));
     }
-    lines.extend(render_running(dashboard, width));
+    lines.extend(render_running(dashboard, width, spaced));
     lines
 }
 
-fn render_running(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
+fn render_running(dashboard: &UnifiedDashboard, width: usize, spaced: bool) -> Vec<String> {
     let inner = width.saturating_sub(4);
+    let blank = || full_row("", width);
     let mut lines = vec![
         border("TESTING / PROCESS INFORMATION", width),
         full_row(
@@ -190,13 +228,22 @@ fn render_running(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
             ),
             width,
         ),
-        full_row(
-            &meter(
-                &DashboardMeter::new("PROGRESS", dashboard.progress_percent),
-                inner,
-            ),
-            width,
+    ];
+    if spaced {
+        lines.push(blank());
+    }
+    lines.push(full_row(
+        &meter(
+            &DashboardMeter::new("PROGRESS", dashboard.progress_percent),
+            inner,
+            0,
         ),
+        width,
+    ));
+    if spaced {
+        lines.push(blank());
+    }
+    lines.extend([
         full_row(&format!("ACTIVE TEST   {}", dashboard.active_test), width),
         full_row(&format!("PROCESS       {}", dashboard.process), width),
         full_row(
@@ -206,7 +253,10 @@ fn render_running(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
             ),
             width,
         ),
-    ];
+    ]);
+    if spaced && !dashboard.running_rows.is_empty() {
+        lines.push(blank());
+    }
     lines.extend(
         dashboard
             .running_rows
@@ -218,7 +268,11 @@ fn render_running(dashboard: &UnifiedDashboard, width: usize) -> Vec<String> {
     lines
 }
 
-fn meter(metric: &DashboardMeter, width: usize) -> String {
+/// Longest bar: a wide console would otherwise draw bars across the whole screen.
+const BAR_MAX: usize = 60;
+
+/// `LABEL [bar] suffix`, the label padded to `label_width` so bars of a panel line up.
+fn meter(metric: &DashboardMeter, width: usize, label_width: usize) -> String {
     let percent = metric.percent.map(|value| value.clamp(0.0, 100.0));
     let percent_text = percent.map_or_else(|| "N/A".to_owned(), |value| format!("{value:.0}%"));
     let suffix = if metric.suffix.is_empty() {
@@ -226,11 +280,12 @@ fn meter(metric: &DashboardMeter, width: usize) -> String {
     } else {
         format!(" {}", metric.suffix)
     };
+    let label_width = label_width.max(metric.label.chars().count());
     let bar_width = width
-        .saturating_sub(metric.label.chars().count() + suffix.chars().count() + 3)
-        .max(1);
+        .saturating_sub(label_width + suffix.chars().count() + 3)
+        .clamp(4, BAR_MAX);
     format!(
-        "{} [{}]{}",
+        "{:<label_width$} [{}]{}",
         metric.label,
         bar(percent.unwrap_or(0.0), 100.0, bar_width),
         suffix
@@ -448,8 +503,8 @@ pub fn boxify(lines: &[String]) -> Vec<Vec<char>> {
             let left = column.checked_sub(1).and_then(|c| cell(row, c));
             let right = cell(row, column + 1);
             shown[row][column] = match character {
-                '#' if in_bar => '\u{2588}',
-                '-' if in_bar => '\u{2591}',
+                '#' if in_bar => '\u{25a0}',
+                '-' if in_bar => '\u{2500}',
                 '|' => '\u{2502}',
                 '-' if horizontal(left) || horizontal(right) => '\u{2500}',
                 '+' if corner(row, column) => {
@@ -485,7 +540,61 @@ pub fn decorate(frame: &str) -> String {
     paint(&lines, 0, "", unicode_terminal())
 }
 
+/// A device's own load (CPU, RAM, GPU, VRAM): its bar turns orange from 70 % and red from 90 %.
+/// Progress, targets and transfer rates stay green: being high is not a warning there.
+fn usage_meter(label: &str) -> bool {
+    label.contains("USAGE") || label.ends_with("VRAM") || label == "MEMORY"
+}
+
+/// The bars of a row with the colour of their fill: `(first, end, colour)` over the bar's interior.
+fn bar_fills(chars: &[char], linux: bool) -> Vec<(usize, usize, &'static str)> {
+    let green = if linux {
+        BAR_GREEN_CONSOLE
+    } else {
+        BAR_GREEN_256
+    };
+    let orange = if linux { ORANGE_CONSOLE } else { ORANGE_256 };
+    bar_ranges(chars)
+        .into_iter()
+        .map(|(start, end)| {
+            let open = start.saturating_sub(1);
+            let from = chars[..open]
+                .iter()
+                .rposition(|c| *c == '|')
+                .map_or(0, |i| i + 1);
+            let label: String = chars[from..open].iter().collect();
+            // The percentage printed after the bar, else the bar's own fill.
+            let after: String = chars[(end + 1).min(chars.len())..].iter().collect();
+            let after = after.trim_start();
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            #[allow(clippy::cast_precision_loss)]
+            let percent = if !digits.is_empty() && after[digits.len()..].starts_with('%') {
+                digits.parse::<f64>().unwrap_or(0.0)
+            } else {
+                let filled = chars[start..end].iter().filter(|c| **c == '#').count();
+                100.0 * filled as f64 / (end - start).max(1) as f64
+            };
+            let fill = if !usage_meter(label.trim()) {
+                green
+            } else if percent >= 90.0 {
+                RED
+            } else if percent >= 70.0 {
+                orange
+            } else {
+                green
+            };
+            (start, end, fill)
+        })
+        .collect()
+}
+
+/// Whether a row is a screen's title (its first rows, with the engine's name or a `//` heading).
+fn title_line(index: usize, line: &str) -> bool {
+    index <= 2 && (line.contains("DATA INTEGRITY TEST ENGINE") || line.contains(" // "))
+}
+
 fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String {
+    let linux = linux_console();
     let footer_key: String = footer.chars().take(24).collect();
     let shown: Vec<Vec<char>> = if unicode {
         boxify(lines)
@@ -495,7 +604,8 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
     lines
         .iter()
         .zip(shown)
-        .map(|(line, shown)| {
+        .enumerate()
+        .map(|(row, (line, shown))| {
             let (counter_above_zero, bare_fail) = fail_counters(line);
             // Lines with several results are coloured part by part (`part_colors`), never whole.
             let by_part = line.contains("FAIL BY PART")
@@ -508,6 +618,9 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
             let text_color =
                 if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer)) {
                     RED
+                } else if line.contains("REPORT ABI") {
+                    // The engine line names the temperature limit; it is a heading, not a warning.
+                    CYAN
                 } else if line.contains("PASS") {
                     GREEN
                 } else if line.contains("INVALID")
@@ -525,26 +638,33 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
                     "\x1b[37m"
                 };
             let mut result = String::new();
-            let mut in_bar = false;
             let mut previous_color = "";
             let chars: Vec<char> = line.chars().collect();
+            let fills = bar_fills(&chars, linux);
+            let title = title_line(row, line);
+            let first_frame = chars.iter().position(|c| *c == '|');
+            let last_frame = chars.iter().rposition(|c| *c == '|');
             for (index, &character) in chars.iter().enumerate() {
-                let current = if character == '[' {
-                    in_bar = true;
-                    CYAN
-                } else if character == ']' {
-                    in_bar = false;
-                    CYAN
-                } else if in_bar && character == '#' {
-                    GREEN
-                } else if in_bar && character == '-' {
-                    GRAY
-                } else if character == '|'
-                    || (character == '+' && frame_corner(&chars, index, line))
+                let in_band = title
+                    && first_frame.is_some_and(|f| index > f)
+                    && last_frame.is_some_and(|l| index < l);
+                let current = if let Some(&(_, _, fill)) =
+                    fills.iter().find(|(a, b, _)| index >= *a && index < *b)
                 {
-                    CYAN
+                    if character == '#' { fill } else { GRAY }
+                } else if fills.iter().any(|(a, b, _)| index + 1 == *a || index == *b) {
+                    // The brackets of a bar: as quiet as its empty part.
+                    GRAY
+                } else if in_band {
+                    TITLE_BAND
                 } else if let Some(color) = overrides[index] {
                     color
+                } else if character == '|'
+                    || (character == '+' && frame_corner(&chars, index, line))
+                    || character == '['
+                    || character == ']'
+                {
+                    CYAN
                 } else if character == '-' && line.starts_with('+') {
                     // Borders only; a dash inside a word (CPU-RAM) takes the line's colour.
                     CYAN
@@ -571,6 +691,36 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Device load bars: green below 70 %, orange from 70 %, red from 90 %; progress and rates
+    /// stay green whatever their value. The Linux console gets its own orange (colour 3).
+    #[test]
+    fn usage_bars_turn_orange_then_red_and_progress_stays_green() {
+        let fill = |line: &str, linux: bool| {
+            let chars: Vec<char> = line.chars().collect();
+            bar_fills(&chars, linux)[0].2
+        };
+        let bar = |percent: usize| {
+            format!(
+                "[{}{}] {percent}%",
+                "#".repeat(percent / 10),
+                "-".repeat(10 - percent / 10)
+            )
+        };
+        let line = |label: &str, percent: usize| format!("| {label} {} |", bar(percent));
+        assert_eq!(fill(&line("CPU USAGE", 50), true), BAR_GREEN_CONSOLE);
+        assert_eq!(fill(&line("CPU USAGE", 70), true), ORANGE_CONSOLE);
+        assert_eq!(fill(&line("GPU 1 VRAM", 89), false), ORANGE_256);
+        assert_eq!(fill(&line("RAM USAGE", 90), false), RED);
+        assert_eq!(fill(&line("MEMORY", 95), true), RED);
+        assert_eq!(fill(&line("PROGRESS", 95), true), BAR_GREEN_CONSOLE);
+        assert_eq!(fill(&line("DIT TARGET", 95), false), BAR_GREEN_256);
+        // No printed percentage (a rate): the bar's own fill decides, and a rate is not a load.
+        let speed = "| SSD 1 SPEED [#########-] R 3 GiB/s W 0 |"
+            .chars()
+            .collect::<Vec<_>>();
+        assert_eq!(bar_fills(&speed, true)[0].2, BAR_GREEN_CONSOLE);
+    }
 
     #[test]
     fn fail_counters_read_their_own_count() {
@@ -636,7 +786,7 @@ mod tests {
         );
         assert!(line("HW EVENTS").contains(YELLOW));
         let phases = line("PHASES");
-        assert!(phases.contains(&format!("{RED}FAIL")), "{phases:?}");
+        assert!(phases.contains(&format!("{RED}[FAIL]")), "{phases:?}");
         assert!(!phases.contains(&format!("{RED}OK")));
         assert!(
             !line("is counted").contains(RED),

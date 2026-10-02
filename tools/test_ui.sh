@@ -68,7 +68,8 @@ for expected in \
         exit 1
     }
 done
-grep -Fq $'\033[1;38;5;82m' "$dashboard_output"
+# Bars use the soft green (plain green on the Linux console), not the bright one.
+grep -Eq $'\033\[22;(32|38;5;71)m' "$dashboard_output"
 grep -Fq $'\033[1;38;5;45m' "$dashboard_output"
 
 CPU_DIT_BINARY="$DIT" \

@@ -4263,7 +4263,14 @@ mod tests {
         assert!(frame.contains("GPU USAGE"));
         assert!(frame.contains("VRAM"));
         assert!(frame.contains("Used 4.00 GiB / 8.00 GiB"));
-        let vram_meter = frame.lines().find(|line| line.contains("VRAM [")).unwrap();
+        // Labels are padded so the bars of the panel line up: "VRAM" then spaces then "[".
+        let vram_meter = frame
+            .lines()
+            .find(|line| {
+                line.find("VRAM ")
+                    .is_some_and(|at| line[at + 4..].trim_start().starts_with('['))
+            })
+            .unwrap();
         assert!(vram_meter.contains("50%"), "{vram_meter}");
         assert_eq!(progress_snapshot(&state).vram_usage_percent, Some(50.0));
         assert!(frame.contains("DIT TARGET"));

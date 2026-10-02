@@ -5,6 +5,12 @@ mod unified;
 
 pub use unified::{DashboardMeter, UnifiedDashboard, boxify, decorate, render_unified_dashboard};
 
+/// Whether this is the Linux console (`TERM=linux`): 16 colours, where colour 3 is orange-brown.
+#[must_use]
+pub fn linux_console() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term == "linux")
+}
+
 /// Whether the terminal draws Unicode box characters: the Linux console (UTF-8 by default) and the
 /// usual terminal emulators do; a serial line (`vt100`, `vt220`, `dumb`) does not. `DIT_UI_ASCII=1`
 /// forces the ASCII frame. The glyphs used (box drawing, full and light-shade blocks) are in the
@@ -943,10 +949,28 @@ mod tests {
         assert!(frame.contains("CPU:     Example CPU"));
         assert!(frame.contains("GPU:     Example GPU"));
         assert!(frame.contains("LIVE UTILIZATION"));
-        assert!(frame.contains("CPU USAGE ["));
+        // Labels are padded so the bars of a panel line up.
+        let row = |label: &str| {
+            frame
+                .lines()
+                .find(|line| line.contains(label) && line.contains('['))
+                .unwrap_or_else(|| panic!("no {label} meter"))
+                .to_owned()
+        };
+        assert!(row("CPU USAGE").contains(" 25%"));
         assert!(frame.contains(" 25%"));
         assert!(frame.contains("Freq 4.25 GHz / Temp 72.5 C / Power 105.3 W"));
-        assert!(frame.contains("RAM USAGE ["));
+        assert!(row("RAM USAGE").contains(" 50%"));
+        let bar_column = |label: &str| {
+            let line = row(label);
+            let at = line.find(label).unwrap();
+            line[at..].find('[').map(|offset| at + offset)
+        };
+        assert_eq!(
+            bar_column("CPU USAGE"),
+            bar_column("RAM USAGE"),
+            "bars start in one column"
+        );
         assert!(frame.contains(" 50%"));
         assert!(frame.contains("RAM used 8.00 GiB / 16.00 GiB total"));
         assert!(frame.contains("953.87 GiB total"));
@@ -973,8 +997,12 @@ mod tests {
                 .lines()
                 .position(|line| line.contains("TESTING / PROCESS INFORMATION"))
                 .unwrap();
+            // One more meter row per SSD, plus a blank row before it when the screen has room.
             if let Some(previous) = previous_process_row {
-                assert_eq!(process_row, previous + 1);
+                assert!(
+                    process_row == previous + 1 || process_row == previous + 2,
+                    "{previous} -> {process_row}"
+                );
             }
             previous_process_row = Some(process_row);
             assert!(
@@ -1117,9 +1145,8 @@ mod tests {
         };
         let colored = state.render(size, true);
         // Bars are `#` on an ASCII terminal, full blocks on a Unicode one.
-        assert!(
-            colored.contains(&format!("{GREEN}#")) || colored.contains(&format!("{GREEN}\u{2588}"))
-        );
+        // Bar fills: the console's plain green, or a softer green elsewhere.
+        assert!(colored.contains("\x1b[38;5;71m") || colored.contains(&format!("{GREEN}#")));
         assert!(colored.contains(CYAN));
         let mut stripped = String::new();
         let mut escape = false;
@@ -1173,7 +1200,7 @@ mod tests {
         );
         assert_eq!(
             boxed[1],
-            "\u{2502} CPU-RAM [3/8+] a-b  \u{2502}  \u{2502} [\u{2588}\u{2588}\u{2591}\u{2591}] x \u{2502}"
+            "\u{2502} CPU-RAM [3/8+] a-b  \u{2502}  \u{2502} [\u{25a0}\u{25a0}\u{2500}\u{2500}] x \u{2502}"
         );
         assert!(
             boxed[2].contains("CPU + RAM") && boxed[3].contains("GPU + VRAM"),

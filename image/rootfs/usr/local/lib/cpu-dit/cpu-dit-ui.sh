@@ -70,11 +70,21 @@ fi
 if (( ui_unicode )); then
     export LC_ALL=C.UTF-8
     g_h='─' g_v='│' g_tl='┌' g_tr='┐' g_bl='└' g_br='┘' g_ml='├' g_mr='┤'
-    g_fill='█' g_empty='░'
+    # A small square and a thin track: a bar never fills the whole cell height, so it does not
+    # touch the rows above and below.
+    g_fill='■' g_empty='─'
 else
     g_h='-' g_v='|' g_tl='+' g_tr='+' g_bl='+' g_br='+' g_ml='+' g_mr='+'
     g_fill='#' g_empty='-'
 fi
+# Bar fills, as the shared renderer: plain green; a device's load orange from 70 % and red from
+# 90 %. On the Linux console (16 colours) colour 3 is orange-brown; elsewhere a 256-colour orange.
+if [[ "${TERM:-}" == linux ]]; then
+    c_bar_green="${esc}[22;32m" c_orange="${esc}[22;33m"
+else
+    c_bar_green="${esc}[22;38;5;71m" c_orange="${esc}[22;38;5;208m"
+fi
+c_bar_red="${esc}[22;31m"
 # rule '=' opens a screen's frame the first time and closes it the second; '-' separates.
 rule_open=0
 
@@ -450,14 +460,14 @@ ui_meter() {
     empty=$((bar_width - filled))
     case "$mode" in
         cyan) fill_color="$c_cyan" ;;
-        green) fill_color="$c_green" ;;
+        green) fill_color="$c_bar_green" ;;
         *)
             if (( percent >= 90 )); then
-                fill_color="$c_red"
-            elif (( percent >= 75 )); then
-                fill_color="$c_yellow"
+                fill_color="$c_bar_red"
+            elif (( percent >= 70 )); then
+                fill_color="$c_orange"
             else
-                fill_color="$c_green"
+                fill_color="$c_bar_green"
             fi
             ;;
     esac
