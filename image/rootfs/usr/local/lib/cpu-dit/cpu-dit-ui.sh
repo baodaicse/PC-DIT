@@ -1007,6 +1007,30 @@ show_result() {
     IFS= read -r _unused || true
 }
 
+# run_result VERDICT TEXT COLOR: the result of a CPU-RAM run. With the shared view, inside its
+# last screen (verdict and where the reports went, under the progress); otherwise the result
+# screen. Uses run_profile's shared_view, final_frame and run_log.
+run_result() {
+    local verdict="$1" text="$2" color="$3" reports report_row
+    if (( ${shared_view:-0} )) && [[ -s "${final_frame:-}" ]]; then
+        reports="$(grep '^Reports: ' "$run_log" 2>/dev/null | tail -n 1)"
+        reports="${reports#Reports: }"
+        if grep -q 'verified USB result partition unavailable' "$run_log" 2>/dev/null; then
+            report_row="REPORT   Verified result volume unavailable; reports remain in tmpfs: ${reports:-unknown}"
+        else
+            report_row="REPORT   Reports saved to: ${reports:-unknown}"
+        fi
+        if "$SUITE" final-frame --frame "$final_frame" \
+            --row "RESULT: $verdict    $text" --row "$report_row"; then
+            rm -f -- "$final_frame"
+            ui_reset
+            IFS= read -r _unused || true
+            return
+        fi
+    fi
+    show_result "$verdict" "$text" "$color"
+}
+
 run_profile() {
     local profile="$1" title="$2" duration="$3" status=0
     local watchdog_stale=90
@@ -1056,6 +1080,9 @@ run_profile() {
     running_screen_initialized=0
     sensor_refresh_tick="$SENSOR_REFRESH_TICKS"
     local shared_view=0 view_status
+    # The shared view saves its last screen here; the result is then drawn inside it.
+    local final_frame="$UI_RUN_DIR/cpu-ram-final-$$.json"
+    rm -f -- "$final_frame"
     if [[ "$module" == cpu-ram && -x "$SUITE" ]] \
         && "$SUITE" cpu-ram-view --help >/dev/null 2>&1; then
         shared_view=1
@@ -1074,7 +1101,7 @@ run_profile() {
                 --report-abi "$REPORT_ABI")
             (( thermal_limit_enabled == 1 )) && view_args+=(--temp-limit-celsius "$THERMAL_LIMIT_C")
             view_status=0
-            "$SUITE" "${view_args[@]}" || view_status=$?
+            DIT_UI_FINAL_FRAME="$final_frame" "$SUITE" "${view_args[@]}" || view_status=$?
             if (( view_status != 0 && view_status != 130 )); then
                 shared_view=0
                 running_screen_initialized=0
@@ -1098,7 +1125,7 @@ run_profile() {
         # The watchdog exits with its own convention code (2) after an operator
         # stop, not a signal-derived status; classify from the request, not $status.
         sigint_seen=0
-        show_result 'ABORTED' 'The operator stopped the active test; this is not PASS.' "$c_yellow"
+        run_result 'ABORTED' 'The operator stopped the active test; this is not PASS.' "$c_yellow"
     else
         if [[ "$module" == cpu-power-platform ]]; then
             local result_line verdict evidence
@@ -1114,11 +1141,11 @@ run_profile() {
             return
         fi
         case "$status" in
-            0) show_result 'PASS' 'All required correctness and coverage gates passed.' "$c_green" ;;
-            2) show_result 'FAIL' 'A correctness, telemetry or execution gate failed.' "$c_red" ;;
-            3) show_result 'INVALID' 'Source, profile or environment is invalid.' "$c_yellow" ;;
-            130|143) show_result 'ABORTED' 'The operator stopped the active test; this is not PASS.' "$c_yellow" ;;
-            *) show_result "ERROR $status" 'The runner ended unexpectedly; preserve the report.' "$c_red" ;;
+            0) run_result 'PASS' 'All required correctness and coverage gates passed.' "$c_green" ;;
+            2) run_result 'FAIL' 'A correctness, telemetry or execution gate failed.' "$c_red" ;;
+            3) run_result 'INVALID' 'Source, profile or environment is invalid.' "$c_yellow" ;;
+            130|143) run_result 'ABORTED' 'The operator stopped the active test; this is not PASS.' "$c_yellow" ;;
+            *) run_result "ERROR $status" 'The runner ended unexpectedly; preserve the report.' "$c_red" ;;
         esac
     fi
 }

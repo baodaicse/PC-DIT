@@ -3,7 +3,10 @@
 mod dashboard;
 mod unified;
 
-pub use unified::{DashboardMeter, UnifiedDashboard, boxify, decorate, render_unified_dashboard};
+pub use unified::{
+    DashboardMeter, FINAL_FRAME_ENV, UnifiedDashboard, boxify, decorate, load_final_frame,
+    render_result_frame, render_unified_dashboard, save_final_frame,
+};
 
 /// Whether this is the Linux console (`TERM=linux`): 16 colours, where colour 3 is orange-brown.
 #[must_use]
@@ -613,6 +616,8 @@ impl<W: Write> InPlaceRenderer<W> {
     ///
     /// Returns an I/O error when writing or flushing the terminal fails.
     pub fn finish(&mut self) -> io::Result<()> {
+        // The launcher may show the verdict inside this last screen (DIT_UI_FINAL_FRAME).
+        save_final_frame();
         if self.cursor_hidden {
             write!(
                 self.writer,

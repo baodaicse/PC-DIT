@@ -316,6 +316,8 @@ name = "dit-ui-core"
 version = "0.1.0"
 dependencies = [
  "dit-contracts",
+ "serde",
+ "serde_json",
  "terminal_size",
 ]
 

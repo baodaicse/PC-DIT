@@ -19,7 +19,7 @@ const BAR_GREEN_256: &str = "\x1b[38;5;71m";
 const ORANGE_CONSOLE: &str = "\x1b[33m";
 const ORANGE_256: &str = "\x1b[38;5;208m";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DashboardMeter {
     pub label: String,
     pub percent: Option<f64>,
@@ -51,7 +51,7 @@ impl DashboardMeter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnifiedDashboard {
     pub engine: String,
     pub report_abi: String,
@@ -78,6 +78,9 @@ pub fn render_unified_dashboard(
     size: TerminalSize,
     color: bool,
 ) -> String {
+    if color {
+        remember(dashboard);
+    }
     let width = usize::from(size.cols).clamp(40, 240);
     let height = usize::from(size.rows).saturating_sub(1).max(1);
     let layout = |spaced: bool| {
@@ -143,6 +146,63 @@ fn title_row(width: usize) -> String {
         &format!("{:^inner$}", "DIT-01 / DATA INTEGRITY TEST ENGINE"),
         width,
     )
+}
+
+/// The last dashboard drawn on a terminal, kept for [`save_final_frame`].
+static LAST: std::sync::Mutex<Option<UnifiedDashboard>> = std::sync::Mutex::new(None);
+
+fn remember(dashboard: &UnifiedDashboard) {
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some(dashboard.clone());
+    }
+}
+
+/// Environment variable naming the file a test's last screen is written to when its live view
+/// ends (`InPlaceRenderer::finish`). The launcher reads it back to show the verdict and the
+/// report's place inside that screen.
+pub const FINAL_FRAME_ENV: &str = "DIT_UI_FINAL_FRAME";
+
+/// Writes the last dashboard drawn to the file `DIT_UI_FINAL_FRAME` names (nothing when unset or
+/// nothing was drawn). Written whole, then renamed.
+pub fn save_final_frame() {
+    let Some(path) = std::env::var_os(FINAL_FRAME_ENV).filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let Some(dashboard) = LAST.lock().ok().and_then(|last| last.clone()) else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let temporary = path.with_extension("tmp");
+    if serde_json::to_vec(&dashboard).is_ok_and(|bytes| std::fs::write(&temporary, bytes).is_ok()) {
+        let _ = std::fs::rename(&temporary, &path);
+    }
+}
+
+/// A test's last screen as [`save_final_frame`] wrote it.
+#[must_use]
+pub fn load_final_frame(path: &std::path::Path) -> Option<UnifiedDashboard> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The last screen of a finished test with its result under the progress: `rows` (the verdict
+/// as `RESULT: <VERDICT> ...`, where the report went, anything the screen did not show) after
+/// the running rows, and `footer` in place of the running footer.
+#[must_use]
+pub fn render_result_frame(
+    dashboard: &UnifiedDashboard,
+    rows: &[String],
+    footer: &str,
+    size: TerminalSize,
+    color: bool,
+) -> String {
+    let mut finished = dashboard.clone();
+    "DONE".clone_into(&mut finished.state);
+    if !rows.is_empty() {
+        finished.running_rows.push(String::new());
+        finished.running_rows.extend(rows.iter().cloned());
+    }
+    footer.clone_into(&mut finished.footer);
+    render_unified_dashboard(&finished, size, color)
 }
 
 fn render_wide(dashboard: &UnifiedDashboard, width: usize, spaced: bool) -> Vec<String> {
@@ -433,7 +493,7 @@ fn state_badge(word: &str) -> &'static str {
     let upper = word.to_ascii_uppercase();
     if upper.starts_with("PASS") {
         BADGE_PASS
-    } else if upper.starts_with("FAIL") {
+    } else if upper.starts_with("FAIL") || upper.starts_with("ERROR") {
         BADGE_FAIL
     } else if [
         "INVALID",
@@ -619,6 +679,9 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
             let text_color =
                 if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer)) {
                     RED
+                } else if line.contains("RESULT: ") {
+                    // The verdict is its badge; the rest of the row stays plain.
+                    "\x1b[37m"
                 } else if line.contains("REPORT ABI") {
                     // The engine line names the temperature limit; it is a heading, not a warning.
                     CYAN

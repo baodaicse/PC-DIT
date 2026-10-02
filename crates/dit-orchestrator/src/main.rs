@@ -48,6 +48,21 @@ enum Command {
     Combined(combined_run::CombinedCli),
     /// Running screen of a CPU-RAM test on the shared dashboard (started by the CPU-RAM UI).
     CpuRamView(cpu_ram_view::CpuRamViewArgs),
+    /// Draws a finished test's saved last screen with its result under the progress (used by
+    /// the CPU-RAM UI); exits 1 when the screen cannot be drawn, so the caller falls back.
+    FinalFrame(FinalFrameArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct FinalFrameArgs {
+    /// The screen the test saved (`DIT_UI_FINAL_FRAME`).
+    #[arg(long)]
+    frame: PathBuf,
+    /// One result row; repeat for each (the first should be `RESULT: <VERDICT> ...`).
+    #[arg(long = "row")]
+    rows: Vec<String>,
+    #[arg(long, default_value = "Press Enter to return to the control center")]
+    footer: String,
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -121,6 +136,13 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Combined(args) => combined_run::run_cli(&args),
         Command::CpuRamView(args) => {
             cpu_ram_view::command(&args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::FinalFrame(args) => {
+            let Some(dashboard) = dit_ui_core::load_final_frame(&args.frame) else {
+                return Ok(ExitCode::from(1));
+            };
+            draw_result_frame(&dashboard, &args.rows, &args.footer)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -284,6 +306,10 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
         None,
         [heartbeat],
     );
+    command.env(
+        dit_ui_core::FINAL_FRAME_ENV,
+        suite_dir.join(FINAL_FRAME_FILE),
+    );
     command.arg(&args.nvme_binary);
     command
         .arg("interactive")
@@ -297,6 +323,7 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let nvme_status = command.status()?;
     let nvme_report = suite_dir.join("report.json");
+    let mut verdict = "INVALID";
     let completion = if nvme_report.is_file() {
         let nvme = adapt_nvme_report(&nvme_report, &std::fs::read(&nvme_report)?)?;
         let total_threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
@@ -307,6 +334,7 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
             allocate_resources(ExecutionPlan::CpuNvmeOnly, total_threads, available_memory)?,
         );
         write_new_json(&suite_dir.join("suite-report.json"), &report)?;
+        verdict = verdict_name(report.aggregate_verdict);
         format!(
             "CPU-SSD completed with {}.\n{}",
             verdict_name(report.aggregate_verdict),
@@ -337,7 +365,12 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
                 suite_dir.display()
             ),
         };
-    pause(&format!("{completion}\n{storage}"))?;
+    if !show_in_frame(
+        &suite_dir.join(FINAL_FRAME_FILE),
+        &module_result_rows(verdict, &completion, &storage),
+    )? {
+        pause(&format!("{completion}\n{storage}"))?;
+    }
     Ok(())
 }
 
@@ -568,6 +601,10 @@ fn launch_gpu(
         Some(&heartbeat),
         std::iter::empty::<PathBuf>(),
     )
+    .env(
+        dit_ui_core::FINAL_FRAME_ENV,
+        suite_dir.join(FINAL_FRAME_FILE),
+    )
     .arg(&args.gpu_binary)
     .args(gpu_run_arguments(
         profile, *settings, &suite_dir, &heartbeat,
@@ -576,8 +613,10 @@ fn launch_gpu(
     .args(args.attribution_checks.then_some("--boundary-checks"))
     .status()?;
     let report_path = suite_dir.join("report.json");
+    let mut verdict = "INVALID";
     let completion = if report_path.is_file() {
         let report: GpuReportView = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+        verdict = verdict_name(report.verdict);
         let mut message = gpu_completion_message(&report);
         if profile == GpuProfile::TensorCheck {
             message.push('\n');
@@ -611,8 +650,75 @@ fn launch_gpu(
                 suite_dir.display()
             ),
         };
-    pause(&format!("{completion}\n{storage}"))?;
+    if !show_in_frame(
+        &suite_dir.join(FINAL_FRAME_FILE),
+        &module_result_rows(verdict, &completion, &storage),
+    )? {
+        pause(&format!("{completion}\n{storage}"))?;
+    }
     Ok(())
+}
+
+/// File the test's last screen is saved to in its run directory (`DIT_UI_FINAL_FRAME`).
+const FINAL_FRAME_FILE: &str = "dashboard-final.json";
+
+/// The result shown under the progress of a finished single test: the verdict first
+/// (`RESULT: <VERDICT>` and the completion headline), the ledger lines as they are (the test's
+/// own screen does not show them), the fail-summary row and where the report went.
+fn module_result_rows(verdict: &str, completion: &str, storage: &str) -> Vec<String> {
+    let mut lines = completion
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let mut rows = vec![format!(
+        "RESULT: {verdict}    {}",
+        lines.next().unwrap_or_default()
+    )];
+    for line in lines {
+        rows.push(if line.starts_with("Fail summary") {
+            format!("CSV      {line}")
+        } else if line.starts_with("FAIL BY PART") || line.starts_with("HW EVENTS") {
+            line.to_owned()
+        } else {
+            format!("NOTE     {line}")
+        });
+    }
+    rows.push(format!("REPORT   {storage}"));
+    rows
+}
+
+/// Draws a finished test's last screen (`frame`, saved when its live view ended) with `rows`
+/// under the progress, then waits for Enter. `Ok(false)` when there is no such screen to show
+/// (not a terminal, no frame saved): the caller prints the text instead.
+fn show_in_frame(frame: &Path, rows: &[String]) -> io::Result<bool> {
+    if !io::stdout().is_terminal() {
+        return Ok(false);
+    }
+    let Some(dashboard) = dit_ui_core::load_final_frame(frame) else {
+        return Ok(false);
+    };
+    draw_result_frame(
+        &dashboard,
+        rows,
+        "Press Enter to return to the control center",
+    )?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(true)
+}
+
+/// Clears the screen and draws `dashboard` finished, with `rows` under its progress.
+fn draw_result_frame(
+    dashboard: &dit_ui_core::UnifiedDashboard,
+    rows: &[String],
+    footer: &str,
+) -> io::Result<()> {
+    print!("\x1b[H\x1b[2J");
+    let frame =
+        dit_ui_core::render_result_frame(dashboard, rows, footer, TerminalSize::current(), true);
+    let mut renderer = dit_ui_core::InPlaceRenderer::new(io::stdout(), 2);
+    renderer.render_frame(&frame)?;
+    renderer.finish()
 }
 
 fn watchdog_command<I>(
@@ -1205,6 +1311,32 @@ mod tests {
         assert_eq!(ProfileChoice::parse("t"), ProfileChoice::TempLimit);
         let screen = render_gpu_profile_menu(chosen);
         assert!(screen.contains("10 min") && screen.contains("ON at 90 C"));
+    }
+
+    /// The result under a finished test's progress: verdict first, the ledger lines as they are,
+    /// the CSV row and where the report went.
+    #[test]
+    fn module_result_rows_put_the_verdict_first_and_the_report_last() {
+        let rows = module_result_rows(
+            "FAIL",
+            "GPU-VRAM validation completed with FAIL; hardware transfer/compute tested: yes.\n\
+HARDWARE WARNINGS: corrected hardware errors were logged during the run.\n\
+FAIL BY PART  PCIe-GPU1 2 | GPU1 0 | VRAM1 0 | PLATFORM 0\n\
+HW EVENTS     PCIe-GPU1 replay +4\n\
+Fail summary row added to /mnt/cpu-dit-results/fail-summary.csv",
+            "Final report bundle copied once to: /mnt/cpu-dit-results/runs/x/gpu-vram",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "RESULT: FAIL    GPU-VRAM validation completed with FAIL; hardware transfer/compute tested: yes.",
+                "NOTE     HARDWARE WARNINGS: corrected hardware errors were logged during the run.",
+                "FAIL BY PART  PCIe-GPU1 2 | GPU1 0 | VRAM1 0 | PLATFORM 0",
+                "HW EVENTS     PCIe-GPU1 replay +4",
+                "CSV      Fail summary row added to /mnt/cpu-dit-results/fail-summary.csv",
+                "REPORT   Final report bundle copied once to: /mnt/cpu-dit-results/runs/x/gpu-vram",
+            ]
+        );
     }
 
     #[test]
