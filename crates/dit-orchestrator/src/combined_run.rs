@@ -659,15 +659,12 @@ fn run_session(
             session.phases.len(),
         )
         .map_or("none (not every phase completed)", Level::label);
-        let mut rows = vec![
-            format!(
-                "RESULT: {verdict}    COMBINED {} {}    depth reached {depth}",
-                session.settings.level.label(),
-                session.settings.intensity.label()
-            ),
-            format!("REPORT   {stored}"),
-            format!("CSV      {csv}"),
-        ];
+        // The order every test uses: verdict, notes, report, CSV (the ledger is on screen).
+        let mut rows = vec![format!(
+            "RESULT: {verdict}    COMBINED {} {}    depth reached {depth}",
+            session.settings.level.label(),
+            session.settings.intensity.label()
+        )];
         // Clean-up is shown only when it did not go as it should.
         for note in [cleanup.trim(), release.trim()] {
             if !note.is_empty()
@@ -679,6 +676,8 @@ fn run_session(
                 rows.push(format!("NOTE     {note}"));
             }
         }
+        rows.push(format!("REPORT   {stored}"));
+        rows.push(format!("CSV      {csv}"));
         session.draw_result(rows, "Press Enter to return to the control center");
     }
     Ok((summary, verdict, shown))

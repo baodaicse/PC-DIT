@@ -2,6 +2,7 @@
 //! same shell every other test uses. `cpu-dit-ui.sh` starts the runner and then this view, which
 //! follows the runner's log (`CPU_DIT_PROGRESS` / `CPU_DIT_COUNTER` lines) until the runner exits.
 //! It only reads: the runner, its watchdog and the result screen stay with the UI script.
+//! `--mode power` draws the CPU availability / power-platform test (`CPU_DIT_POWER_PROGRESS`).
 use super::combined_view::{format_bytes, format_duration};
 use dit_system::LiveSensorSampler;
 use dit_ui_core::{
@@ -13,8 +14,18 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ViewMode {
+    /// CPU-RAM Safe / Full / Compute (`CPU_DIT_PROGRESS`).
+    CpuRam,
+    /// CPU availability / power platform (`CPU_DIT_POWER_PROGRESS`).
+    Power,
+}
+
 #[derive(Debug, clap::Args)]
 pub struct CpuRamViewArgs {
+    #[arg(long, value_enum, default_value_t = ViewMode::CpuRam)]
+    mode: ViewMode,
     /// Runner log the UI script captures (stdout and stderr of the runner).
     #[arg(long)]
     log: PathBuf,
@@ -53,7 +64,8 @@ struct Progress {
 
 impl Progress {
     fn absorb_line(&mut self, line: &str) {
-        let progress = line.contains("CPU_DIT_PROGRESS phase=");
+        let progress = line.contains("CPU_DIT_PROGRESS phase=")
+            || line.contains("CPU_DIT_POWER_PROGRESS phase=");
         let counter = line.contains("CPU_DIT_COUNTER calculations_completed=");
         if !progress && !counter {
             return;
@@ -64,7 +76,7 @@ impl Progress {
                     self.fields.insert(key.to_owned(), value.to_owned());
                 }
                 match key {
-                    "failures_total" => {
+                    "failures_total" | "failures" => {
                         if let Ok(count) = value.parse::<u64>() {
                             self.failures_peak = self.failures_peak.max(count);
                         }
@@ -307,6 +319,172 @@ fn dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
     }
 }
 
+/// The CPU availability / power-platform test: transitions or, in the campaign, minimum time and
+/// coverage rounds, with the availability and power evidence kept apart from FAIL.
+#[allow(clippy::too_many_lines)]
+fn power_dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
+    let args = frame.args;
+    let (total, available, cache) = frame.memory;
+    let live = frame.live;
+    let text = |key: &str, default: &str| progress.field(key).unwrap_or(default).to_owned();
+    let campaign = progress.field("mode") == Some("campaign");
+    let phase = text("phase", "PREFLIGHT");
+    let rounds = progress.number("rounds").unwrap_or(0);
+    let (mut completed, target, workers) = if campaign {
+        (
+            progress.number("round_completed"),
+            progress.number("round_target"),
+            text("active_workers", "planning"),
+        )
+    } else {
+        (
+            progress.number("completed"),
+            progress.number("target"),
+            text("workers", "planning"),
+        )
+    };
+    if campaign
+        && matches!(phase.as_str(), "FINAL" | "TRANSITION_DONE")
+        && completed == Some(0)
+        && rounds > 0
+    {
+        completed = target;
+    }
+    let minimum_ms = progress.number("minimum_ms").filter(|ms| *ms > 0);
+    let elapsed = match (campaign, progress.number("elapsed_ms")) {
+        (true, Some(ms)) => ms / 1000,
+        _ => frame.now_unix.saturating_sub(args.started_unix),
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let progress_percent = match (campaign, minimum_ms, completed, target) {
+        (true, Some(minimum), ..) => {
+            Some((100.0 * (elapsed * 1000) as f64 / minimum as f64).min(100.0))
+        }
+        (false, _, Some(done), Some(goal)) if goal > 0 => {
+            Some((100.0 * done as f64 / goal as f64).min(100.0))
+        }
+        _ => Some(0.0),
+    };
+    let availability = text("availability", "Starting");
+    let detail = if !campaign {
+        "Progress counts completed transitions; completion does not prove power stability."
+            .to_owned()
+    } else if progress.field("topology_complete") == Some("false") {
+        "INCOMPLETE TOPOLOGY: core/SMT coverage unavailable; this run cannot PASS.".to_owned()
+    } else if progress_percent.is_some_and(|p| p >= 100.0) && availability == "Running" {
+        "Finishing current coverage round; minimum time reached, test is not complete.".to_owned()
+    } else {
+        format!("Completed rounds {rounds}; full coverage round required. Not power validation.")
+    };
+    let load = if campaign {
+        format!(
+            "Idle {} ms / burst {} ms / {}",
+            text("idle_ms", "?"),
+            text("burst_ms", "?"),
+            text("timing", "planning")
+        )
+    } else {
+        "Idle 500 ms / burst 100 ms".to_owned()
+    };
+    let shown = |value: Option<u64>| value.map_or_else(|| "planning".to_owned(), |v| v.to_string());
+    let used = total.saturating_sub(available);
+    let mut running_rows = vec![
+        format!(
+            "{}  {} / {}    WORKERS {workers}    BURSTS {}",
+            if campaign {
+                "ROUND COVERAGE"
+            } else {
+                "TRANSITIONS   "
+            },
+            completed.unwrap_or(0),
+            shown(target),
+            progress.number("bursts").unwrap_or(0)
+        ),
+        format!(
+            "AVAILABILITY  {availability}    POWER {}    VCORE unavailable",
+            text("power_platform", "NoEvidence")
+        ),
+        format!("SEED          {}", text("seed", "planning")),
+    ];
+    if campaign {
+        running_rows.push(format!(
+            "KERNEL        {}    ROUNDS {rounds}    GROUP {}    ACTIVE CPUs {}",
+            text("kernel", "planning"),
+            text("group", "-"),
+            text("active_cpus", "-")
+        ));
+    }
+    running_rows.push(detail);
+    running_rows
+        .push("Scratch RAM 64 KiB/worker; full RAM coverage is a separate test.".to_owned());
+    UnifiedDashboard {
+        engine: format!("CPU-POWER {}", args.engine_version),
+        report_abi: args.report_abi.clone(),
+        profile: format!("{} / CPU AVAILABILITY + POWER PLATFORM", args.title),
+        hardware_rows: vec![
+            format!("CPU:     {}", frame.system.cpu),
+            format!("THREADS: {} logical CPU(s)", frame.system.logical_threads),
+            format!("RAM:     {} total system memory", format_bytes(total)),
+            format!("NUMA:    {} node(s)", frame.numa),
+            format!("GPU:     {}", frame.system.gpu),
+            format!("BOARD:   {}", frame.system.board),
+            format!("KERNEL:  {}", frame.system.kernel),
+        ],
+        live_meters: vec![
+            DashboardMeter::new("CPU USAGE", live.cpu_percent).detail(format!(
+                "Freq {} / Temp {} / Power {}",
+                optional(live.cpu_frequency_ghz, "GHz", 2),
+                optional(live.cpu_temperature_celsius, "C", 0),
+                optional(live.cpu_power_watts, "W", 0)
+            )),
+            DashboardMeter::new("RAM USAGE", percent(used, total)).detail(format!(
+                "Used {} / {} / Available {} / Cache {}",
+                format_bytes(used),
+                format_bytes(total),
+                format_bytes(available),
+                format_bytes(cache)
+            )),
+        ],
+        state: availability.to_ascii_uppercase(),
+        progress_percent,
+        elapsed: format_duration(elapsed),
+        target: if campaign {
+            minimum_ms.map_or_else(|| "planning".to_owned(), |ms| format_duration(ms / 1000))
+        } else {
+            format!("{} transitions", shown(target))
+        },
+        active_test: if campaign {
+            format!(
+                "{}  PHASE {} / {phase}",
+                args.title,
+                text("campaign_phase", "planning")
+            )
+        } else {
+            format!("{}  PHASE {phase}", args.title)
+        },
+        process: load,
+        calculations_completed: progress.number("bursts").unwrap_or(0),
+        failures: progress.failures_peak,
+        running_rows,
+        footer: args.temp_limit_celsius.map_or_else(
+            || "TEMP LIMIT OFF - TELEMETRY ONLY    |    Ctrl+C: stop + preserve report".to_owned(),
+            |limit| {
+                format!(
+                    "TEMP LIMIT ON ({limit} C, TRUSTED CPU SENSORS)    |    Ctrl+C: stop + preserve report"
+                )
+            },
+        ),
+    }
+}
+
+/// The screen of the view's mode.
+fn model(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
+    match frame.args.mode {
+        ViewMode::CpuRam => dashboard(frame, progress),
+        ViewMode::Power => power_dashboard(frame, progress),
+    }
+}
+
 /// Whether `pid` still runs (a zombie waiting for its parent counts as gone).
 fn running(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -369,7 +547,7 @@ pub fn command(args: &CpuRamViewArgs) -> io::Result<()> {
                 .map_or(0, |d| d.as_secs()),
         };
         let text =
-            render_unified_dashboard(&dashboard(&frame, &progress), TerminalSize::current(), true);
+            render_unified_dashboard(&model(&frame, &progress), TerminalSize::current(), true);
         renderer.render_frame(&text)?;
         if !alive {
             break;
@@ -385,6 +563,7 @@ mod tests {
 
     fn args() -> CpuRamViewArgs {
         CpuRamViewArgs {
+            mode: ViewMode::CpuRam,
             log: PathBuf::from("/nonexistent"),
             pid: 0,
             title: "FULL TEST".into(),
@@ -413,6 +592,49 @@ mod tests {
         assert_eq!(progress.field("phase"), Some("RAM_WRITE"));
         assert_eq!(progress.calculations, 2_147_483_648);
         assert_eq!(format_calculations(2_147_483_648), "2147483648 (2.00 GiB)");
+    }
+
+    #[test]
+    fn the_power_campaign_screen_shows_minimum_time_coverage_and_evidence() {
+        let mut progress = Progress::default();
+        progress.absorb_line(
+            "CPU_DIT_POWER_PROGRESS phase=BURST_ARMED mode=campaign completed=3 target=10 round_completed=5 round_target=24 rounds=1 minimum_ms=120000 elapsed_ms=60000 active_workers=4 bursts=25 failures=1 availability=Running power_platform=NoEvidence seed=0x1234 campaign_phase=SINGLE kernel=heavy-fp-v1 group=0 active_cpus=0-3 idle_ms=200 burst_ms=50 timing=seeded",
+        );
+        let mut args = args();
+        args.mode = ViewMode::Power;
+        args.title = "UNIFIED POWER CAMPAIGN".into();
+        let system = SystemInfo::default();
+        let live = LiveUtilization::default();
+        let frame = Frame {
+            args: &args,
+            system: &system,
+            numa: 1,
+            live: &live,
+            memory: (32 << 30, 16 << 30, 4 << 30),
+            now_unix: 2000,
+        };
+        let text = render_unified_dashboard(
+            &model(&frame, &progress),
+            TerminalSize {
+                cols: 160,
+                rows: 48,
+            },
+            false,
+        );
+        for expected in [
+            "PROFILE UNIFIED POWER CAMPAIGN / CPU AVAILABILITY + POWER PLATFORM",
+            "STATE: RUNNING",
+            "PROGRESS: 50%",
+            "00:01:00 / 00:02:00",
+            "PHASE SINGLE / BURST_ARMED",
+            "ROUND COVERAGE  5 / 24",
+            "FAIL TOTAL  1",
+            "AVAILABILITY  Running    POWER NoEvidence    VCORE unavailable",
+            "KERNEL        heavy-fp-v1",
+            "Completed rounds 1; full coverage round required",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
     }
 
     #[test]

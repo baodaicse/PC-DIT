@@ -207,10 +207,18 @@ pub(super) fn render(state: &UiState, size: TerminalSize, color: bool) -> String
     } else {
         String::new()
     };
-    let target = state.duration_limit.map_or_else(
-        || "N/A".to_owned(),
-        |limit| format!("{}s stop limit", limit.as_secs()),
-    );
+    // Same clock as every other test: hh:mm:ss.
+    let clock = |seconds: u64| {
+        format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    };
+    let target = state
+        .duration_limit
+        .map_or_else(|| "N/A".to_owned(), |limit| clock(limit.as_secs()));
     let dashboard = UnifiedDashboard {
         engine: format!("{}-{}", state.title, env!("CARGO_PKG_VERSION")),
         report_abi: dit_contracts::SCHEMA_VERSION.to_string(),
@@ -219,7 +227,7 @@ pub(super) fn render(state: &UiState, size: TerminalSize, color: bool) -> String
         live_meters,
         state: summary.state.to_owned(),
         progress_percent: Some(progress),
-        elapsed: format!("{}s", state.started.elapsed().as_secs()),
+        elapsed: clock(state.started.elapsed().as_secs()),
         target,
         active_test: active,
         process: "4K matrix -> direct write -> readback -> independent exact recompute".to_owned(),

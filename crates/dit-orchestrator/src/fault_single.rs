@@ -1,4 +1,4 @@
-//! Fault ledger of a single-module run (GPU-VRAM or CPU-SSD from the menu): the module's report
+//! Fault ledger of a single-module run (GPU-VRAM, CPU-SSD or CPU-RAM from the menu): the report
 //! counted on component cells, two lines for the completion screen and one `fail-summary.csv`
 //! row on the results volume, like a combined session.
 use dit_orchestrator::fault_ledger::{Component, CsvMeta, Ledger, append_csv};
@@ -12,6 +12,8 @@ use std::path::Path;
 pub enum SingleModule {
     Gpu,
     Ssd,
+    /// CPU-RAM Safe / Full / Compute, run by the CPU-RAM UI (`dit-suite ledger`).
+    CpuRam,
 }
 
 impl SingleModule {
@@ -19,6 +21,15 @@ impl SingleModule {
         match self {
             Self::Gpu => "gpu-vram",
             Self::Ssd => "cpu-nvme",
+            Self::CpuRam => "cpu-ram",
+        }
+    }
+
+    /// The report's place in the results volume, as the CSV row names it.
+    fn report_path(self, run_id: &str) -> String {
+        match self {
+            Self::CpuRam => format!("runs/{run_id}/system-report.json"),
+            _ => format!("runs/{run_id}/{}/report.json", self.directory()),
         }
     }
 
@@ -35,6 +46,7 @@ impl SingleModule {
         match self {
             Self::Gpu => "GPU-VRAM",
             Self::Ssd => "CPU-SSD",
+            Self::CpuRam => "CPU-RAM",
         }
     }
 }
@@ -46,23 +58,12 @@ fn names(values: impl Iterator<Item = String>) -> String {
         .join("; ")
 }
 
-/// Counts the report's failures on their cells and appends the CSV row. The returned text goes
-/// under the module's completion message; an unreadable report gives an empty string.
-pub fn summarize(
+/// What the module's report says: its failures and hardware events, the machine's cells for
+/// the FAIL BY PART line, and the GPU and SSD names for the CSV row.
+fn module_findings(
     module: SingleModule,
-    report_path: &Path,
-    results_root: &Path,
-    run_dir: &Path,
-    run_id: &str,
-    verdict: &str,
-    attribution: bool,
-) -> String {
-    let Some(report) = std::fs::read(report_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-    else {
-        return String::new();
-    };
+    report: &Value,
+) -> (fault_sources::Findings, Vec<Component>, String, String) {
     let str_at = |value: &Value, pointer: &str| {
         value
             .pointer(pointer)
@@ -70,7 +71,7 @@ pub fn summarize(
             .unwrap_or("")
             .to_owned()
     };
-    let (findings, machine, gpus, ssds) = match module {
+    match module {
         SingleModule::Gpu => {
             let devices: Vec<Value> = report
                 .pointer("/device_reports")
@@ -84,7 +85,7 @@ pub fn summarize(
             machine.push(Component::Platform);
             let gpus = names(devices.iter().map(|d| str_at(d, "/selected_device/name")));
             (
-                fault_sources::gpu_by_order(&report),
+                fault_sources::gpu_by_order(report),
                 machine,
                 gpus,
                 String::new(),
@@ -116,13 +117,39 @@ pub fn summarize(
                     .map(|device| str_at(device, "/model")),
             );
             (
-                fault_sources::ssd(&report, "", &|_| None),
+                fault_sources::ssd(report, "", &|_| None),
                 machine,
                 String::new(),
                 ssds,
             )
         }
+        SingleModule::CpuRam => (
+            fault_sources::cpu_ram(report, ""),
+            vec![Component::Cpu, Component::Ram, Component::Platform],
+            String::new(),
+            String::new(),
+        ),
+    }
+}
+
+/// Counts the report's failures on their cells and appends the CSV row. The returned text goes
+/// under the module's completion message; an unreadable report gives an empty string.
+pub fn summarize(
+    module: SingleModule,
+    report_path: &Path,
+    results_root: &Path,
+    run_dir: &Path,
+    run_id: &str,
+    verdict: &str,
+    attribution: bool,
+) -> String {
+    let Some(report) = std::fs::read(report_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return String::new();
     };
+    let (findings, machine, gpus, ssds) = module_findings(module, &report);
     let mut ledger = Ledger::default();
     ledger.add_all(findings.failures);
     for event in &findings.hardware {
@@ -141,7 +168,7 @@ pub fn summarize(
         gpus,
         ssds,
         verdict: verdict.to_owned(),
-        report: format!("runs/{run_id}/{}/report.json", module.directory()),
+        report: module.report_path(run_id),
     };
     let csv_path = if results_root.is_dir() {
         results_root.join("fail-summary.csv")

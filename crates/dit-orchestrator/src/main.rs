@@ -51,6 +51,41 @@ enum Command {
     /// Draws a finished test's saved last screen with its result under the progress (used by
     /// the CPU-RAM UI); exits 1 when the screen cannot be drawn, so the caller falls back.
     FinalFrame(FinalFrameArgs),
+    /// Counts a finished CPU-RAM run's failures on their component cells and appends its
+    /// `fail-summary.csv` row; prints the FAIL BY PART, HW EVENTS and CSV lines (CPU-RAM UI).
+    Ledger(LedgerArgs),
+    /// Clears the screen and draws an option screen in the shared look (menus of the CPU-RAM
+    /// and power UI script).
+    OptionScreen(OptionScreenArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct OptionScreenArgs {
+    /// `DIT <MODULE> // <WHAT>`, drawn as the title band.
+    #[arg(long)]
+    title: String,
+    /// One row; a row of exactly `---` starts a new section.
+    #[arg(long = "row", allow_hyphen_values = true)]
+    rows: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct LedgerArgs {
+    /// `system-report.json` of the run.
+    #[arg(long)]
+    report: PathBuf,
+    /// Verified results volume; the CSV goes to `--run-dir` when it is not a directory.
+    #[arg(long, default_value = "/mnt/cpu-dit-results")]
+    results_root: PathBuf,
+    #[arg(long)]
+    run_dir: PathBuf,
+    #[arg(long)]
+    run_id: String,
+    #[arg(long)]
+    verdict: String,
+    /// The run was booted with the Fault Attribution entry.
+    #[arg(long)]
+    attribution: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -136,6 +171,42 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Combined(args) => combined_run::run_cli(&args),
         Command::CpuRamView(args) => {
             cpu_ram_view::command(&args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::OptionScreen(args) => {
+            let mut sections: Vec<Vec<String>> = vec![Vec::new()];
+            for row in args.rows {
+                if row == "---" {
+                    sections.push(Vec::new());
+                } else if let Some(section) = sections.last_mut() {
+                    section.push(row);
+                }
+            }
+            sections.retain(|section| !section.is_empty());
+            println!(
+                "\x1b[0m\x1b[H\x1b[2J{}",
+                dit_ui_core::decorate(&dit_ui_core::option_screen(
+                    &args.title,
+                    &sections,
+                    TerminalSize::current()
+                ))
+            );
+            io::stdout().flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Ledger(args) => {
+            println!(
+                "{}",
+                fault_single::summarize(
+                    fault_single::SingleModule::CpuRam,
+                    &args.report,
+                    &args.results_root,
+                    &args.run_dir,
+                    &args.run_id,
+                    &args.verdict,
+                    args.attribution,
+                )
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::FinalFrame(args) => {
@@ -662,28 +733,31 @@ fn launch_gpu(
 /// File the test's last screen is saved to in its run directory (`DIT_UI_FINAL_FRAME`).
 const FINAL_FRAME_FILE: &str = "dashboard-final.json";
 
-/// The result shown under the progress of a finished single test: the verdict first
-/// (`RESULT: <VERDICT>` and the completion headline), the ledger lines as they are (the test's
-/// own screen does not show them), the fail-summary row and where the report went.
+/// The result shown under the progress of a finished single test, in the order every test uses:
+/// the verdict (`RESULT: <VERDICT>` and the completion headline), notes, the ledger lines as they
+/// are (the test's own screen does not show them), where the report went, the fail-summary row.
 fn module_result_rows(verdict: &str, completion: &str, storage: &str) -> Vec<String> {
     let mut lines = completion
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty());
-    let mut rows = vec![format!(
-        "RESULT: {verdict}    {}",
-        lines.next().unwrap_or_default()
-    )];
+    let headline = format!("RESULT: {verdict}    {}", lines.next().unwrap_or_default());
+    let (mut notes, mut ledger, mut csv) = (Vec::new(), Vec::new(), Vec::new());
     for line in lines {
-        rows.push(if line.starts_with("Fail summary") {
-            format!("CSV      {line}")
+        if line.starts_with("Fail summary") {
+            csv.push(format!("CSV      {line}"));
         } else if line.starts_with("FAIL BY PART") || line.starts_with("HW EVENTS") {
-            line.to_owned()
+            ledger.push(line.to_owned());
         } else {
-            format!("NOTE     {line}")
-        });
+            notes.push(format!("NOTE     {line}"));
+        }
     }
+    // One order for every test (COMBINED too): verdict, notes, ledger, report, CSV.
+    let mut rows = vec![headline];
+    rows.extend(notes);
+    rows.extend(ledger);
     rows.push(format!("REPORT   {storage}"));
+    rows.extend(csv);
     rows
 }
 
@@ -1333,8 +1407,8 @@ Fail summary row added to /mnt/cpu-dit-results/fail-summary.csv",
                 "NOTE     HARDWARE WARNINGS: corrected hardware errors were logged during the run.",
                 "FAIL BY PART  PCIe-GPU1 2 | GPU1 0 | VRAM1 0 | PLATFORM 0",
                 "HW EVENTS     PCIe-GPU1 replay +4",
-                "CSV      Fail summary row added to /mnt/cpu-dit-results/fail-summary.csv",
                 "REPORT   Final report bundle copied once to: /mnt/cpu-dit-results/runs/x/gpu-vram",
+                "CSV      Fail summary row added to /mnt/cpu-dit-results/fail-summary.csv",
             ]
         );
     }

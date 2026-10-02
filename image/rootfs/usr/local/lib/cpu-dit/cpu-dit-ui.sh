@@ -11,6 +11,28 @@ WATCHDOG="${CPU_DIT_WATCHDOG_BINARY:-/usr/local/bin/dit-watchdog}"
 # drawn by the same Rust renderer as CPU-SSD, GPU-VRAM and COMBINED. Without it, the screen
 # below (draw_running) is the fallback.
 SUITE="${CPU_DIT_SUITE_BINARY:-/usr/local/bin/dit-suite}"
+# Menus and result screens are drawn by the same renderer too (`dit-suite option-screen`), when
+# this dit-suite has it; otherwise the script draws them itself.
+suite_screens=0
+if [[ -x "$SUITE" ]] && "$SUITE" option-screen --help >/dev/null 2>&1; then
+    suite_screens=1
+fi
+
+# shared_screen TITLE ROW...: clears the screen and draws an option screen in the shared look
+# (title band, rows; a row '---' starts a new section). Returns 1 when it cannot.
+shared_screen() {
+    (( suite_screens )) || return 1
+    local title="$1" row
+    shift
+    local -a screen_args=(option-screen --title "$title")
+    for row in "$@"; do screen_args+=(--row "$row"); done
+    "$SUITE" "${screen_args[@]}"
+}
+
+# shared_prompt TEXT: the prompt under a shared screen (no script background colour).
+shared_prompt() {
+    printf '%s%s%s' "$c_cyan" "$1" "$c_reset"
+}
 WATCHDOG_RESULTS_ROOT="${CPU_DIT_WATCHDOG_RESULTS_ROOT:-/mnt/cpu-dit-results}"
 AUTO_SECONDS="${CPU_DIT_UI_AUTOSTART_SECONDS:-10}"
 PROFILE_CONFIG="${CPU_DIT_PROFILE_CONFIG:-/etc/cpu-dit/profiles.conf}"
@@ -518,8 +540,36 @@ sensor_summary() {
 draw_menu() {
     if [[ "$POWER_UI" == 1 ]]; then draw_power_menu; return; fi
     refresh_geometry
-    begin_running_frame compact
     sensor_summary force
+    local limit_row back_row=() start_row
+    if (( thermal_limit_enabled == 1 )); then
+        limit_row=" [T] TEMP LIMIT      ON at ${THERMAL_LIMIT_C} C (trusted CPU sensors)"
+    else
+        limit_row=' [T] TEMP LIMIT      OFF (temperature telemetry is still recorded)'
+    fi
+    [[ "${CPU_DIT_SUITE_CHILD:-0}" == 1 ]] && back_row=(' [B] BACK            Return to DIT module selection')
+    if (( AUTO_SECONDS > 0 )); then
+        start_row="Safe test starts automatically in ${AUTO_SECONDS}s; press a key to choose"
+    else
+        start_row='Select 1-5, D, T, R or P'
+    fi
+    if shared_screen 'DIT CPU + RAM // OFFLINE CPU + MEMORY DATA INTEGRITY TEST' \
+        "$cpu_line" "$ram_line" --- \
+        " [1] SAFE TEST       ${SAFE_MEMORY_MIB} MiB, min $(format_duration "$SAFE_MINIMUM_DURATION_SECONDS")" \
+        " [2] FULL TEST       ${FULL_SAFE_PERCENT}% safe RAM + CPU compute oracle, min $(format_duration "$full_duration_seconds")" \
+        " [5] CPU COMPUTE     FMA/AVX, branch, AES oracles, min $(format_duration "$full_duration_seconds")" \
+        ' [3] SENSOR INFO     Temperature, CPU package Watt, EDAC and drivers' \
+        ' [4] DIAGNOSTIC      Open root shell; type exit to return' \
+        ' [D] TEST DURATION   Change minimum duration for Full and CPU Compute' \
+        "$limit_row" \
+        ' [R] REBOOT          [P] POWER OFF' \
+        "${back_row[@]}" --- \
+        'Root is read-only; reports only go to verified DIT-RESULTS on this USB.' \
+        "$start_row"; then
+        shared_prompt 'Selection > '
+        return
+    fi
+    begin_running_frame compact
     rule '='
     box_center 'CPU-DIT-01' "$c_cyan"
     box_center 'OFFLINE CPU + MEMORY DATA INTEGRITY TEST' "$c_muted"
@@ -563,8 +613,31 @@ draw_menu() {
 
 draw_power_menu() {
     refresh_geometry
-    begin_running_frame compact
     sensor_summary force
+    local limit_row
+    if (( thermal_limit_enabled )); then
+        limit_row=' [T] TEMP LIMIT          ON at 95 C (trusted CPU sensors)'
+    else
+        limit_row=' [T] TEMP LIMIT          OFF; telemetry remains active'
+    fi
+    if shared_screen 'DIT CPU AVAILABILITY / POWER // PLATFORM TEST' \
+        "$cpu_line" "$ram_line" --- \
+        ' [1] START AVAILABILITY / POWER TEST' \
+        " [D] DURATION            Minimum $(format_duration "$power_duration_seconds") + complete coverage round" \
+        ' [2] ADVANCED            Power-only / Core-SMT-only diagnostics' \
+        ' [3] SENSOR INFO         Temperature, package power and drivers' \
+        ' [4] DIAGNOSTIC          Open shell' \
+        "$limit_row" \
+        ' [B] BACK                Return to module menu' \
+        ' [R] REBOOT              [P] POWER OFF' --- \
+        'Single-thread -> Core/SMT -> All-CPU -> Mixed; repeat full rounds.' \
+        'Seeded short/long idle + burst; mixed/heavy FP, 64 KiB/worker.' \
+        'Availability and power evidence are reported separately.' \
+        'Vcore unavailable; a completed run does not prove power stability.'; then
+        shared_prompt 'Selection > '
+        return
+    fi
+    begin_running_frame compact
     rule '='
     box_center 'CPU AVAILABILITY / POWER PLATFORM' "$c_cyan"
     rule '-'
@@ -594,14 +667,20 @@ draw_power_menu() {
 }
 
 power_advanced_menu() {
-    clear_screen
-    rule '='
-    box_center 'ADVANCED POWER DIAGNOSTICS' "$c_cyan"
-    box_line " [1] POWER TRANSITIONS   $power_transitions cycles"
-    box_line " [2] CORE / SMT SWEEP    $power_transitions cycles per group"
-    box_line ' [N] TRANSITIONS         Set cycles/group (1..1000)'
-    box_line ' [B] BACK                No test started'
-    rule '='
+    if ! shared_screen 'DIT CPU AVAILABILITY / POWER // ADVANCED DIAGNOSTICS' \
+        " [1] POWER TRANSITIONS   $power_transitions cycles" \
+        " [2] CORE / SMT SWEEP    $power_transitions cycles per group" \
+        ' [N] TRANSITIONS         Set cycles/group (1..1000)' \
+        ' [B] BACK                No test started'; then
+        clear_screen
+        rule '='
+        box_center 'ADVANCED POWER DIAGNOSTICS' "$c_cyan"
+        box_line " [1] POWER TRANSITIONS   $power_transitions cycles"
+        box_line " [2] CORE / SMT SWEEP    $power_transitions cycles per group"
+        box_line ' [N] TRANSITIONS         Set cycles/group (1..1000)'
+        box_line ' [B] BACK                No test started'
+        rule '='
+    fi
     local selected requested
     IFS= read -r -n 1 selected || return 0
     case "$selected" in
@@ -989,6 +1068,13 @@ draw_running() {
 
 show_result() {
     local status="$1" text_value="$2" color="$3"
+    if shared_screen 'DIT CPU + RAM // TEST RESULT' \
+        "RESULT: $status    $text_value" --- \
+        'Reports: DIT-RESULTS/runs/<session-id> when the verified USB partition is available.'; then
+        shared_prompt 'Press Enter to return to the control center '
+        IFS= read -r _unused || true
+        return
+    fi
     clear_screen
     rule '='
     box_center 'CPU-DIT-01  //  TEST RESULT' "$c_cyan"
@@ -1007,11 +1093,12 @@ show_result() {
     IFS= read -r _unused || true
 }
 
-# run_result VERDICT TEXT COLOR: the result of a CPU-RAM run. With the shared view, inside its
+# run_result VERDICT TEXT COLOR: the result of a CPU-RAM or power run. With the shared view, inside its
 # last screen (verdict and where the reports went, under the progress); otherwise the result
 # screen. Uses run_profile's shared_view, final_frame and run_log.
 run_result() {
-    local verdict="$1" text="$2" color="$3" reports report_row
+    local verdict="$1" text="$2" color="$3" reports report_row line
+    local -a rows=() ledger_rows=() csv_rows=() ledger_args=()
     if (( ${shared_view:-0} )) && [[ -s "${final_frame:-}" ]]; then
         reports="$(grep '^Reports: ' "$run_log" 2>/dev/null | tail -n 1)"
         reports="${reports#Reports: }"
@@ -1020,8 +1107,26 @@ run_result() {
         else
             report_row="REPORT   Reports saved to: ${reports:-unknown}"
         fi
-        if "$SUITE" final-frame --frame "$final_frame" \
-            --row "RESULT: $verdict    $text" --row "$report_row"; then
+        # CPU-RAM: the failures on their component cells and the fail-summary row, as the other
+        # tests show them.
+        if [[ "${module:-cpu-ram}" == cpu-ram && -n "$reports" && -s "$reports/system-report.json" ]]; then
+            ledger_args=(ledger --report "$reports/system-report.json"
+                --results-root "$WATCHDOG_RESULTS_ROOT" --run-dir "$reports"
+                --run-id "${reports##*/}" --verdict "$verdict")
+            grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && ledger_args+=(--attribution)
+            while IFS= read -r line; do
+                case "$line" in
+                    'FAIL BY PART'*|'HW EVENTS'*) ledger_rows+=("$line") ;;
+                    'Fail summary'*) csv_rows+=("CSV      $line") ;;
+                esac
+            done < <("$SUITE" "${ledger_args[@]}" 2>/dev/null)
+        fi
+        # The order every test uses: verdict, ledger, report, CSV.
+        rows=(--row "RESULT: $verdict    $text")
+        for line in "${ledger_rows[@]}"; do rows+=(--row "$line"); done
+        rows+=(--row "$report_row")
+        for line in "${csv_rows[@]}"; do rows+=(--row "$line"); done
+        if "$SUITE" final-frame --frame "$final_frame" "${rows[@]}"; then
             rm -f -- "$final_frame"
             ui_reset
             IFS= read -r _unused || true
@@ -1083,19 +1188,18 @@ run_profile() {
     # The shared view saves its last screen here; the result is then drawn inside it.
     local final_frame="$UI_RUN_DIR/cpu-ram-final-$$.json"
     rm -f -- "$final_frame"
-    if [[ "$module" == cpu-ram && -x "$SUITE" ]] \
-        && "$SUITE" cpu-ram-view --help >/dev/null 2>&1; then
+    local view_mode=cpu-ram
+    [[ "$module" == cpu-power-platform ]] && view_mode=power
+    if [[ -x "$SUITE" && "$("$SUITE" cpu-ram-view --help 2>/dev/null)" == *--mode* ]]; then
         shared_view=1
         printf '%s%s[H%s[2J' "$c_reset" "$esc" "$esc"
     fi
     while kill -0 "$active_run_pid" 2>/dev/null; do
-        if [[ "$module" == cpu-power-platform ]]; then
-            draw_power_running "$title" "$started" "$run_log"
-        elif (( shared_view )); then
+        if (( shared_view )); then
             # Returns when the runner exits. Ctrl+C ends it too (status 130): the INT trap stops
             # the runner, and the view starts again to show the stop. Any other failure falls
             # back to the script's own screen.
-            local -a view_args=(cpu-ram-view --log "$run_log" --pid "$active_run_pid"
+            local -a view_args=(cpu-ram-view --mode "$view_mode" --log "$run_log" --pid "$active_run_pid"
                 --title "$title" --duration-seconds "$duration" --started-unix "$started"
                 --full-safe-percent "$FULL_SAFE_PERCENT" --engine-version "$ENGINE_VERSION"
                 --report-abi "$REPORT_ABI")
@@ -1107,6 +1211,8 @@ run_profile() {
                 running_screen_initialized=0
             fi
             continue
+        elif [[ "$module" == cpu-power-platform ]]; then
+            draw_power_running "$title" "$started" "$run_log"
         else
             draw_running "$title" "$duration" "$started" "$run_log"
         fi
@@ -1133,10 +1239,10 @@ run_profile() {
             verdict="$(progress_field "$result_line" verdict)"
             evidence="Availability: $(progress_field "$result_line" availability); power: $(progress_field "$result_line" power_platform)"
             case "$verdict:$status" in
-                Pass:0) show_result 'PASS' "$evidence" "$c_green" ;;
-                Fail:*) show_result 'FAIL' "$evidence" "$c_red" ;;
-                Incomplete:*) show_result 'INCOMPLETE' "$evidence" "$c_yellow" ;;
-                *) show_result 'INTERRUPTED / INVALID' 'No successful final result; preserve checkpoint and watchdog evidence.' "$c_yellow" ;;
+                Pass:0) run_result 'PASS' "$evidence" "$c_green" ;;
+                Fail:*) run_result 'FAIL' "$evidence" "$c_red" ;;
+                Incomplete:*) run_result 'INCOMPLETE' "$evidence" "$c_yellow" ;;
+                *) run_result 'INTERRUPTED / INVALID' 'No successful final result; preserve checkpoint and watchdog evidence.' "$c_yellow" ;;
             esac
             return
         fi
@@ -1152,20 +1258,28 @@ run_profile() {
 
 set_full_duration() {
     local requested
-    clear_screen
-    rule '='
-    box_center 'CPU-DIT-01  //  FULL TEST DURATION' "$c_cyan"
-    rule '-'
-    box_center "Current minimum: $(format_duration "$full_duration_seconds")" "$c_white"
-    box_line ' Enter 60..86400 seconds. Validation default is 1800 seconds (30 min).'
-    box_line ' The engine finishes the active exact write/read round after time expires.'
-    rule '-'
-    box_center 'Press Enter without a value to keep the current duration' "$c_yellow"
-    rule '='
-    ui_reset
-    printf '\n'
-    indent
-    printf '%sSeconds > %s' "$c_cyan" "$c_reset$c_bg$c_white"
+    if shared_screen 'DIT CPU + RAM // FULL TEST DURATION' \
+        "Current minimum: $(format_duration "$full_duration_seconds")" --- \
+        'Enter 60..86400 seconds. Validation default is 1800 seconds (30 min).' \
+        'The engine finishes the active exact write/read round after time expires.' \
+        'Press Enter without a value to keep the current duration.'; then
+        shared_prompt 'Seconds > '
+    else
+        clear_screen
+        rule '='
+        box_center 'CPU-DIT-01  //  FULL TEST DURATION' "$c_cyan"
+        rule '-'
+        box_center "Current minimum: $(format_duration "$full_duration_seconds")" "$c_white"
+        box_line ' Enter 60..86400 seconds. Validation default is 1800 seconds (30 min).'
+        box_line ' The engine finishes the active exact write/read round after time expires.'
+        rule '-'
+        box_center 'Press Enter without a value to keep the current duration' "$c_yellow"
+        rule '='
+        ui_reset
+        printf '\n'
+        indent
+        printf '%sSeconds > %s' "$c_cyan" "$c_reset$c_bg$c_white"
+    fi
     IFS= read -r requested || requested=''
     [[ -z "$requested" ]] && return
     if [[ "$requested" =~ ^[0-9]+$ ]] && (( requested >= 60 && requested <= 86400 )); then
@@ -1195,10 +1309,13 @@ abort_active_run() {
 }
 
 show_sensors() {
-    clear_screen
-    ui_reset
-    printf '%s%s%s[2J%s[H' "$c_bg" "$c_white" "$esc" "$esc"
-    printf '%sCPU-DIT-01 SENSOR / DRIVER EVIDENCE%s\n\n' "$c_cyan" "$c_reset$c_bg$c_white"
+    if ! shared_screen 'DIT CPU + RAM // SENSOR / DRIVER EVIDENCE' \
+        'CPU and platform sensors, libsensors and the driver probe follow.'; then
+        clear_screen
+        ui_reset
+        printf '%s%s%s[2J%s[H' "$c_bg" "$c_white" "$esc" "$esc"
+        printf '%sCPU-DIT-01 SENSOR / DRIVER EVIDENCE%s\n\n' "$c_cyan" "$c_reset$c_bg$c_white"
+    fi
     "$DIT" sensors --interval-ms 500 || true
     if command -v sensors >/dev/null 2>&1; then
         printf '\n%sLIBSENSORS VIEW%s\n\n' "$c_cyan" "$c_reset$c_bg$c_white"

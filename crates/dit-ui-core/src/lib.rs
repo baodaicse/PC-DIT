@@ -1121,7 +1121,10 @@ mod tests {
                 .unwrap()
                 .contains("N/A")
         );
-        assert!(frame.contains("1800s stop limit"));
+        assert!(
+            frame.contains(" / 00:30:00"),
+            "the stop limit in the common clock"
+        );
         assert!(frame.contains("0x000000000000007b"));
         assert!(frame.contains("main progress = duration"));
     }
