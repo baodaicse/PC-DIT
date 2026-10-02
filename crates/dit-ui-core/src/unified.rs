@@ -197,12 +197,68 @@ pub fn render_result_frame(
 ) -> String {
     let mut finished = dashboard.clone();
     "DONE".clone_into(&mut finished.state);
+    // A pass means the planned work is complete, whatever the last running estimate showed.
+    if rows
+        .first()
+        .is_some_and(|row| row.starts_with("RESULT: PASS"))
+    {
+        finished.progress_percent = Some(100.0);
+    }
     if !rows.is_empty() {
         finished.running_rows.push(String::new());
-        finished.running_rows.extend(rows.iter().cloned());
+        finished.running_rows.extend(wrap_result_rows(rows, size));
     }
     footer.clone_into(&mut finished.footer);
     render_unified_dashboard(&finished, size, color)
+}
+
+/// Result rows as the frame shows them: a row wider than the frame (a report path) continues on
+/// the next rows, under its value column, instead of being clipped at the edge.
+#[must_use]
+pub fn wrap_result_rows(rows: &[String], size: TerminalSize) -> Vec<String> {
+    let inner = usize::from(size.cols).clamp(40, 240).saturating_sub(4);
+    let mut wrapped = Vec::new();
+    for row in rows {
+        let chars: Vec<char> = row.chars().collect();
+        if chars.len() <= inner {
+            wrapped.push(row.clone());
+            continue;
+        }
+        let indent = value_column(&chars)
+            .filter(|&column| column <= inner / 2)
+            .unwrap_or(0);
+        let mut rest = chars.as_slice();
+        let mut first = true;
+        while !rest.is_empty() {
+            let room = if first { inner } else { inner - indent };
+            let cut = if rest.len() <= room {
+                rest.len()
+            } else {
+                // After the last `/` or space that fits, unless that leaves the row half empty.
+                rest[..room]
+                    .iter()
+                    .rposition(|c| *c == '/' || *c == ' ')
+                    .map(|at| at + 1)
+                    .filter(|&at| at > room / 2)
+                    .unwrap_or(room)
+            };
+            let piece: String = rest[..cut].iter().collect();
+            wrapped.push(if first {
+                piece
+            } else {
+                format!("{}{}", " ".repeat(indent), piece.trim_start())
+            });
+            rest = &rest[cut..];
+            first = false;
+        }
+    }
+    wrapped
+}
+
+/// Where a row's value starts: after its label and the gap of two or more spaces behind it.
+fn value_column(chars: &[char]) -> Option<usize> {
+    let gap = chars.windows(2).position(|pair| pair == [' ', ' '])?;
+    (gap..chars.len()).find(|&column| chars[column] != ' ')
 }
 
 fn render_wide(dashboard: &UnifiedDashboard, width: usize, spaced: bool) -> Vec<String> {
@@ -939,5 +995,50 @@ mod tests {
         }
         assert!(cpu_frame.contains("ACTIVE TEST   TEST-A"));
         assert!(gpu_frame.contains("ACTIVE TEST   GPU-XFER-MATRIX"));
+    }
+
+    /// A report path wider than the frame continues under its value column, broken after a `/`,
+    /// and the whole path is still there; rows that fit are left alone.
+    #[test]
+    fn long_result_rows_wrap_under_their_value_instead_of_being_clipped() {
+        let path =
+            "/mnt/cpu-dit-results/runs/20261002T135436Z-04bb4a7a-a56b-4c93-a1f6-2ff9b8f1ea6c";
+        let rows = vec![
+            "RESULT: PASS    All gates passed.".to_owned(),
+            format!("REPORT   Reports saved to: {path}"),
+        ];
+        let size = TerminalSize { rows: 40, cols: 80 };
+        let wrapped = wrap_result_rows(&rows, size);
+        assert_eq!(wrapped[0], rows[0]);
+        assert!(wrapped.len() > rows.len());
+        assert!(wrapped.iter().all(|row| row.chars().count() <= 76));
+        assert!(wrapped[1].ends_with('/'));
+        for continuation in &wrapped[2..] {
+            assert!(continuation.starts_with(&" ".repeat(9)));
+            assert!(!continuation[9..].starts_with(' '));
+        }
+        let joined: String = wrapped[1..].iter().map(|row| row.trim_start()).collect();
+        assert!(joined.ends_with(path));
+    }
+
+    /// The result frame of a pass shows the progress complete; any other verdict keeps the
+    /// progress the run reached.
+    #[test]
+    fn a_passed_result_frame_shows_full_progress() {
+        let size = TerminalSize {
+            rows: 40,
+            cols: 140,
+        };
+        let progress = |verdict: &str| {
+            let frame =
+                render_result_frame(&model(), &[format!("RESULT: {verdict}")], "", size, false);
+            frame
+                .lines()
+                .find(|line| line.contains("STATE: DONE"))
+                .map(str::to_owned)
+                .unwrap()
+        };
+        assert!(progress("PASS").contains("PROGRESS: 100%"));
+        assert!(progress("FAIL").contains("PROGRESS: 25%"));
     }
 }

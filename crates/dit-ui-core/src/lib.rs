@@ -5,7 +5,7 @@ mod unified;
 
 pub use unified::{
     DashboardMeter, FINAL_FRAME_ENV, UnifiedDashboard, boxify, decorate, load_final_frame,
-    render_result_frame, render_unified_dashboard, save_final_frame,
+    render_result_frame, render_unified_dashboard, save_final_frame, wrap_result_rows,
 };
 
 /// Whether this is the Linux console (`TERM=linux`): 16 colours, where colour 3 is orange-brown.

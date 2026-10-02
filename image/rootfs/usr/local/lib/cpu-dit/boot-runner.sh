@@ -67,6 +67,11 @@ echo " Internal disks: never mounted by the CPU-DIT runner"
 echo "============================================================"
 
 swapoff -a 2>/dev/null || true
+# The test screens own the console: only critical kernel messages (levels 0-2) print on it, as
+# loglevel=3 on the kernel command line means. Ubuntu's sysctl.d raises the level to 4 after
+# boot, which lets KERN_ERR lines (NVRM probes, I/O errors) overwrite the frames; the kernel
+# log, and the reports read from it, still keep every message.
+dmesg --console-level 3 2>/dev/null || true
 # Best-effort: install an NVIDIA driver package burned onto the DIT-RESULTS sibling
 # partition (see docs/gpu-vram/NVIDIA_DRIVER_PACKAGE.md), before probing modules, so
 # driver-probe.sh sees the result. A generic USB without that package, or hardware
@@ -107,14 +112,16 @@ if [[ "$PROFILE" == menu ]]; then
             MENU_ARGS+=(--results-root /run/dit-suite-no-persistent-results)
         fi
         if [[ -r /dev/tty1 && -w /dev/tty1 ]]; then
-            # The service has no TTY, so nothing sets TERM; tty1 is the Linux console, which
-            # draws the box and block characters of the screens (dit_ui_core::unicode_terminal).
-            export TERM="${TERM:-linux}"
+            # systemd gives a service without a TTY TERM=dumb; tty1 is the Linux console, which
+            # draws the box and block characters and the 16-colour bars of the screens
+            # (dit_ui_core::unicode_terminal / linux_console).
+            export TERM=linux
             exec /usr/local/bin/dit-suite "${MENU_ARGS[@]}" </dev/tty1 >/dev/tty1 2>&1
         fi
         exec /usr/local/bin/dit-suite "${MENU_ARGS[@]}"
     fi
     if [[ -r /dev/tty1 && -w /dev/tty1 ]]; then
+        export TERM=linux
         exec /usr/local/lib/cpu-dit/cpu-dit-ui.sh </dev/tty1 >/dev/tty1 2>&1
     fi
     exec /usr/local/lib/cpu-dit/cpu-dit-ui.sh

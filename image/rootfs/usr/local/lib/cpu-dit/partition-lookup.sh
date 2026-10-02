@@ -23,7 +23,11 @@ find_boot_device() {
             part:vfat | disk:iso9660 | part:iso9660 | rom:iso9660) ;;
             *) continue ;;
         esac
-        if mount -o ro "$candidate" "$mnt" 2>/dev/null; then
+        # The hybrid ISO's volume is the whole disk, and while DIT-RESULTS (a partition of that
+        # disk) is mounted the kernel refuses to mount the disk itself (EBUSY: the partition
+        # holds its claim). A read-only loop device over the disk reads the same volume.
+        if mount -o ro "$candidate" "$mnt" 2>/dev/null \
+            || mount -o ro,loop "$candidate" "$mnt" 2>/dev/null; then
             actual_id="$(cat "$mnt/cpu-dit/image-id" 2>/dev/null || true)"
             umount "$mnt"
             if [[ "$actual_id" == "$expected_id" ]]; then

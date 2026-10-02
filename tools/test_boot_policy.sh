@@ -67,6 +67,8 @@ grep -Fq '. /usr/local/lib/cpu-dit/partition-lookup.sh' "$RUNNER"
 grep -Fq 'find_boot_device()' "$PARTITION_LOOKUP"
 grep -Fq 'find_result_partition()' "$PARTITION_LOOKUP"
 grep -Fq 'mount_result_partition()' "$PARTITION_LOOKUP"
+# The hybrid ISO's boot volume is the whole disk: with DIT-RESULTS mounted it is read via loop.
+grep -Fq 'mount -o ro,loop "$candidate" "$mnt"' "$PARTITION_LOOKUP"
 
 # nvidia-driver-install.sh must run before driver-probe.sh, so a freshly loaded
 # module is visible to the same boot's probe.
@@ -169,7 +171,13 @@ grep -Fq 'MENU_ARGS+=(--attribution-checks)' "$ROOT_DIR/image/rootfs/usr/local/l
 grep -q '^CONFIG_FONT_TER10x18=y' "$ROOT_DIR"/build/boot-image/rootfs-noble-amd64/boot/config-* 2>/dev/null \
     || [[ ! -d "$ROOT_DIR/build/boot-image/rootfs-noble-amd64/boot" ]]
 # The control center on tty1 knows it is the Linux console (box and block characters).
-grep -Fq 'export TERM="${TERM:-linux}"' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
+# systemd sets TERM=dumb for the service: tty1 must get TERM=linux outright, not as a default.
+[[ "$(grep -c '^ *export TERM=linux$' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh")" == 2 ]]
+if grep -Fq 'TERM="${TERM:-linux}"' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"; then
+    printf 'BOOT_POLICY_FAIL: TERM=dumb from systemd would survive a ${TERM:-linux} default\n' >&2
+    exit 2
+fi
+grep -Fq 'dmesg --console-level 3' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
 if grep -Eq '^set default=[0-9]' "$GRUB_CONFIG"; then
     printf 'BOOT_POLICY_FAIL: the default boot entry must be chosen by id, not position\n' >&2
     exit 2

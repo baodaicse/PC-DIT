@@ -8,7 +8,7 @@ use dit_system::{
 };
 use dit_ui_core::{
     DashboardMeter, HostSampler, LiveUtilization, SystemInfo, TerminalSize, UnifiedDashboard,
-    render_unified_dashboard,
+    render_unified_dashboard, wrap_result_rows,
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -403,11 +403,20 @@ pub fn render(
     running_rows.push(view.phases_row.clone());
     if !view.result_rows.is_empty() {
         running_rows.push(String::new());
-        running_rows.extend(view.result_rows.iter().cloned());
+        running_rows.extend(wrap_result_rows(&view.result_rows, size));
     }
+    // A pass means the planned work is complete, whatever the last running estimate showed.
+    let passed = view
+        .result_rows
+        .first()
+        .is_some_and(|row| row.starts_with("RESULT: PASS"));
     #[allow(clippy::cast_precision_loss)]
-    let progress = (view.planned_seconds > 0)
-        .then(|| 100.0 * view.elapsed_seconds as f64 / view.planned_seconds as f64);
+    let progress = if passed {
+        Some(100.0)
+    } else {
+        (view.planned_seconds > 0)
+            .then(|| 100.0 * view.elapsed_seconds as f64 / view.planned_seconds as f64)
+    };
     let dashboard = UnifiedDashboard {
         engine: "DIT-COMBINED-1".to_owned(),
         report_abi: dit_contracts::SCHEMA_VERSION.to_string(),
