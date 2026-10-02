@@ -55,6 +55,29 @@ c_green="${esc}[1;38;5;82m"
 c_yellow="${esc}[1;38;5;220m"
 c_red="${esc}[1;38;5;203m"
 
+# Frame and bar glyphs, as the shared Rust renderer draws them: box drawing and blocks on the
+# Linux console (UTF-8, glyphs in the kernel's built-in font) and the usual terminals; plain ASCII
+# on a serial line or with DIT_UI_ASCII=1. In UTF-8 mode bash must count characters, not bytes,
+# for its padded fields, hence C.UTF-8 (built into glibc).
+ui_unicode=0
+if [[ "${DIT_UI_ASCII:-0}" == 0 ]]; then
+    case "${TERM:-}" in
+        linux|xterm*|screen*|tmux*|rxvt*|alacritty*|kitty*|foot*|wezterm*|vte*|konsole*|st-*)
+            ui_unicode=1 ;;
+    esac
+    [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" =~ [Uu][Tt][Ff]-?8 ]] && ui_unicode=1
+fi
+if (( ui_unicode )); then
+    export LC_ALL=C.UTF-8
+    g_h='─' g_v='│' g_tl='┌' g_tr='┐' g_bl='└' g_br='┘' g_ml='├' g_mr='┤'
+    g_fill='█' g_empty='░'
+else
+    g_h='-' g_v='|' g_tl='+' g_tr='+' g_bl='+' g_br='+' g_ml='+' g_mr='+'
+    g_fill='#' g_empty='-'
+fi
+# rule '=' opens a screen's frame the first time and closes it the second; '-' separates.
+rule_open=0
+
 ENGINE_VERSION="${CPU_DIT_ENGINE_VERSION:-0.1.0}"
 REPORT_ABI="${CPU_DIT_REPORT_ABI:-9}"
 THERMAL_LIMIT_C="${CPU_DIT_THERMAL_LIMIT_C:-$TEMPERATURE_LIMIT_C}"
@@ -114,18 +137,36 @@ repeat_char() {
 }
 
 rule() {
-    local value="$1"
+    local value="$1" left="$g_ml" right="$g_mr" fill="$g_h"
+    if [[ "$value" == '=' ]]; then
+        if (( rule_open )); then
+            left="$g_bl" right="$g_br" rule_open=0
+        else
+            left="$g_tl" right="$g_tr" rule_open=1
+        fi
+    fi
+    (( ui_unicode )) || fill="$value"
     indent
-    printf '%s+' "$c_blue"
-    repeat_char "$value" $((page_width - 2))
-    printf '+%s\n' "$c_reset$c_bg$c_white"
+    printf '%s%s' "$c_blue" "$left"
+    repeat_char "$fill" $((page_width - 2))
+    printf '%s%s\n' "$right" "$c_reset$c_bg$c_white"
+}
+
+# fit_text WIDTH VALUE: VALUE cut or padded to WIDTH characters, in $fit_out. bash's printf pads
+# by bytes, which breaks the frame as soon as a field holds box or block characters.
+fit_text() {
+    local width="$1" cut
+    (( width < 0 )) && width=0
+    cut="${2:0:width}"
+    printf -v fit_out '%s%*s' "$cut" "$((width - ${#cut}))" ''
 }
 
 box_line() {
     local value="$1" inner=$((page_width - 4))
+    fit_text "$inner" "$value"
     indent
-    printf '%s|%s %-*.*s %s|%s\n' "$c_blue" "$c_reset$c_bg$c_white" \
-        "$inner" "$inner" "$value" "$c_blue" "$c_reset$c_bg$c_white"
+    printf '%s%s%s %s %s%s%s\n' "$c_blue" "$g_v" "$c_reset$c_bg$c_white" \
+        "$fit_out" "$c_blue" "$g_v" "$c_reset$c_bg$c_white"
 }
 
 box_center() {
@@ -133,16 +174,17 @@ box_center() {
     local length=${#value} left
     (( length > inner )) && length=$inner
     left=$(((inner - length) / 2))
+    fit_text "$((inner - left))" "$value"
     indent
-    printf '%s|%s %*s%s%-*.*s%s %s|%s\n' "$c_blue" \
-        "$c_reset$c_bg$c_white" "$left" '' "$color" "$((inner-left))" \
-        "$((inner-left))" "$value" "$c_reset$c_bg$c_white" "$c_blue" \
-        "$c_reset$c_bg$c_white"
+    printf '%s%s%s %*s%s%s%s %s%s%s\n' "$c_blue" "$g_v" \
+        "$c_reset$c_bg$c_white" "$left" '' "$color" "$fit_out" \
+        "$c_reset$c_bg$c_white" "$c_blue" "$g_v" "$c_reset$c_bg$c_white"
 }
 
 clear_screen() {
     refresh_geometry
     running_screen_initialized=0
+    rule_open=0
     printf '%s%s%s[?25l%s[H%s[2J' "$c_reset$c_bg$c_white" "$esc" "$esc" "$esc" "$esc"
 }
 
@@ -187,8 +229,8 @@ progress_bar() {
     filled=$((percent * width / 100))
     empty=$((width - filled))
     printf '['
-    repeat_char '#' "$filled"
-    repeat_char '.' "$empty"
+    repeat_char "$g_fill" "$filled"
+    repeat_char "$g_empty" "$empty"
     printf ']'
 }
 
@@ -360,26 +402,26 @@ ui_put() {
     (( width < 1 )) && return
     value="${value//$'\n'/ }"
     ui_cursor "$row" "$col"
-    printf '%s%-*.*s%s' "$color" "$width" "$width" "$value" \
-        "$c_reset$c_dashboard_bg$c_white"
+    fit_text "$width" "$value"
+    printf '%s%s%s' "$color" "$fit_out" "$c_reset$c_dashboard_bg$c_white"
 }
 
 ui_box() {
     local row="$1" col="$2" height="$3" width="$4" title="$5"
-    local header="+-- $title " edge row_index edge_width
+    local edge row_index edge_width
     if [[ -n "$title" ]]; then
-        edge_width=$((width - ${#header} - 1))
+        edge_width=$((width - ${#title} - 6))
         (( edge_width < 0 )) && edge_width=0
-        edge="$header$(printf '%*s' "$edge_width" '' | tr ' ' '-')+"
+        edge="$g_tl$g_h$g_h $title $(repeat_char "$g_h" "$edge_width")$g_tr"
     else
-        edge="+$(printf '%*s' "$((width - 2))" '' | tr ' ' '-')+"
+        edge="$g_tl$(repeat_char "$g_h" "$((width - 2))")$g_tr"
     fi
     ui_put "$row" "$col" "$width" "$c_cyan" "$edge"
     for ((row_index=1; row_index<height-1; row_index++)); do
-        ui_put "$((row + row_index))" "$col" 1 "$c_cyan" '|'
-        ui_put "$((row + row_index))" "$((col + width - 1))" 1 "$c_cyan" '|'
+        ui_put "$((row + row_index))" "$col" 1 "$c_cyan" "$g_v"
+        ui_put "$((row + row_index))" "$((col + width - 1))" 1 "$c_cyan" "$g_v"
     done
-    edge="+$(printf '%*s' "$((width - 2))" '' | tr ' ' '-')+"
+    edge="$g_bl$(repeat_char "$g_h" "$((width - 2))")$g_br"
     ui_put "$((row + height - 1))" "$col" "$width" "$c_cyan" "$edge"
 }
 
@@ -391,8 +433,8 @@ bar_text() {
     filled=$((percent * width / 100))
     empty=$((width - filled))
     printf '['
-    repeat_char '#' "$filled"
-    repeat_char '-' "$empty"
+    repeat_char "$g_fill" "$filled"
+    repeat_char "$g_empty" "$empty"
     printf ']'
 }
 
@@ -423,9 +465,9 @@ ui_meter() {
     ui_cursor "$row" "$col"
     printf '%s%-*.*s%s[%s' "$c_white" "$label_width" "$label_width" "$label" \
         "$c_muted" "$fill_color"
-    repeat_char '#' "$filled"
+    repeat_char "$g_fill" "$filled"
     printf '%s' "$c_muted"
-    repeat_char '-' "$empty"
+    repeat_char "$g_empty" "$empty"
     printf ']%s %3d%%%s' "$c_white" "$percent" "$c_reset$c_dashboard_bg$c_white"
 }
 

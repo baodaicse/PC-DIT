@@ -3,7 +3,45 @@
 mod dashboard;
 mod unified;
 
-pub use unified::{DashboardMeter, UnifiedDashboard, render_unified_dashboard};
+pub use unified::{DashboardMeter, UnifiedDashboard, boxify, decorate, render_unified_dashboard};
+
+/// Whether the terminal draws Unicode box characters: the Linux console (UTF-8 by default) and the
+/// usual terminal emulators do; a serial line (`vt100`, `vt220`, `dumb`) does not. `DIT_UI_ASCII=1`
+/// forces the ASCII frame. The glyphs used (box drawing, full and light-shade blocks) are in the
+/// kernel's built-in console font.
+#[must_use]
+pub fn unicode_terminal() -> bool {
+    if std::env::var_os("DIT_UI_ASCII").is_some_and(|value| !value.is_empty() && value != "0") {
+        return false;
+    }
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term == "linux"
+        || [
+            "xterm",
+            "screen",
+            "tmux",
+            "rxvt",
+            "alacritty",
+            "kitty",
+            "foot",
+            "wezterm",
+            "vte",
+            "konsole",
+            "st-",
+        ]
+        .iter()
+        .any(|prefix| term.starts_with(prefix))
+    {
+        return true;
+    }
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .any(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("utf-8") || value.contains("utf8")
+        })
+}
 
 /// Version of the fixed dashboard shell shared by all active DIT engines.
 pub const UNIFIED_DASHBOARD_ABI: u32 = 1;
@@ -1078,7 +1116,10 @@ mod tests {
             cols: 160,
         };
         let colored = state.render(size, true);
-        assert!(colored.contains(&format!("{GREEN}#")));
+        // Bars are `#` on an ASCII terminal, full blocks on a Unicode one.
+        assert!(
+            colored.contains(&format!("{GREEN}#")) || colored.contains(&format!("{GREEN}\u{2588}"))
+        );
         assert!(colored.contains(CYAN));
         let mut stripped = String::new();
         let mut escape = false;
@@ -1093,7 +1134,59 @@ mod tests {
                 stripped.push(character);
             }
         }
-        assert_eq!(stripped, state.render(size, false));
+        let plain = state.render(size, false);
+        if unicode_terminal() {
+            // Same geometry: the same characters per line, the frame drawn with box characters.
+            let lines: Vec<String> = plain.lines().map(str::to_owned).collect();
+            let boxed: Vec<String> = boxify(&lines)
+                .into_iter()
+                .map(|row| row.into_iter().collect())
+                .collect();
+            assert_eq!(stripped, boxed.join("\n"));
+            for (a, b) in stripped.lines().zip(plain.lines()) {
+                assert_eq!(a.chars().count(), b.chars().count());
+            }
+        } else {
+            assert_eq!(stripped, plain);
+        }
+    }
+
+    #[test]
+    fn frames_turn_into_box_drawing_without_touching_text() {
+        let lines: Vec<String> = [
+            "+-- SYSTEM HARDWARE --+  +-- LIVE --+",
+            "| CPU-RAM [3/8+] a-b  |  | [##--] x |",
+            "| CPU + RAM           |  | y        |",
+            "| GPU + VRAM          |  | z        |",
+            "+---------------------+  +----------+",
+        ]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
+        let boxed: Vec<String> = boxify(&lines)
+            .into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect();
+        assert_eq!(
+            boxed[0],
+            "\u{250c}\u{2500}\u{2500} SYSTEM HARDWARE \u{2500}\u{2500}\u{2510}  \u{250c}\u{2500}\u{2500} LIVE \u{2500}\u{2500}\u{2510}"
+        );
+        assert_eq!(
+            boxed[1],
+            "\u{2502} CPU-RAM [3/8+] a-b  \u{2502}  \u{2502} [\u{2588}\u{2588}\u{2591}\u{2591}] x \u{2502}"
+        );
+        assert!(
+            boxed[2].contains("CPU + RAM") && boxed[3].contains("GPU + VRAM"),
+            "text pluses stay"
+        );
+        assert!(boxed[4].starts_with("\u{2514}\u{2500}") && boxed[4].ends_with("\u{2500}\u{2518}"));
+        for (a, b) in boxed.iter().zip(&lines) {
+            assert_eq!(
+                a.chars().count(),
+                b.chars().count(),
+                "one cell per character"
+            );
+        }
     }
 
     #[test]

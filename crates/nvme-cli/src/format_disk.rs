@@ -498,7 +498,10 @@ pub(super) fn command(flags: &super::InventoryFlags) -> Result<std::process::Exi
             ask("Press Enter to go back > ")?;
             return Ok(std::process::ExitCode::SUCCESS);
         }
-        print!("{}", render_disks(&inventory, &flags.protected_devices));
+        print!(
+            "{}",
+            dit_ui_core::decorate(&render_disks(&inventory, &flags.protected_devices))
+        );
         if !format_one(&inventory, &flags.protected_devices)? {
             return Ok(std::process::ExitCode::SUCCESS);
         }

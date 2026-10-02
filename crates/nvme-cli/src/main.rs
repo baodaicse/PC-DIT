@@ -820,11 +820,11 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     print!("\x1b[H\x1b[2J");
     println!(
         "{}",
-        render_picker(
+        dit_ui_core::decorate(&render_picker(
             &picker_entries(&inventory),
             &BTreeSet::new(),
             TerminalSize::current()
-        )
+        ))
     );
     print!("Select NVMe aliases (example 1,2) or A for all: ");
     io::stdout().flush()?;
@@ -1911,11 +1911,11 @@ fn select_command(args: &SelectArgs) -> Result<ExitCode, Box<dyn std::error::Err
         if args.devices.is_none() && io::stdin().is_terminal() {
             println!(
                 "{}",
-                render_picker(
+                dit_ui_core::decorate(&render_picker(
                     &picker_entries(&inventory),
                     &std::collections::BTreeSet::new(),
                     TerminalSize::current()
-                )
+                ))
             );
         } else {
             print_inventory(&inventory);

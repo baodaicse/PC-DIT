@@ -1,6 +1,14 @@
 //! One visual contract for every active DIT engine.
 
-use super::{CYAN, GRAY, GREEN, RED, RESET, TerminalSize, YELLOW, bar, sanitize_and_clip};
+use super::{
+    CYAN, GRAY, GREEN, RED, RESET, TerminalSize, YELLOW, bar, sanitize_and_clip, unicode_terminal,
+};
+
+/// State badges: the state word on a coloured background.
+const BADGE_RUN: &str = "\x1b[30;46m";
+const BADGE_PASS: &str = "\x1b[30;42m";
+const BADGE_FAIL: &str = "\x1b[97;41m";
+const BADGE_WARN: &str = "\x1b[30;43m";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DashboardMeter {
@@ -80,7 +88,12 @@ pub fn render_unified_dashboard(
     }
     debug_assert!(lines.len() <= height);
     if color {
-        paint(&lines, dashboard.failures, &dashboard.footer)
+        paint(
+            &lines,
+            dashboard.failures,
+            &dashboard.footer,
+            unicode_terminal(),
+        )
     } else {
         lines.join("\n")
     }
@@ -303,6 +316,12 @@ fn part_colors(line: &str) -> Vec<Option<&'static str>> {
         found.push((start, end));
         found
     };
+    if let Some(at) = find_chars(&chars, "STATE: ") {
+        let from = at + "STATE: ".len();
+        let to = (from..end).find(|&i| chars[i] == ' ').unwrap_or(end);
+        let word: String = chars[from..to].iter().collect();
+        color_range(from, to, state_badge(&word));
+    }
     if let Some(at) = find_chars(&chars, "FAIL BY PART") {
         for (from, to) in segments(at + "FAIL BY PART".len()) {
             let text: String = chars[from..to].iter().collect();
@@ -322,24 +341,161 @@ fn part_colors(line: &str) -> Vec<Option<&'static str>> {
             }
         }
     } else if find_chars(&chars, "PHASES").is_some() {
-        let mut index = 0;
-        while let Some(offset) = find_chars(&chars[index..], "[FAIL]") {
-            let from = index + offset;
-            let to = (from + 1..end)
-                .find(|&i| chars[i] == ' ' && chars.get(i + 1) == Some(&' '))
-                .unwrap_or(end);
-            color_range(from, to, RED);
-            index = to;
+        // Each step in its colour: done, failed, running, waiting, cut short.
+        for (tag, color) in [
+            ("[OK]", GREEN),
+            ("[FAIL]", RED),
+            ("[>>]", YELLOW),
+            ("[--]", GRAY),
+            ("[!!]", YELLOW),
+        ] {
+            let mut index = 0;
+            while let Some(offset) = find_chars(&chars[index..], tag) {
+                let from = index + offset;
+                let to = (from + 1..end)
+                    .find(|&i| chars[i] == ' ' && chars.get(i + 1) == Some(&' '))
+                    .unwrap_or(end);
+                color_range(from, to, color);
+                index = to;
+            }
         }
     }
     colors
 }
 
-fn paint(lines: &[String], failures: u64, footer: &str) -> String {
+/// Whether the `+` at `index` is a frame corner (next to a frame line), not a plus in text.
+fn frame_corner(chars: &[char], index: usize, line: &str) -> bool {
+    line.starts_with('+')
+        || index
+            .checked_sub(1)
+            .and_then(|i| chars.get(i))
+            .is_some_and(|c| matches!(c, '-' | '+'))
+        || chars.get(index + 1).is_some_and(|c| matches!(c, '-' | '+'))
+}
+
+/// Badge of a state word: running states cyan, PASS green, FAIL red, anything stopped, cut
+/// short or waiting yellow.
+fn state_badge(word: &str) -> &'static str {
+    let upper = word.to_ascii_uppercase();
+    if upper.starts_with("PASS") {
+        BADGE_PASS
+    } else if upper.starts_with("FAIL") {
+        BADGE_FAIL
+    } else if [
+        "INVALID",
+        "ABORT",
+        "STOP",
+        "INTERRUPT",
+        "FINALIZ",
+        "DRAIN",
+        "WAIT",
+        "INCOMPLETE",
+    ]
+    .iter()
+    .any(|warn| upper.starts_with(warn))
+    {
+        BADGE_WARN
+    } else {
+        BADGE_RUN
+    }
+}
+
+/// Bar interiors of a row: `[` + at least four of `#` / `-` + `]`, as char index ranges.
+fn bar_ranges(row: &[char]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < row.len() {
+        if row[index] == '[' {
+            let start = index + 1;
+            let mut end = start;
+            while end < row.len() && matches!(row[end], '#' | '-') {
+                end += 1;
+            }
+            if end < row.len() && row[end] == ']' && end - start >= 4 {
+                ranges.push((start, end));
+                index = end;
+            }
+        }
+        index += 1;
+    }
+    ranges
+}
+
+/// The ASCII frame of a screen in box-drawing characters: each `+` becomes the corner or tee its
+/// neighbours call for, runs of `-` in a frame become `─`, `|` becomes `│`, bar fills `█` and
+/// `░`. A dash inside a word (`CPU-RAM`) or a `+` in text (`[3/8+]`) is left as it is. Every
+/// character stays one cell wide, so the layout does not move.
+#[must_use]
+pub fn boxify(lines: &[String]) -> Vec<Vec<char>> {
+    let grid: Vec<Vec<char>> = lines.iter().map(|line| line.chars().collect()).collect();
+    let cell = |row: usize, column: usize| grid.get(row).and_then(|r| r.get(column)).copied();
+    let horizontal = |c: Option<char>| matches!(c, Some('-' | '+'));
+    // A `+` is a frame corner only with a frame line beside it ("CPU + RAM" is text).
+    let corner = |row: usize, column: usize| {
+        cell(row, column) == Some('+')
+            && (column
+                .checked_sub(1)
+                .is_some_and(|c| horizontal(cell(row, c)))
+                || horizontal(cell(row, column + 1)))
+    };
+    let vertical =
+        |row: usize, column: usize| cell(row, column) == Some('|') || corner(row, column);
+    let mut shown = grid.clone();
+    for (row, chars) in grid.iter().enumerate() {
+        let bars = bar_ranges(chars);
+        for (column, &character) in chars.iter().enumerate() {
+            let in_bar = bars.iter().any(|&(a, b)| column >= a && column < b);
+            let left = column.checked_sub(1).and_then(|c| cell(row, c));
+            let right = cell(row, column + 1);
+            shown[row][column] = match character {
+                '#' if in_bar => '\u{2588}',
+                '-' if in_bar => '\u{2591}',
+                '|' => '\u{2502}',
+                '-' if horizontal(left) || horizontal(right) => '\u{2500}',
+                '+' if corner(row, column) => {
+                    let up = row.checked_sub(1).is_some_and(|r| vertical(r, column));
+                    let down = vertical(row + 1, column);
+                    match (up, down, horizontal(left), horizontal(right)) {
+                        (false, true, false, true) => '\u{250c}',
+                        (false, true, true, false) => '\u{2510}',
+                        (true, false, false, true) => '\u{2514}',
+                        (true, false, true, false) => '\u{2518}',
+                        (true, true, false, true) => '\u{251c}',
+                        (true, true, true, false) => '\u{2524}',
+                        (false, true, true, true) => '\u{252c}',
+                        (true, false, true, true) => '\u{2534}',
+                        (true, true, true, true) => '\u{253c}',
+                        (false, false, true, true) => '\u{2500}',
+                        (true, true, false, false) => '\u{2502}',
+                        _ => '+',
+                    }
+                }
+                other => other,
+            };
+        }
+    }
+    shown
+}
+
+/// Colours (and, on a Unicode terminal, box-drawing characters) for a frame that is not a
+/// dashboard: menus, pickers.
+#[must_use]
+pub fn decorate(frame: &str) -> String {
+    let lines: Vec<String> = frame.lines().map(str::to_owned).collect();
+    paint(&lines, 0, "", unicode_terminal())
+}
+
+fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String {
     let footer_key: String = footer.chars().take(24).collect();
+    let shown: Vec<Vec<char>> = if unicode {
+        boxify(lines)
+    } else {
+        lines.iter().map(|line| line.chars().collect()).collect()
+    };
     lines
         .iter()
-        .map(|line| {
+        .zip(shown)
+        .map(|(line, shown)| {
             let (counter_above_zero, bare_fail) = fail_counters(line);
             // Lines with several results are coloured part by part (`part_colors`), never whole.
             let by_part = line.contains("FAIL BY PART")
@@ -371,7 +527,8 @@ fn paint(lines: &[String], failures: u64, footer: &str) -> String {
             let mut result = String::new();
             let mut in_bar = false;
             let mut previous_color = "";
-            for (index, character) in line.chars().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            for (index, &character) in chars.iter().enumerate() {
                 let current = if character == '[' {
                     in_bar = true;
                     CYAN
@@ -382,7 +539,9 @@ fn paint(lines: &[String], failures: u64, footer: &str) -> String {
                     GREEN
                 } else if in_bar && character == '-' {
                     GRAY
-                } else if matches!(character, '+' | '|') {
+                } else if character == '|'
+                    || (character == '+' && frame_corner(&chars, index, line))
+                {
                     CYAN
                 } else if let Some(color) = overrides[index] {
                     color
@@ -393,10 +552,14 @@ fn paint(lines: &[String], failures: u64, footer: &str) -> String {
                     text_color
                 };
                 if current != previous_color {
+                    // A badge's background must end with it.
+                    if previous_color.contains(';') {
+                        result.push_str(RESET);
+                    }
                     result.push_str(current);
                     previous_color = current;
                 }
-                result.push(character);
+                result.push(shown.get(index).copied().unwrap_or(character));
             }
             result.push_str(RESET);
             result

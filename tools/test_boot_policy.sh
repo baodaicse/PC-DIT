@@ -164,6 +164,8 @@ grep -A1 -- '--id fault-attribution' "$GRUB_CONFIG" | grep -Fq 'cpu_dit_profile=
 ! grep -A1 -- '--id control-center' "$GRUB_CONFIG" | grep -Fq 'dit_attribution'
 grep -Fq 'SYSTEM_ARGS+=(--confirm-on-fail)' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
 grep -Fq 'MENU_ARGS+=(--attribution-checks)' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
+# The control center on tty1 knows it is the Linux console (box and block characters).
+grep -Fq 'export TERM="${TERM:-linux}"' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
 if grep -Eq '^set default=[0-9]' "$GRUB_CONFIG"; then
     printf 'BOOT_POLICY_FAIL: the default boot entry must be chosen by id, not position\n' >&2
     exit 2

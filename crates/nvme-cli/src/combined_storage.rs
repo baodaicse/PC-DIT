@@ -137,11 +137,11 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
     }
     println!(
         "{}",
-        render_picker(
+        dit_ui_core::decorate(&render_picker(
             &picker_entries(&inventory),
             &BTreeSet::new(),
             TerminalSize::current()
-        )
+        ))
     );
     let request = prompt(
         "COMBINED: select NVMe aliases for the SSD layer and data chain (1,2 / A = all / N = no SSD): ",

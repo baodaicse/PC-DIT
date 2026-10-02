@@ -3,6 +3,8 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UI="$PROJECT_ROOT/image/rootfs/usr/local/lib/cpu-dit/cpu-dit-ui.sh"
+# The checks below read the ASCII frame; the Unicode frame has its own check at the end.
+export DIT_UI_ASCII=1
 DIT="${1:-$PROJECT_ROOT/target/debug/dit-cli}"
 PROFILE_CONFIG="$PROJECT_ROOT/image/rootfs/etc/cpu-dit/profiles.conf"
 WATCHDOG="$PROJECT_ROOT/target/debug/dit-watchdog"
@@ -193,5 +195,27 @@ for verdict in Pass Incomplete Fail NoFinal; do
     sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$test_dir/power-$verdict.ansi" >"$test_dir/power-result.txt"
     grep -Eq "\|[[:space:]]+$expected[[:space:]]+\|" "$test_dir/power-result.txt"
 done
+
+# Unicode frame (Linux console): the same result screen drawn with box characters, every line
+# the same number of characters as its ASCII form (bash pads by characters, not bytes).
+DIT_UI_ASCII=0 TERM=linux DIT_TEST_POWER_VERDICT=Pass CPU_DIT_POWER_UI=1 CPU_DIT_BINARY="$DIT" \
+CPU_DIT_PROFILE_CONFIG="$PROFILE_CONFIG" CPU_DIT_UI_RUN_DIR="$test_dir" \
+CPU_DIT_WATCHDOG_RESULTS_ROOT="$test_dir/no-persistent-results" \
+CPU_DIT_WATCHDOG_BINARY="$WATCHDOG" \
+CPU_DIT_RUNNER="$PROJECT_ROOT/tools/fixtures/power_ui_runner.sh" \
+    "$UI" --run-profile-once "$profile" </dev/null >"$test_dir/power-unicode.ansi"
+sed -E 's/\x1B\[[0-9;?]*[[:alpha:]]//g' "$test_dir/power-unicode.ansi" >"$test_dir/power-unicode.txt"
+sed -E 's/\x1B\[[0-9;?]*[[:alpha:]]//g' "$test_dir/power-Pass.ansi" >"$test_dir/power-ascii.txt"
+grep -Eq '│[[:space:]]+PASS[[:space:]]+│' "$test_dir/power-unicode.txt"
+grep -q '┌─' "$test_dir/power-unicode.txt"
+grep -q '─┘' "$test_dir/power-unicode.txt"
+python3 - "$test_dir/power-ascii.txt" "$test_dir/power-unicode.txt" <<'PY'
+import sys
+ascii_lines = open(sys.argv[1], encoding="utf-8").read().split("TEST RESULT")[-1].splitlines()
+unicode_lines = open(sys.argv[2], encoding="utf-8").read().split("TEST RESULT")[-1].splitlines()
+assert len(ascii_lines) == len(unicode_lines), (len(ascii_lines), len(unicode_lines))
+for a, u in zip(ascii_lines, unicode_lines):
+    assert len(a) == len(u), (a, u)
+PY
 done
 printf 'Power-platform menu, progress and supervised result tests: PASS\n'

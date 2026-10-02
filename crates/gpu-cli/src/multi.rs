@@ -138,13 +138,13 @@ fn interactive_selection(
     print!("\x1b[2J\x1b[H");
     println!(
         "{}",
-        render_device_picker(
+        dit_ui_core::decorate(&render_device_picker(
             "DIT GPU-VRAM // SELECT DEVICES",
             "Enter aliases (1,2) or A=all READY devices; selection stores UUID/BDF",
             &entries,
             &BTreeSet::new(),
             TerminalSize::current(),
-        )
+        ))
     );
     print!("Select GPU aliases (example 1,2) or A for all: ");
     io::stdout().flush()?;

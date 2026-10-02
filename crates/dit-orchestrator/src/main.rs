@@ -103,7 +103,13 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     match cli.command {
         Command::Menu(args) => menu(&args),
         Command::RenderMenu(args) => {
-            println!("{}", render(&args));
+            // On a terminal as the menu shows it; plain text for scripts that read it.
+            let frame = render(&args);
+            if io::stdout().is_terminal() {
+                println!("{}", dit_ui_core::decorate(&frame));
+            } else {
+                println!("{frame}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Registry(args) => {
@@ -155,7 +161,10 @@ fn menu(args: &MenuArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Kept for the whole menu session, so a chosen GPU duration/limit survives going back.
     let mut gpu_settings = GpuSettings::default();
     loop {
-        print!("\x1b[H\x1b[2J{}\nSelection > ", render(args));
+        print!(
+            "\x1b[H\x1b[2J{}\nSelection > ",
+            dit_ui_core::decorate(&render(args))
+        );
         io::stdout().flush()?;
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;

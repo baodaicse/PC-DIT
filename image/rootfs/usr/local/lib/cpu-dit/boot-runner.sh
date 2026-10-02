@@ -107,6 +107,9 @@ if [[ "$PROFILE" == menu ]]; then
             MENU_ARGS+=(--results-root /run/dit-suite-no-persistent-results)
         fi
         if [[ -r /dev/tty1 && -w /dev/tty1 ]]; then
+            # The service has no TTY, so nothing sets TERM; tty1 is the Linux console, which
+            # draws the box and block characters of the screens (dit_ui_core::unicode_terminal).
+            export TERM="${TERM:-linux}"
             exec /usr/local/bin/dit-suite "${MENU_ARGS[@]}" </dev/tty1 >/dev/tty1 2>&1
         fi
         exec /usr/local/bin/dit-suite "${MENU_ARGS[@]}"
