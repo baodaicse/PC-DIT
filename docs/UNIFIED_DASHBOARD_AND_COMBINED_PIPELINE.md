@@ -42,7 +42,7 @@ Phân tích thiết kế chi tiết cho COMBINED-B → F (hai lớp "bão hoà +
 
 ### COMBINED-A — UI/event contract
 
-Trạng thái: `implemented` ở source ngày 2026-09-07. `UnifiedDashboard`, dynamic meters, running rows và NVMe/GPU adapters đã có unit/layout gates. CPU–RAM hiện tương thích hình ảnh nhưng adapter native Rust còn pending.
+Trạng thái: `implemented` ở source ngày 2026-09-07. `UnifiedDashboard`, dynamic meters, running rows và NVMe/GPU adapters đã có unit/layout gates. **2026-10-02:** màn hình đang chạy của CPU–RAM (Safe/Full/Compute) nay cũng do bộ vẽ chung vẽ: `cpu-dit-ui.sh` khởi chạy runner rồi gọi `dit-suite cpu-ram-view`, lệnh này đọc các dòng `CPU_DIT_PROGRESS`/`CPU_DIT_COUNTER` của runner và vẽ cho tới khi runner kết thúc (số FAIL không giảm khi lần chạy chẩn đoán lại đếm từ 0). Ctrl+C: view thoát, trap của script dừng runner, view mở lại để hiện quá trình dừng. Thiếu `dit-suite` thì script dùng màn hình bash cũ làm dự phòng. Menu và màn hình kết quả của CPU–RAM, và màn hình Power (CPU AVAIL / POWER), vẫn là bash.
 
 ### COMBINED-B — Resource arbiter
 

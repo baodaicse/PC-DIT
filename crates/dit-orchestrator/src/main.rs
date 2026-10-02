@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod combined_layers;
 mod combined_run;
 mod combined_view;
+mod cpu_ram_view;
 mod fault_single;
 
 /// Set by Ctrl+C while the menu runs. Single modules ignore it (their own watchdog handles the
@@ -45,6 +46,8 @@ enum Command {
     Registry(MenuArgs),
     /// Run the combined CPU-RAM + GPU-VRAM + SSD + data-chain session without the menu.
     Combined(combined_run::CombinedCli),
+    /// Running screen of a CPU-RAM test on the shared dashboard (started by the CPU-RAM UI).
+    CpuRamView(cpu_ram_view::CpuRamViewArgs),
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -110,6 +113,10 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         Command::Aggregate(args) => aggregate(&args),
         Command::Combined(args) => combined_run::run_cli(&args),
+        Command::CpuRamView(args) => {
+            cpu_ram_view::command(&args)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

@@ -7,6 +7,10 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 DIT="${CPU_DIT_BINARY:-/opt/cpu-dit-01/dit-cli}"
 RUNNER="${CPU_DIT_RUNNER:-/usr/local/lib/cpu-dit/boot-runner.sh}"
 WATCHDOG="${CPU_DIT_WATCHDOG_BINARY:-/usr/local/bin/dit-watchdog}"
+# Shared dashboard renderer (`dit-suite cpu-ram-view`): the running screen of CPU-RAM tests is
+# drawn by the same Rust renderer as CPU-SSD, GPU-VRAM and COMBINED. Without it, the screen
+# below (draw_running) is the fallback.
+SUITE="${CPU_DIT_SUITE_BINARY:-/usr/local/bin/dit-suite}"
 WATCHDOG_RESULTS_ROOT="${CPU_DIT_WATCHDOG_RESULTS_ROOT:-/mnt/cpu-dit-results}"
 AUTO_SECONDS="${CPU_DIT_UI_AUTOSTART_SECONDS:-10}"
 PROFILE_CONFIG="${CPU_DIT_PROFILE_CONFIG:-/etc/cpu-dit/profiles.conf}"
@@ -999,9 +1003,31 @@ run_profile() {
     active_run_pid=$!
     running_screen_initialized=0
     sensor_refresh_tick="$SENSOR_REFRESH_TICKS"
+    local shared_view=0 view_status
+    if [[ "$module" == cpu-ram && -x "$SUITE" ]] \
+        && "$SUITE" cpu-ram-view --help >/dev/null 2>&1; then
+        shared_view=1
+        printf '%s%s[H%s[2J' "$c_reset" "$esc" "$esc"
+    fi
     while kill -0 "$active_run_pid" 2>/dev/null; do
         if [[ "$module" == cpu-power-platform ]]; then
             draw_power_running "$title" "$started" "$run_log"
+        elif (( shared_view )); then
+            # Returns when the runner exits. Ctrl+C ends it too (status 130): the INT trap stops
+            # the runner, and the view starts again to show the stop. Any other failure falls
+            # back to the script's own screen.
+            local -a view_args=(cpu-ram-view --log "$run_log" --pid "$active_run_pid"
+                --title "$title" --duration-seconds "$duration" --started-unix "$started"
+                --full-safe-percent "$FULL_SAFE_PERCENT" --engine-version "$ENGINE_VERSION"
+                --report-abi "$REPORT_ABI")
+            (( thermal_limit_enabled == 1 )) && view_args+=(--temp-limit-celsius "$THERMAL_LIMIT_C")
+            view_status=0
+            "$SUITE" "${view_args[@]}" || view_status=$?
+            if (( view_status != 0 && view_status != 130 )); then
+                shared_view=0
+                running_screen_initialized=0
+            fi
+            continue
         else
             draw_running "$title" "$duration" "$started" "$run_log"
         fi
