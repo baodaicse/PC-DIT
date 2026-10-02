@@ -1223,7 +1223,7 @@ mod tests {
         );
         assert_eq!(
             boxed[1],
-            "\u{2502} CPU-RAM [3/8+] a-b  \u{2502}  \u{2502} [\u{25a0}\u{25a0}\u{2500}\u{2500}] x \u{2502}"
+            "\u{2502} CPU-RAM [3/8+] a-b  \u{2502}  \u{2502} [\u{2580}\u{2580}\u{2580}\u{2580}] x \u{2502}"
         );
         assert!(
             boxed[2].contains("CPU + RAM") && boxed[3].contains("GPU + VRAM"),

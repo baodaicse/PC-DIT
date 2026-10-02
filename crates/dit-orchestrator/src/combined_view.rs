@@ -245,6 +245,10 @@ pub struct SessionView {
     pub held_bytes: u64,
     /// `FAIL BY PART` and `HW EVENTS` lines of the fault ledger.
     pub fault_rows: Vec<String>,
+    /// Once the run is over: the verdict and where the report went, shown under the progress.
+    pub result_rows: Vec<String>,
+    /// Replaces the running footer once the run is over.
+    pub footer: Option<String>,
 }
 
 pub struct ChainMeter {
@@ -397,6 +401,10 @@ pub fn render(
         .collect();
     running_rows.extend(view.fault_rows.iter().cloned());
     running_rows.push(view.phases_row.clone());
+    if !view.result_rows.is_empty() {
+        running_rows.push(String::new());
+        running_rows.extend(view.result_rows.iter().cloned());
+    }
     #[allow(clippy::cast_precision_loss)]
     let progress = (view.planned_seconds > 0)
         .then(|| 100.0 * view.elapsed_seconds as f64 / view.planned_seconds as f64);
@@ -420,7 +428,9 @@ pub fn render(
         calculations_completed: view.calculations,
         failures,
         running_rows,
-        footer: "A layer FAIL is counted, the run continues | Ctrl+C: stop every layer and keep the reports".to_owned(),
+        footer: view.footer.clone().unwrap_or_else(|| {
+            "A layer FAIL is counted, the run continues | Ctrl+C: stop every layer and keep the reports".to_owned()
+        }),
     };
     render_unified_dashboard(&dashboard, size, color)
 }
@@ -472,6 +482,8 @@ mod tests {
                 "FAIL BY PART  CPU 0 | RAM 0 | ? PCIe-GPU1|GPU1|VRAM1 1".into(),
                 "HW EVENTS     none recorded".into(),
             ],
+            result_rows: Vec::new(),
+            footer: None,
         };
         let frame = render(
             &view,

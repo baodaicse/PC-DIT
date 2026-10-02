@@ -70,9 +70,9 @@ fi
 if (( ui_unicode )); then
     export LC_ALL=C.UTF-8
     g_h='─' g_v='│' g_tl='┌' g_tr='┐' g_bl='└' g_br='┘' g_ml='├' g_mr='┤'
-    # A small square and a thin track: a bar never fills the whole cell height, so it does not
-    # touch the rows above and below.
-    g_fill='■' g_empty='─'
+    # Upper half blocks: a solid bar half a row high, leaving the lower half of its row as space
+    # before the line below; the track is the same glyph in grey.
+    g_fill='▀' g_empty='▀'
 else
     g_h='-' g_v='|' g_tl='+' g_tr='+' g_bl='+' g_br='+' g_ml='+' g_mr='+'
     g_fill='#' g_empty='-'

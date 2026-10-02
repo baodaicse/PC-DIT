@@ -102,8 +102,14 @@ pub fn launch(menu: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
     let Some(settings) = choose_settings()? else {
         return Ok(());
     };
-    let (summary, _) = run_session(menu, settings, None)?;
-    pause(&summary)?;
+    let (summary, _, shown) = run_session(menu, settings, None)?;
+    if shown {
+        // The verdict and the report's place are in the last frame; wait for Enter.
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+    } else {
+        pause(&summary)?;
+    }
     Ok(())
 }
 
@@ -134,8 +140,11 @@ pub fn run_cli(args: &CombinedCli) -> Result<ExitCode, Box<dyn std::error::Error
             InjectLayerArg::Chain => Layer::Chain,
         }),
     };
-    let (summary, verdict) = run_session(&args.menu, settings, args.storage_plan.as_deref())?;
-    println!("{summary}");
+    let (summary, verdict, shown) =
+        run_session(&args.menu, settings, args.storage_plan.as_deref())?;
+    if !shown {
+        println!("{summary}");
+    }
     Ok(match verdict {
         "PASS" | "PASS (HW WARNINGS)" => ExitCode::SUCCESS,
         "FAIL" => ExitCode::from(2),
@@ -461,7 +470,7 @@ fn run_session(
     menu: &MenuArgs,
     settings: Settings,
     storage_plan: Option<&Path>,
-) -> Result<(String, &'static str), Box<dyn std::error::Error>> {
+) -> Result<(String, &'static str, bool), Box<dyn std::error::Error>> {
     INTERRUPTED.store(false, Ordering::SeqCst);
     let run_id = unique_id("suite-combined");
     let dir = Path::new("/run/dit-suite").join(&run_id).join("combined");
@@ -481,6 +490,7 @@ fn run_session(
                 return Ok((
                     "COMBINED cancelled at the SSD setup; no test was started.".to_owned(),
                     "NOT RUN",
+                    false,
                 ));
             }
         },
@@ -550,6 +560,7 @@ fn run_session(
         return Ok((
             format!("COMBINED refused before start (fail closed): {error}\n{release}"),
             "INVALID",
+            false,
         ));
     }
     let renderer = io::stdout()
@@ -618,9 +629,6 @@ fn run_session(
         session.current = index;
         session.run_phase(index);
     }
-    if let Some(renderer) = session.renderer.as_mut() {
-        let _ = renderer.finish();
-    }
     let cleanup = session.remove_chain_file();
     let release = release_storage(holder);
     let ranked = session.rank_signatures();
@@ -643,7 +651,37 @@ fn run_session(
         session.ledger.hardware_line(),
         report_path.display()
     );
-    Ok((summary, verdict))
+    let shown = session.renderer.is_some();
+    if shown {
+        let depth = combined::grade(
+            session.settings.level,
+            session.records.iter().filter(|r| r.completed).count(),
+            session.phases.len(),
+        )
+        .map_or("none (not every phase completed)", Level::label);
+        let mut rows = vec![
+            format!(
+                "RESULT: {verdict}    COMBINED {} {}    depth reached {depth}",
+                session.settings.level.label(),
+                session.settings.intensity.label()
+            ),
+            format!("REPORT   {stored}"),
+            format!("CSV      {csv}"),
+        ];
+        // Clean-up is shown only when it did not go as it should.
+        for note in [cleanup.trim(), release.trim()] {
+            if !note.is_empty()
+                && !matches!(
+                    note,
+                    "Chain record file removed." | "SSD test directories released."
+                )
+            {
+                rows.push(format!("NOTE     {note}"));
+            }
+        }
+        session.draw_result(rows, "Press Enter to return to the control center");
+    }
+    Ok((summary, verdict, shown))
 }
 
 impl Session<'_> {
@@ -1631,7 +1669,32 @@ impl Session<'_> {
                 ),
                 self.ledger.hardware_line(),
             ],
+            result_rows: Vec::new(),
+            footer: None,
         }
+    }
+
+    /// The last frame: the screen as the run left it, with the verdict and where the report went
+    /// under the progress (the rest is on the screen already). Drawn on a cleared screen, so a
+    /// line another process printed while the storage was released does not stay in the frame.
+    fn draw_result(&mut self, result_rows: Vec<String>, footer: &str) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let _ = renderer.finish();
+        print!("\x1b[H\x1b[2J");
+        let mut view = self.view(&[], 0);
+        // Every phase shows how it ended (the one that ran last included).
+        let current = std::mem::replace(&mut self.current, self.phases.len());
+        view.phases_row = self.phases_row();
+        self.current = current;
+        "DONE".clone_into(&mut view.state);
+        view.result_rows = result_rows;
+        view.footer = Some(footer.to_owned());
+        let frame = render(&view, &self.telemetry, TerminalSize::current(), true);
+        let mut last = InPlaceRenderer::new(io::stdout(), 2);
+        let _ = last.render_frame(&frame);
+        let _ = last.finish();
     }
 
     fn remove_chain_file(&self) -> String {

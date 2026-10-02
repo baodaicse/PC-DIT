@@ -268,9 +268,6 @@ fn render_running(dashboard: &UnifiedDashboard, width: usize, spaced: bool) -> V
     lines
 }
 
-/// Longest bar: a wide console would otherwise draw bars across the whole screen.
-const BAR_MAX: usize = 60;
-
 /// `LABEL [bar] suffix`, the label padded to `label_width` so bars of a panel line up.
 fn meter(metric: &DashboardMeter, width: usize, label_width: usize) -> String {
     let percent = metric.percent.map(|value| value.clamp(0.0, 100.0));
@@ -283,7 +280,7 @@ fn meter(metric: &DashboardMeter, width: usize, label_width: usize) -> String {
     let label_width = label_width.max(metric.label.chars().count());
     let bar_width = width
         .saturating_sub(label_width + suffix.chars().count() + 3)
-        .clamp(4, BAR_MAX);
+        .max(4);
     format!(
         "{:<label_width$} [{}]{}",
         metric.label,
@@ -371,11 +368,13 @@ fn part_colors(line: &str) -> Vec<Option<&'static str>> {
         found.push((start, end));
         found
     };
-    if let Some(at) = find_chars(&chars, "STATE: ") {
-        let from = at + "STATE: ".len();
-        let to = (from..end).find(|&i| chars[i] == ' ').unwrap_or(end);
-        let word: String = chars[from..to].iter().collect();
-        color_range(from, to, state_badge(&word));
+    for key in ["STATE: ", "RESULT: "] {
+        if let Some(at) = find_chars(&chars, key) {
+            let from = at + key.len();
+            let to = (from..end).find(|&i| chars[i] == ' ').unwrap_or(end);
+            let word: String = chars[from..to].iter().collect();
+            color_range(from, to, state_badge(&word));
+        }
     }
     if let Some(at) = find_chars(&chars, "FAIL BY PART") {
         for (from, to) in segments(at + "FAIL BY PART".len()) {
@@ -503,8 +502,9 @@ pub fn boxify(lines: &[String]) -> Vec<Vec<char>> {
             let left = column.checked_sub(1).and_then(|c| cell(row, c));
             let right = cell(row, column + 1);
             shown[row][column] = match character {
-                '#' if in_bar => '\u{25a0}',
-                '-' if in_bar => '\u{2500}',
+                // Upper half blocks: a solid bar half a row high, with the rest of its row as
+                // space before the line below; the track is the same glyph in grey.
+                '#' | '-' if in_bar => '\u{2580}',
                 '|' => '\u{2502}',
                 '-' if horizontal(left) || horizontal(right) => '\u{2500}',
                 '+' if corner(row, column) => {
@@ -610,7 +610,8 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
             // Lines with several results are coloured part by part (`part_colors`), never whole.
             let by_part = line.contains("FAIL BY PART")
                 || line.contains("PHASES")
-                || line.contains("HW EVENTS");
+                || line.contains("HW EVENTS")
+                || line.contains("RESULT: ");
             let is_footer = !footer_key.is_empty() && line.contains(&footer_key);
             let overrides = part_colors(line);
             // A line is red for its own count, not for the run's: one layer's FAIL does not
