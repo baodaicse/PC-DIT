@@ -155,15 +155,22 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
     }
     let selection = parse_selection(&inventory, request.trim())?;
     println!(
-        "Write level per SSD: L) Light {} MiB (default)  S) Standard {} MiB  H) Heavy {} MiB",
-        args.write_budget_mib,
-        WriteLevel::Standard.budget_for(args.write_budget_mib),
-        WriteLevel::Heavy.budget_for(args.write_budget_mib)
+        "{}",
+        dit_ui_core::decorate(&dit_ui_core::option_screen(
+            "DIT COMBINED STRESS // SSD WRITE LEVEL",
+            &[vec![
+                format!(
+                    "WRITE      L) Light {} MiB (default)   S) Standard {} MiB   H) Heavy {} MiB  (per SSD)",
+                    args.write_budget_mib,
+                    WriteLevel::Standard.budget_for(args.write_budget_mib),
+                    WriteLevel::Heavy.budget_for(args.write_budget_mib)
+                ),
+                "           The data chain writes its records once on the first SSD: 16 GiB (Standard/Heavy) or 4 GiB (Light).".to_owned(),
+            ]],
+            TerminalSize::current(),
+        ))
     );
-    println!(
-        "  The data chain writes its records once on the first SSD: 16 GiB (Standard/Heavy) or 4 GiB (Light)."
-    );
-    let level = parse_write_level(&prompt("Level [L] > ")?);
+    let level = parse_write_level(&prompt("Write level [L] > ")?);
     let capacity_mib = level.capacity_for(args.capacity_mib, args.write_budget_mib);
     let write_budget_mib = level.budget_for(args.write_budget_mib);
     let chain_working_set_mib = if level == WriteLevel::Light {

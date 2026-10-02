@@ -472,6 +472,29 @@ pub fn render_picker(
     )
 }
 
+/// Widest a menu, picker or option screen gets (the control center's width): on a wide console a
+/// box across the whole screen is hard to read.
+pub const MENU_MAX_COLUMNS: u16 = 180;
+
+/// A framed option screen in the look of every other screen: a title band (`title` should read
+/// `DIT <MODULE> // <WHAT>`), then each section's rows, sections separated by a rule. Plain
+/// ASCII; print it through [`decorate`].
+#[must_use]
+pub fn option_screen(title: &str, sections: &[Vec<String>], size: TerminalSize) -> String {
+    let width = usize::from(size.cols.clamp(60, MENU_MAX_COLUMNS));
+    let inner = width - 2;
+    let rule = format!("+{}+", "-".repeat(inner));
+    let mut lines = vec![rule.clone(), box_line(title, inner), rule.clone()];
+    for (index, section) in sections.iter().enumerate() {
+        if index > 0 {
+            lines.push(rule.clone());
+        }
+        lines.extend(section.iter().map(|row| box_line(row, inner)));
+    }
+    lines.push(rule);
+    lines.join("\n")
+}
+
 /// Renders a module-specific picker with the same box geometry as CPU-SSD.
 #[must_use]
 pub fn render_device_picker(
@@ -481,7 +504,7 @@ pub fn render_device_picker(
     selected: &BTreeSet<usize>,
     size: TerminalSize,
 ) -> String {
-    let width = usize::from(size.cols).clamp(50, 240);
+    let width = usize::from(size.cols.min(MENU_MAX_COLUMNS)).clamp(50, 240);
     let inner = width - 2;
     let mut lines = vec![
         format!("+{}+", "-".repeat(inner)),

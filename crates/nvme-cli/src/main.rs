@@ -832,25 +832,35 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     let selection = parse_selection(&inventory, request.trim())?;
 
     let default_minutes = args.duration_seconds.max(60) / 60;
-    print!(
-        "Test duration: 1) 10 min  2) 30 min  3) 60 min  or type minutes (1-1440)  [{default_minutes}] > "
+    println!(
+        "{}",
+        dit_ui_core::decorate(&dit_ui_core::option_screen(
+            "DIT CPU-SSD // DURATION AND WRITE LEVEL",
+            &[
+                vec![
+                    "DURATION   1) 10 min   2) 30 min   3) 60 min   or type minutes (1-1440)".to_owned(),
+                ],
+                vec![
+                    format!(
+                        "WRITE      L) Light {} MiB (default)   S) Standard {} MiB   H) Heavy {} MiB  (per SSD)",
+                        args.write_budget_mib,
+                        WriteLevel::Standard.budget_mib(args),
+                        WriteLevel::Heavy.budget_mib(args)
+                    ),
+                    "           Writes stop at the level; the test then re-reads and re-verifies what it wrote until the time is up.".to_owned(),
+                    format!(
+                        "           Each SSD needs that much free space plus {} MiB left untouched. Only new test files are used.",
+                        args.reserve_free_mib
+                    ),
+                ],
+            ],
+            TerminalSize::current(),
+        ))
     );
+    print!("Duration [{default_minutes}] > ");
     io::stdout().flush()?;
     let duration_seconds = parse_ssd_minutes(&read_operator_line()?, default_minutes) * 60;
-    println!(
-        "Write level per SSD: L) Light {} MiB (default)  S) Standard {} MiB  H) Heavy {} MiB",
-        args.write_budget_mib,
-        WriteLevel::Standard.budget_mib(args),
-        WriteLevel::Heavy.budget_mib(args)
-    );
-    println!(
-        "  Writes stop at the level; the test then re-reads and re-verifies what it wrote until the time is up."
-    );
-    println!(
-        "  Each SSD needs that much free space plus {} MiB left untouched. Only new test files are used.",
-        args.reserve_free_mib
-    );
-    print!("Level [L] > ");
+    print!("Write level [L] > ");
     io::stdout().flush()?;
     let level = parse_write_level(&read_operator_line()?);
     let (capacity_mib, write_budget_mib) = (level.capacity_mib(args), level.budget_mib(args));

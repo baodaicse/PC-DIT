@@ -34,8 +34,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MIB: u64 = 1024 * 1024;
 /// A layer still running this long after its phase should have ended is drained.
 const OVERRUN_GRACE: Duration = Duration::from_mins(15);
-const RULE: &str =
-    "+--------------------------------------------------------------------------------+";
 const READY_WAIT: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -155,19 +153,34 @@ fn ask(question: &str) -> io::Result<String> {
 
 fn choose_settings() -> io::Result<Option<Settings>> {
     print!("\x1b[H\x1b[2J");
-    println!("+-- COMBINED STRESS: CPU-RAM + GPU-VRAM + SSD + DATA CHAIN ----------------------+");
-    for line in [
-        "Level  1) BOUNDED ~15 min  quick check; a stability verdict needs DEEP or SOAK",
-        "       2) DEEP    ~60 min  40 min overlap, rest, retention re-read",
-        "       3) SOAK    hours    50 min overlap cycles with rest and retention",
-        "Intensity  B) balanced (default): each layer gets its own CPU share",
-        "           M) max: every layer at full speed; GPU temp limit forced ON",
-        "Baselines run first, so a failure seen only in the overlap points to load,",
-        "power or heat. A layer FAIL is counted and the run goes on.",
-    ] {
-        println!("| {line:<78} |");
-    }
-    println!("{RULE}");
+    let rows = |lines: &[&str]| {
+        lines
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "{}",
+        dit_ui_core::decorate(&dit_ui_core::option_screen(
+            "DIT COMBINED STRESS // CPU-RAM + GPU-VRAM + SSD + DATA CHAIN",
+            &[
+                rows(&[
+                    "LEVEL      1) BOUNDED  ~15 min   quick check; a stability verdict needs DEEP or SOAK",
+                    "           2) DEEP     ~60 min   40 min overlap, rest, retention re-read",
+                    "           3) SOAK     hours     50 min overlap cycles with rest and retention",
+                ]),
+                rows(&[
+                    "INTENSITY  B) balanced (default)   each layer gets its own CPU share",
+                    "           M) max                  every layer at full speed; GPU temp limit forced ON",
+                ]),
+                rows(&[
+                    "Baselines run first, so a failure seen only in the overlap points to load, power or heat.",
+                    "A layer FAIL is counted and the run goes on.",
+                ]),
+            ],
+            dit_ui_core::TerminalSize::current(),
+        ))
+    );
     let level = match ask("Level [1], Q to go back > ")?.as_str() {
         "q" => return Ok(None),
         "2" => Level::Deep,

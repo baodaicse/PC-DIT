@@ -471,18 +471,27 @@ fn render_gpu_profile_menu(settings: GpuSettings) -> String {
     } else {
         "OFF (temperature is still recorded)".to_owned()
     };
-    format!(
-        "\
-GPU-VRAM TEST PROFILE
-  1  Full DIT (default, Enter)  u32 + FP32 GEMM in turn, GPU DRAM sweep, VRAM held to the limit
-  2  Tensor INT8 check          2 minutes of the INT8 tensor-core GEMM only (compute capability 8.0+,
-                                RTX 30/40/50); confirms it matches the CPU oracle bit for bit
-  3  Full DIT + INT8 tensor     profile 1 with the INT8 tensor GEMM in the rotation; use once
-                                profile 2 has passed on this kind of card
-  D  DURATION                   {} min for profiles 1 and 3 (the tensor check is always 2 min)
-  T  TEMP LIMIT                 {limit}
-  b  Back to the control center",
-        settings.duration_minutes
+    let rows = |lines: Vec<String>| lines;
+    dit_ui_core::option_screen(
+        "DIT GPU-VRAM // TEST PROFILE",
+        &[
+            rows(vec![
+                " [1] Full DIT (default, Enter)  u32 + FP32 GEMM in turn, GPU DRAM sweep, VRAM held to the limit".into(),
+                " [2] Tensor INT8 check          2 minutes of the INT8 tensor-core GEMM only (compute capability 8.0+,".into(),
+                "                                RTX 30/40/50); confirms it matches the CPU oracle bit for bit".into(),
+                " [3] Full DIT + INT8 tensor     profile 1 with the INT8 tensor GEMM in the rotation; use once".into(),
+                "                                profile 2 has passed on this kind of card".into(),
+            ]),
+            rows(vec![
+                format!(
+                    " [D] DURATION                   {} min for profiles 1 and 3 (the tensor check is always 2 min)",
+                    settings.duration_minutes
+                ),
+                format!(" [T] TEMP LIMIT                 {limit}"),
+                " [B] Back to the control center".into(),
+            ]),
+        ],
+        TerminalSize::current(),
     )
 }
 
@@ -523,7 +532,7 @@ fn choose_gpu_profile(settings: &mut GpuSettings) -> io::Result<Option<GpuProfil
     loop {
         print!(
             "\x1b[H\x1b[2J{}\nSelection [1] > ",
-            render_gpu_profile_menu(*settings)
+            dit_ui_core::decorate(&render_gpu_profile_menu(*settings))
         );
         io::stdout().flush()?;
         let mut choice = String::new();

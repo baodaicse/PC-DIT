@@ -485,14 +485,22 @@ pub(super) fn command(flags: &super::InventoryFlags) -> Result<std::process::Exi
     loop {
         let inventory = super::scan_releasing_stale(flags)?;
         print!("\x1b[H\x1b[2J");
-        println!("FORMAT SSD (quick) // erases EVERYTHING on the chosen NVMe disk");
         println!(
-            "One GPT partition with a new NTFS or ext4 file system labelled {LABEL} is left on it."
+            "{}",
+            dit_ui_core::decorate(&dit_ui_core::option_screen(
+                "DIT FORMAT SSD // QUICK FORMAT, ERASES EVERYTHING ON THE CHOSEN NVMe DISK",
+                &[vec![
+                    format!(
+                        "One GPT partition with a new NTFS or ext4 file system labelled {LABEL} is left on it."
+                    ),
+                    format!(
+                        "System, boot, results, swap, mounted and read-only disks are refused; the last {CONFIRM_CHARS}"
+                    ),
+                    "characters of the disk's serial number must be typed to confirm.".to_owned(),
+                ]],
+                dit_ui_core::TerminalSize::current(),
+            ))
         );
-        println!(
-            "System, boot, results, swap, mounted and read-only disks are refused; the last {CONFIRM_CHARS}"
-        );
-        println!("characters of the disk's serial number must be typed to confirm.");
         if inventory.devices.is_empty() {
             println!("\nNo NVMe disk was found.");
             ask("Press Enter to go back > ")?;
