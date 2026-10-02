@@ -792,8 +792,10 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
                     text_color
                 };
                 if current != previous_color {
-                    // A badge's background must end with it.
-                    if previous_color.contains(';') {
+                    // A badge's background must end with it. Grey (90) is bright black, and the
+                    // Linux console turns bold on with it: the colours after it would come out
+                    // bright (a bar's green or orange, the text) unless that ends too.
+                    if previous_color.contains(';') || previous_color == GRAY {
                         result.push_str(RESET);
                     }
                     result.push_str(current);
@@ -1019,6 +1021,19 @@ mod tests {
         }
         let joined: String = wrapped[1..].iter().map(|row| row.trim_start()).collect();
         assert!(joined.ends_with(path));
+    }
+
+    /// Grey (bright black) turns bold on at the Linux console: whatever follows it starts from a
+    /// reset, so a bar's fill and the text after the bar keep their normal intensity.
+    #[test]
+    fn colours_after_grey_start_from_a_reset() {
+        let painted = paint(&["| CPU USAGE [#####-----] 50% |".to_owned()], 0, "", false);
+        assert!(painted.contains(GRAY));
+        for (at, _) in painted.match_indices(GRAY) {
+            let after = &painted[at + GRAY.len()..];
+            let next = after.find('\x1b').map_or("", |i| &after[i..]);
+            assert!(next.is_empty() || next.starts_with(RESET), "{painted:?}");
+        }
     }
 
     /// The result frame of a pass shows the progress complete; any other verdict keeps the
