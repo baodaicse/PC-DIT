@@ -80,7 +80,7 @@ pub fn render_unified_dashboard(
     }
     debug_assert!(lines.len() <= height);
     if color {
-        paint(&lines, dashboard.failures)
+        paint(&lines, dashboard.failures, &dashboard.footer)
     } else {
         lines.join("\n")
     }
@@ -247,12 +247,110 @@ fn full_row(content: &str, width: usize) -> String {
     panel_row(content, width)
 }
 
-fn paint(lines: &[String], failures: u64) -> String {
+/// What the `FAIL` words of a line say: a counter above zero (`FAIL 3`, `FAIL TOTAL  3`), and
+/// whether a bare verdict word (`FAIL` not followed by a count) is there.
+fn fail_counters(line: &str) -> (bool, bool) {
+    let (mut positive, mut bare) = (false, false);
+    let mut rest = line;
+    while let Some(at) = rest.find("FAIL") {
+        let after = rest[at + 4..].trim_start();
+        let after = after.strip_prefix("TOTAL").map_or(after, str::trim_start);
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            bare = true;
+        } else if digits.parse::<u64>().map_or(true, |count| count > 0) {
+            positive = true;
+        }
+        rest = &rest[at + 4..];
+    }
+    (positive, bare)
+}
+
+/// Char index of `needle` in `chars`.
+fn find_chars(chars: &[char], needle: &str) -> Option<usize> {
+    let needle: Vec<char> = needle.chars().collect();
+    chars
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+}
+
+/// Colours of single parts of a line, by char index, where a line carries several results:
+/// the cells of `FAIL BY PART` with a count above zero (red), the events of `HW EVENTS`
+/// (yellow) and the `[FAIL]` phases of `PHASES` (red). A FAIL stays red where it happened.
+fn part_colors(line: &str) -> Vec<Option<&'static str>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut colors = vec![None; chars.len()];
+    // Content ends at the panel's closing frame.
+    let end = chars.iter().rposition(|c| *c == '|').unwrap_or(chars.len());
+    let mut color_range = |from: usize, to: usize, color: &'static str| {
+        for slot in colors.iter_mut().take(to.min(end)).skip(from) {
+            *slot = Some(color);
+        }
+    };
+    let segments = |from: usize| -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        let mut start = from;
+        let mut index = from;
+        while index + 2 < end {
+            if chars[index] == ' ' && chars[index + 1] == '|' && chars[index + 2] == ' ' {
+                found.push((start, index));
+                start = index + 3;
+                index += 3;
+            } else {
+                index += 1;
+            }
+        }
+        found.push((start, end));
+        found
+    };
+    if let Some(at) = find_chars(&chars, "FAIL BY PART") {
+        for (from, to) in segments(at + "FAIL BY PART".len()) {
+            let text: String = chars[from..to].iter().collect();
+            let count = text
+                .split_whitespace()
+                .find(|token| token.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|token| token.parse::<u64>().ok())
+                .unwrap_or(0);
+            if count > 0 {
+                color_range(from, to, RED);
+            }
+        }
+    } else if let Some(at) = find_chars(&chars, "HW EVENTS") {
+        if find_chars(&chars, "none recorded").is_none() {
+            for (from, to) in segments(at + "HW EVENTS".len()) {
+                color_range(from, to, YELLOW);
+            }
+        }
+    } else if find_chars(&chars, "PHASES").is_some() {
+        let mut index = 0;
+        while let Some(offset) = find_chars(&chars[index..], "[FAIL]") {
+            let from = index + offset;
+            let to = (from + 1..end)
+                .find(|&i| chars[i] == ' ' && chars.get(i + 1) == Some(&' '))
+                .unwrap_or(end);
+            color_range(from, to, RED);
+            index = to;
+        }
+    }
+    colors
+}
+
+fn paint(lines: &[String], failures: u64, footer: &str) -> String {
+    let footer_key: String = footer.chars().take(24).collect();
     lines
         .iter()
         .map(|line| {
+            let (counter_above_zero, bare_fail) = fail_counters(line);
+            // Lines with several results are coloured part by part (`part_colors`), never whole.
+            let by_part = line.contains("FAIL BY PART")
+                || line.contains("PHASES")
+                || line.contains("HW EVENTS");
+            let is_footer = !footer_key.is_empty() && line.contains(&footer_key);
+            let overrides = part_colors(line);
+            // A line is red for its own count, not for the run's: one layer's FAIL does not
+            // turn the others red. A bare verdict word still follows the run's total.
             let text_color =
-                if failures > 0 && line.contains("FAIL") && !line.contains("FAIL TOTAL  0") {
+                if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer)) {
                     RED
                 } else if line.contains("PASS") {
                     GREEN
@@ -273,7 +371,7 @@ fn paint(lines: &[String], failures: u64) -> String {
             let mut result = String::new();
             let mut in_bar = false;
             let mut previous_color = "";
-            for character in line.chars() {
+            for (index, character) in line.chars().enumerate() {
                 let current = if character == '[' {
                     in_bar = true;
                     CYAN
@@ -284,7 +382,12 @@ fn paint(lines: &[String], failures: u64) -> String {
                     GREEN
                 } else if in_bar && character == '-' {
                     GRAY
-                } else if matches!(character, '+' | '|' | '-') {
+                } else if matches!(character, '+' | '|') {
+                    CYAN
+                } else if let Some(color) = overrides[index] {
+                    color
+                } else if character == '-' && line.starts_with('+') {
+                    // Borders only; a dash inside a word (CPU-RAM) takes the line's colour.
                     CYAN
                 } else {
                     text_color
@@ -305,6 +408,79 @@ fn paint(lines: &[String], failures: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fail_counters_read_their_own_count() {
+        assert_eq!(
+            fail_counters("CPU-RAM  IDLE  FAIL 1    round 3"),
+            (true, false)
+        );
+        assert_eq!(fail_counters("GPU-VRAM IDLE  FAIL 0"), (false, false));
+        assert_eq!(
+            fail_counters("CALCULATIONS 9  |  FAIL TOTAL  0"),
+            (false, false)
+        );
+        assert_eq!(
+            fail_counters("CALCULATIONS 9  |  FAIL TOTAL  2"),
+            (true, false)
+        );
+        assert_eq!(fail_counters("STATE: FAIL"), (false, true));
+    }
+
+    /// A FAIL stays red where it happened: the layer that failed (whatever phase runs now), the
+    /// cell of FAIL BY PART that counted it and the phase it happened in, and nothing else.
+    #[test]
+    fn red_marks_only_where_the_failure_is() {
+        let mut dashboard = model();
+        dashboard.failures = 1;
+        dashboard.footer = "A layer FAIL is counted, the run continues".into();
+        dashboard.running_rows = vec![
+            "CPU-RAM  IDLE               FAIL 1".into(),
+            "GPU-VRAM RUNNING            FAIL 0".into(),
+            "FAIL BY PART  CPU 0 | RAM 1 (1 susp) | PCIe-GPU1 0 | ? PCIe-GPU1|GPU1|VRAM1 2".into(),
+            "HW EVENTS     PCIe-GPU1 replay +4".into(),
+            "PHASES  [OK] PREFILL  [FAIL] BASELINE CPU-RAM  [>>] BASELINE GPU-VRAM".into(),
+        ];
+        let frame = render_unified_dashboard(
+            &dashboard,
+            TerminalSize {
+                cols: 160,
+                rows: 50,
+            },
+            true,
+        );
+        let line = |needle: &str| {
+            frame
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle}"))
+                .to_owned()
+        };
+        let layer = line("IDLE");
+        assert!(
+            layer.contains(&format!("{RED} CPU-RAM  IDLE")),
+            "the failed layer stays red, dash included: {layer:?}"
+        );
+        assert!(!line("GPU-VRAM").contains(RED), "a clean layer is not red");
+        let parts = line("BY PART");
+        assert!(parts.contains(&format!("{RED}RAM 1 (1 susp)")), "{parts:?}");
+        assert!(
+            parts.contains(&format!("{RED}2")) || parts.contains(&format!("{RED}?")),
+            "{parts:?}"
+        );
+        assert!(
+            !parts.contains(&format!("{RED}CPU 0")) && !parts.contains(&format!("{RED}  CPU 0"))
+        );
+        assert!(line("HW EVENTS").contains(YELLOW));
+        let phases = line("PHASES");
+        assert!(phases.contains(&format!("{RED}FAIL")), "{phases:?}");
+        assert!(!phases.contains(&format!("{RED}OK")));
+        assert!(
+            !line("is counted").contains(RED),
+            "the footer is not a failure"
+        );
+        assert!(line("FAIL TOTAL").contains(RED));
+    }
 
     fn model() -> UnifiedDashboard {
         UnifiedDashboard {

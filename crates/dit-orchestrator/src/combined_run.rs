@@ -218,6 +218,20 @@ struct Running {
     faults: Vec<(PathBuf, dit_contracts::FaultTail)>,
     /// Failures counted live, to reconcile with the report at the end.
     live_attributed: u64,
+    /// Most failures the layer's progress ever showed in this phase. A count never goes back:
+    /// CPU-RAM's diagnostic rerun writes the same progress file with fresh counters.
+    failures_peak: u64,
+}
+
+impl Running {
+    /// Failures of this layer in the phase so far: the highest of what its progress showed and
+    /// what the fault ledger counted from its live records.
+    fn failures(&self) -> u64 {
+        self.live
+            .failures
+            .max(self.failures_peak)
+            .max(self.live_attributed)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -690,6 +704,7 @@ impl Session<'_> {
             tally: (layer == Layer::Ssd).then(SsdTally::default),
             faults: Vec::new(),
             live_attributed: 0,
+            failures_peak: 0,
             live: LiveLayer::default(),
             drained: false,
         })
@@ -1050,6 +1065,7 @@ impl Session<'_> {
             }
             self.drain_live(layer, &record.label);
             layer.live = layers::live(layer.layer, &layer.dir, layer.tally.as_ref());
+            layer.failures_peak = layer.failures_peak.max(layer.live.failures);
             if let Some(read) = layer.live.read_gibps {
                 self.chain_peak_gibps = self.chain_peak_gibps.max(read);
             }
@@ -1094,7 +1110,7 @@ impl Session<'_> {
             outcome = LayerOutcome::Invalid;
             detail = format!("stopped by the session before its report: {detail}");
         }
-        let failures = live.failures.max(ended.live.failures);
+        let failures = live.failures.max(ended.failures());
         let calculations = live.calculations.max(ended.live.calculations);
         let totals = self.totals.entry(ended.layer).or_default();
         totals.failures += failures;
@@ -1386,6 +1402,16 @@ impl Session<'_> {
             .enumerate()
             .map(|(index, phase)| {
                 let mark = match index.cmp(&self.current) {
+                    // A phase with a FAIL says so (and is painted red), finished or not.
+                    std::cmp::Ordering::Less
+                        if self.records.get(index).is_some_and(|r| {
+                            r.layers
+                                .iter()
+                                .any(|l| l.failures > 0 || l.outcome == LayerOutcome::Fail)
+                        }) =>
+                    {
+                        "FAIL"
+                    }
                     std::cmp::Ordering::Less
                         if self.records.get(index).is_some_and(|r| r.completed) =>
                     {
@@ -1507,7 +1533,7 @@ impl Session<'_> {
                             |note| format!("{} | HW {note}", r.live.detail),
                         )
                     }),
-                    failures: total.failures + active.map_or(0, |r| r.live.failures),
+                    failures: total.failures + active.map_or(0, Running::failures),
                 }
             })
             .collect()
