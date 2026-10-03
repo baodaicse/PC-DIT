@@ -804,9 +804,10 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         .as_deref()
         .map(validate_cpu_ram_preflight)
         .transpose()?;
-    if args.output_dir.symlink_metadata().is_ok() {
+    if let Some(file) = earlier_run_file(&args.output_dir) {
         return Err(format!(
-            "output directory already exists and will not be reused: {}",
+            "output directory holds an earlier run ({}) and will not be reused: {}",
+            file,
             args.output_dir.display()
         )
         .into());
@@ -876,10 +877,9 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     );
     println!("Only new test files are used; system/boot/results devices remain blocked.");
 
-    if let Some(parent) = args.output_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::create_dir(&args.output_dir)?;
+    // The supervising watchdog makes the directory (its status file lives there) before it
+    // starts this run.
+    std::fs::create_dir_all(&args.output_dir)?;
     let selection_path = args.output_dir.join("selection.json");
     let events_path = args.output_dir.join("events.jsonl");
     let report_path = args.output_dir.join("report.json");
@@ -1418,6 +1418,23 @@ fn parse_ssd_minutes(answer: &str, default_minutes: u64) -> u64 {
             .filter(|minutes| (1..=1440).contains(minutes))
             .unwrap_or(default_minutes),
     }
+}
+
+/// Files an interactive run writes in its output directory.
+const RUN_FILES: [&str; 5] = [
+    "selection.json",
+    "events.jsonl",
+    "report.json",
+    "auto-storage-plan.json",
+    "auto-storage-outcome.json",
+];
+
+/// The first file of an earlier run in `directory`, which must then not be reused. A directory
+/// with only the watchdog's status files is the one made for this run.
+fn earlier_run_file(directory: &Path) -> Option<&'static str> {
+    RUN_FILES
+        .into_iter()
+        .find(|file| directory.join(file).symlink_metadata().is_ok())
 }
 
 /// How often the test filesystems are flushed while a test writes to them.
@@ -3035,6 +3052,21 @@ mod tests {
         assert!(
             rows[4].contains("free  120.0 GiB (incl. 12.0 GiB old DIT files)   <- TEST VOLUME")
         );
+    }
+
+    /// The watchdog makes the run directory before the run starts: that directory is used, one
+    /// holding an earlier run's files is not.
+    #[test]
+    fn a_run_directory_is_reused_only_without_an_earlier_run() {
+        let directory =
+            std::env::temp_dir().join(format!("cpu-ssd-run-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("watchdog-status.json"), "{}").unwrap();
+        assert_eq!(earlier_run_file(&directory), None);
+        std::fs::write(directory.join("report.json"), "{}").unwrap();
+        assert_eq!(earlier_run_file(&directory), Some("report.json"));
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(earlier_run_file(&directory), None);
     }
 
     #[test]
