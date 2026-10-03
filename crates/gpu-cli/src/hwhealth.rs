@@ -4,7 +4,7 @@
 //! Rules: a value that cannot be read is `None`/`unavailable`, never zero; log
 //! and link data are supporting evidence and never change a data verdict; a
 //! clean PASS does not prove the absence of corrected errors.
-use dit_system::{GpuDevice, GpuTelemetry, collect_gpu_telemetry};
+use dit_system::{GpuDevice, GpuTelemetry, SLOWDOWN_MASK, collect_gpu_telemetry};
 use gpu_engine::accounting::MismatchSample;
 use serde::Serialize;
 use std::{
@@ -1000,12 +1000,6 @@ const THROTTLE_NAMES: [(u64, &str); 9] = [
     (0x80, "HwPowerBrakeSlowdown"),
     (0x100, "DisplayClockSetting"),
 ];
-
-/// Throttle reasons that are a slowdown for heat or a hardware signal: `HwSlowdown`,
-/// `SwThermalSlowdown`, `HwThermalSlowdown`, `HwPowerBrakeSlowdown`. The power cap (`SwPowerCap`)
-/// is left out: a loaded GPU reaches it by design, as a CPU reaches its power limit, which the
-/// kernel's CPU throttle counters leave out too.
-pub const SLOWDOWN_MASK: u64 = 0x8 | 0x20 | 0x40 | 0x80;
 
 #[must_use]
 pub fn decode_throttle(mask: u64) -> Vec<&'static str> {

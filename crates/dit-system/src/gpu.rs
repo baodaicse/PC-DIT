@@ -38,6 +38,47 @@ pub struct GpuTelemetry {
     pub source: String,
 }
 
+/// Throttle reasons that are a slowdown for heat or a hardware signal: `HwSlowdown`,
+/// `SwThermalSlowdown`, `HwThermalSlowdown`, `HwPowerBrakeSlowdown`. The power cap (`SwPowerCap`)
+/// is left out: a loaded GPU reaches it by design, as a CPU reaches its power limit, which the
+/// kernel's CPU throttle counters leave out too.
+pub const SLOWDOWN_MASK: u64 = 0x8 | 0x20 | 0x40 | 0x80;
+
+/// Entries into a GPU slowdown ([`SLOWDOWN_MASK`]) and the time spent in it, from successive
+/// throttle masks (a live screen's telemetry samples).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SlowdownCounter {
+    pub episodes: u64,
+    seconds: f64,
+    since: Option<std::time::Instant>,
+}
+
+impl SlowdownCounter {
+    pub fn observe(&mut self, mask: u64, now: std::time::Instant) {
+        let slowing = mask & SLOWDOWN_MASK != 0;
+        match (slowing, self.since) {
+            (true, None) => {
+                self.episodes += 1;
+                self.since = Some(now);
+            }
+            (false, Some(start)) => {
+                self.seconds += now.saturating_duration_since(start).as_secs_f64();
+                self.since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Time spent slowed down so far, the current slowdown included.
+    #[must_use]
+    pub fn seconds(&self, now: std::time::Instant) -> f64 {
+        self.seconds
+            + self.since.map_or(0.0, |start| {
+                now.saturating_duration_since(start).as_secs_f64()
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct NvidiaSample {
     pci_address: String,
@@ -573,5 +614,19 @@ mod tests {
         assert_eq!(sample.core_clock_mhz, Some(2200.0));
         assert_eq!(sample.memory_clock_mhz, Some(1000.0));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Each entry into a heat or hardware slowdown is one episode, timed until it ends; the
+    /// power cap is not a slowdown.
+    #[test]
+    fn slowdowns_are_counted_and_timed() {
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + std::time::Duration::from_secs(seconds);
+        let mut counter = super::SlowdownCounter::default();
+        for (second, mask) in [(0, 0x4), (1, 0x20), (3, 0x20), (4, 0x1), (6, 0x40 | 0x4)] {
+            counter.observe(mask, at(second));
+        }
+        assert_eq!(counter.episodes, 2);
+        assert!((counter.seconds(at(8)) - 5.0).abs() < 1e-9);
     }
 }

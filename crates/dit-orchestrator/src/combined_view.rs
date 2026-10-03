@@ -4,13 +4,15 @@
 //! chain), phase and per-layer progress below.
 use dit_orchestrator::combined::{Intensity, Level};
 use dit_system::{
-    GpuDevice, GpuTelemetry, LiveSensorSampler, collect_gpu_inventory, collect_gpu_telemetry,
+    GpuDevice, GpuTelemetry, LiveSensorSampler, SlowdownCounter, ThrottleGroup,
+    collect_gpu_inventory, collect_gpu_telemetry,
 };
 use dit_ui_core::{
-    DashboardMeter, HostSampler, LiveUtilization, SystemInfo, TerminalSize, UnifiedDashboard,
-    render_unified_dashboard, wrap_result_rows,
+    DashboardMeter, HostSampler, LiveUtilization, SystemInfo, TerminalSize, ThrottleLive,
+    UnifiedDashboard, render_unified_dashboard, wrap_result_rows,
 };
-use std::path::Path;
+use nvme_inventory::SmartSnapshot;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MIB: f64 = 1024.0 * 1024.0;
@@ -137,7 +139,18 @@ pub struct Telemetry {
     pub disks: Vec<DiskMeter>,
     pub live: LiveUtilization,
     pub mem_available_bytes: u64,
+    /// Live throttle of the CPU, each tested GPU and each selected SSD since the session began.
+    pub throttle: ThrottleLive,
+    started: Instant,
+    throttle_start: Option<Vec<ThrottleGroup>>,
+    slowdowns: Vec<SlowdownCounter>,
+    /// `SSD<alias>`, its namespace and its SMART when the session began.
+    ssd_smart: Vec<(String, PathBuf, SmartSnapshot)>,
+    last_smart: Option<Instant>,
 }
+
+/// SMART is an admin command: read it rarely beside the SSD layer's I/O.
+const SMART_PERIOD: Duration = Duration::from_secs(30);
 
 impl Telemetry {
     #[must_use]
@@ -159,7 +172,25 @@ impl Telemetry {
             disks,
             live: LiveUtilization::default(),
             mem_available_bytes: 0,
+            throttle: ThrottleLive::default(),
+            started: Instant::now(),
+            throttle_start: None,
+            slowdowns: Vec::new(),
+            ssd_smart: Vec::new(),
+            last_smart: None,
         }
+    }
+
+    /// Watches the selected SSDs' own throttling: `(alias, block name)` of each.
+    pub fn watch_ssds(&mut self, drives: &[(usize, String)]) {
+        self.ssd_smart = drives
+            .iter()
+            .map(|(alias, block)| {
+                let node = Path::new("/dev").join(block);
+                let start = nvme_inventory::read_smart(&node);
+                (format!("SSD{alias}"), node, start)
+            })
+            .collect();
     }
 
     /// Keeps only the GPUs the run tests (the engine's eligible devices).
@@ -183,6 +214,13 @@ impl Telemetry {
                 .preferred_cpu_power()
                 .map(|reading| reading.milliwatts as f64 / 1000.0);
             self.last_sensor = Some(Instant::now());
+            let start = self
+                .throttle_start
+                .get_or_insert_with(|| snapshot.throttle_groups.clone());
+            let cpu = dit_system::throttle_delta(start, &snapshot.throttle_groups)
+                .map(|delta| (delta.events, delta.longest_ms.map(|ms| ms / 1000)));
+            let clock = format_duration(self.started.elapsed().as_secs());
+            self.throttle.update("CPU", cpu, &clock);
         }
         // nvidia-smi is the slowest source: every 2 s.
         if self
@@ -191,6 +229,23 @@ impl Telemetry {
         {
             self.gpu_live = collect_gpu_telemetry(&self.gpus);
             self.last_gpu = Some(Instant::now());
+            self.track_gpu_throttle();
+        }
+        if !self.ssd_smart.is_empty()
+            && self
+                .last_smart
+                .is_none_or(|last| last.elapsed() >= SMART_PERIOD)
+        {
+            let clock = format_duration(self.started.elapsed().as_secs());
+            for (label, node, start) in &self.ssd_smart {
+                let now = nvme_inventory::read_smart(node);
+                self.throttle.update(
+                    label,
+                    nvme_inventory::thermal_throttle_between(start, &now),
+                    &clock,
+                );
+            }
+            self.last_smart = Some(Instant::now());
         }
         let mut live = self.host.sample();
         live.cpu_temperature_celsius = self.cpu_temperature;
@@ -200,6 +255,33 @@ impl Telemetry {
         let diskstats = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
         for disk in &mut self.disks {
             disk.sample(&diskstats);
+        }
+    }
+}
+
+impl Telemetry {
+    /// Each tested GPU's slowdowns, as `GPU<n>` in the order the session numbers them.
+    fn track_gpu_throttle(&mut self) {
+        let now = Instant::now();
+        let clock = format_duration(self.started.elapsed().as_secs());
+        self.slowdowns
+            .resize(self.gpus.len(), SlowdownCounter::default());
+        for (position, gpu) in self.gpus.iter().enumerate() {
+            let Some(sample) = self
+                .gpu_live
+                .iter()
+                .find(|sample| sample.pci_address.eq_ignore_ascii_case(&gpu.pci_address))
+            else {
+                continue;
+            };
+            let counter = &mut self.slowdowns[position];
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let reading = sample.throttle_reasons_mask.map(|mask| {
+                counter.observe(mask, now);
+                (counter.episodes, Some(counter.seconds(now).round() as u64))
+            });
+            self.throttle
+                .update(&format!("GPU{}", position + 1), reading, &clock);
         }
     }
 }

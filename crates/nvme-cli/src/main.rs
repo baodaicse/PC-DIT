@@ -1423,6 +1423,50 @@ fn parse_ssd_minutes(answer: &str, default_minutes: u64) -> u64 {
     }
 }
 
+/// Each SSD's own thermal management since the run started (SMART thermal management levels 1
+/// and 2), on the live THROTTLE row as `SSD<alias>`, as the result counts it. SMART is read every
+/// [`SMART_PERIOD`]: an admin command, kept rare beside the test's I/O.
+struct SsdThrottleWatch {
+    drives: Vec<(String, PathBuf, nvme_inventory::SmartSnapshot)>,
+    last: Instant,
+}
+
+const SMART_PERIOD: Duration = Duration::from_secs(30);
+
+impl SsdThrottleWatch {
+    fn start(drives: &[(usize, PathBuf)]) -> Self {
+        Self {
+            drives: drives
+                .iter()
+                .map(|(alias, node)| {
+                    (
+                        format!("SSD{alias}"),
+                        node.clone(),
+                        nvme_inventory::read_smart(node),
+                    )
+                })
+                .collect(),
+            last: Instant::now(),
+        }
+    }
+
+    fn sample_if_due(&mut self, state: &mut UiState) {
+        if self.last.elapsed() >= SMART_PERIOD {
+            self.sample(state);
+        }
+    }
+
+    fn sample(&mut self, state: &mut UiState) {
+        for (label, node, start) in &self.drives {
+            state.update_throttle(
+                label,
+                nvme_inventory::thermal_throttle_between(start, &nvme_inventory::read_smart(node)),
+            );
+        }
+        self.last = Instant::now();
+    }
+}
+
 /// Files an interactive run writes in its output directory.
 const RUN_FILES: [&str; 5] = [
     "selection.json",
@@ -1782,6 +1826,7 @@ fn run_preserving_multi_command(
     let run_id = new_run_id();
     let mut jobs = Vec::with_capacity(selection.devices.len());
     let mut descriptors = Vec::with_capacity(selection.devices.len());
+    let mut smart_nodes = Vec::with_capacity(selection.devices.len());
     let mut target_evidence = Vec::with_capacity(selection.devices.len());
     let mut test_files = Vec::with_capacity(selection.devices.len());
     let preparation = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -1837,6 +1882,7 @@ fn run_preserving_multi_command(
             config.wall_clock_limit = Some(Duration::from_secs(duration_seconds));
             config.sustain_until_deadline = true;
             config.compute_workers = compute_workers;
+            smart_nodes.push((selected.display_index, namespace.device_node.clone()));
             descriptors.push(DeviceDescriptor {
                 id: namespace.stable_id.clone(),
                 label: format!("SSD {}", selected.display_index),
@@ -1881,6 +1927,10 @@ fn run_preserving_multi_command(
         ui_state.set_live_utilization(sampler.sample());
     }
     let mut last_host_sample = Instant::now();
+    let mut ssd_throttle = use_ui.then(|| SsdThrottleWatch::start(&smart_nodes));
+    if let Some(watch) = ssd_throttle.as_mut() {
+        watch.sample(&mut ui_state);
+    }
     let mut renderer = use_ui.then(|| InPlaceRenderer::new(io::stdout(), args.ui_fps));
     if let Some(active) = renderer.as_mut()
         && let Err(error) = active.render_if_due(&ui_state, true)
@@ -1896,6 +1946,9 @@ fn run_preserving_multi_command(
             event_error = Some(error);
         }
         ui_state.ingest(&event);
+        if let Some(watch) = ssd_throttle.as_mut() {
+            watch.sample_if_due(&mut ui_state);
+        }
         if last_host_sample.elapsed() >= Duration::from_millis(250)
             && let Some(sampler) = host_sampler.as_mut()
         {

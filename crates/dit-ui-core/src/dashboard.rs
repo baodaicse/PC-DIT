@@ -233,9 +233,15 @@ pub(super) fn render(state: &UiState, size: TerminalSize, color: bool) -> String
         process: "4K matrix -> direct write -> readback -> independent exact recompute".to_owned(),
         calculations_completed: summary.matrix_checks,
         failures: summary.failures,
-        running_rows,
-        footer: format!(
-            "{page_note}TEMP LIMIT OFF | SPEED=R+W/observed peak | main progress = duration | Ctrl+C preserves report"
+        running_rows: {
+            running_rows.extend(state.throttle.row());
+            running_rows
+        },
+        footer: state.throttle.alert().map_or_else(
+            || format!(
+                "{page_note}TEMP LIMIT OFF | SPEED=R+W/observed peak | main progress = duration | Ctrl+C preserves report"
+            ),
+            str::to_owned,
         ),
     };
     render_unified_dashboard(&dashboard, size, color)

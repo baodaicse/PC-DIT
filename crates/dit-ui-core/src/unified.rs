@@ -204,6 +204,12 @@ pub fn render_result_frame(
     {
         finished.progress_percent = Some(100.0);
     }
+    // The result's THROTTLE row (counted from the reports) replaces the live one.
+    if rows.iter().any(|row| row.starts_with("THROTTLE")) {
+        finished
+            .running_rows
+            .retain(|row| !row.starts_with("THROTTLE"));
+    }
     if !rows.is_empty() {
         finished.running_rows.push(String::new());
         finished.running_rows.extend(wrap_result_rows(rows, size));
@@ -769,6 +775,7 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
                 } else if line.contains("INVALID")
                     || line.contains("ABORTED")
                     || line.contains("TEMP LIMIT")
+                    || line.contains("! THROTTLE")
                 {
                     YELLOW
                 } else if line.contains("ENGINE")

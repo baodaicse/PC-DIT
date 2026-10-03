@@ -281,6 +281,7 @@ dependencies = [
  "dit-system",
  "dit-ui-core",
  "nix",
+ "nvme-inventory",
  "serde",
  "serde_json",
  "thiserror",

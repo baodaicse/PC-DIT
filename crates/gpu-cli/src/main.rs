@@ -6,7 +6,7 @@ use dit_system::{
 };
 use dit_ui_core::{
     DashboardMeter, HostSampler, InPlaceRenderer, LiveUtilization, SystemInfo, TerminalSize,
-    UnifiedDashboard, render_unified_dashboard,
+    ThrottleLive, UnifiedDashboard, render_unified_dashboard,
 };
 use gpu_engine::{
     FaultKind, MODULE_ID, run_generation,
@@ -686,6 +686,9 @@ struct GpuUiState {
     sweep_note: Option<String>,
     /// Verified rate per GEMM arithmetic (`--compute-mix`).
     mix_note: Option<String>,
+    /// Live THROTTLE row of the selected GPU and its footer alert after a new slowdown.
+    throttle_row: Option<String>,
+    throttle_alert: Option<String>,
     hardware_active: bool,
     selected: Option<VulkanDeviceInfo>,
     allocation_bytes: u64,
@@ -858,6 +861,8 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut renderer = use_ui.then(|| InPlaceRenderer::new(io::stdout().lock(), 4));
     let started = Instant::now();
     let mut last_telemetry = Instant::now();
+    let mut slowdown = dit_system::SlowdownCounter::default();
+    let mut throttle = ThrottleLive::default();
     let mut last_bottleneck_sample = Instant::now();
     let mut last_log_poll = Instant::now();
     let mut hardware_note: Option<String> = None;
@@ -1423,6 +1428,13 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         if last_telemetry.elapsed() >= Duration::from_secs(1) {
             telemetry = collect_gpu_telemetry(&devices);
             last_telemetry = Instant::now();
+            track_throttle(
+                &mut throttle,
+                &mut slowdown,
+                &telemetry,
+                selected.as_ref().and_then(|i| i.pci_address.as_deref()),
+                started.elapsed(),
+            );
             if let Some(limit) = args.temp_limit_celsius
                 && telemetry
                     .iter()
@@ -1483,6 +1495,8 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 false,
             );
             state.hardware_note.clone_from(&hardware_note);
+            state.throttle_row = throttle.row();
+            state.throttle_alert = throttle.alert().map(str::to_owned);
             state.sweep_note = vulkan
                 .as_ref()
                 .and_then(Backend::sweep_report)
@@ -1638,6 +1652,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             true,
         );
         state.hardware_note.clone_from(&hardware_note);
+        state.throttle_row = throttle.row();
         state.sweep_note = vulkan
             .as_ref()
             .and_then(Backend::sweep_report)
@@ -2466,6 +2481,8 @@ fn ui_state(
         hardware_note: None,
         sweep_note: None,
         mix_note: None,
+        throttle_row: None,
+        throttle_alert: None,
         hardware_active: selected.is_some(),
         selected,
         allocation_bytes,
@@ -2779,10 +2796,11 @@ fn render_gpu_ui(state: &GpuUiState, size: TerminalSize, color: bool) -> String 
                 .as_ref()
                 .map(|note| format!("HARDWARE      {note}")),
         )
+        .chain(state.throttle_row.clone())
         .collect(),
-        footer: format!(
-            "TEMP LIMIT {temp_policy} | Ctrl+C: stop, drain retention and preserve report"
-        ),
+        footer: state.throttle_alert.clone().unwrap_or_else(|| {
+            format!("TEMP LIMIT {temp_policy} | Ctrl+C: stop, drain retention and preserve report")
+        }),
     };
     render_unified_dashboard(&dashboard, size, color)
 }
@@ -3184,6 +3202,27 @@ fn render_gpu_compact(
     ];
     lines.truncate(usize::from(size.rows).saturating_sub(1).max(1));
     lines.join("\n")
+}
+
+/// The selected GPU's slowdowns since the run started, on the live THROTTLE row as `GPU1` (the
+/// name the result counts it under); N/A when the driver gives no throttle reasons.
+fn track_throttle(
+    live: &mut ThrottleLive,
+    counter: &mut dit_system::SlowdownCounter,
+    telemetry: &[GpuTelemetry],
+    pci: Option<&str>,
+    elapsed: Duration,
+) {
+    let Some(sample) = pci.and_then(|pci| telemetry.iter().find(|s| s.pci_address == pci)) else {
+        return;
+    };
+    let now = Instant::now();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let reading = sample.throttle_reasons_mask.map(|mask| {
+        counter.observe(mask, now);
+        (counter.episodes, Some(counter.seconds(now).round() as u64))
+    });
+    live.update("GPU1", reading, &format_duration(elapsed.as_secs()));
 }
 
 fn format_duration(seconds: u64) -> String {
@@ -4179,6 +4218,8 @@ mod tests {
             hardware_note: None,
             sweep_note: None,
             mix_note: None,
+            throttle_row: None,
+            throttle_alert: None,
             system: SystemInfo {
                 cpu: "CPU".to_owned(),
                 memory_total_bytes: 16 * 1024 * MIB,

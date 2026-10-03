@@ -518,6 +518,15 @@ fn run_session(
         layers::GpuEligibility::default()
     };
     telemetry.retain_gpus(&eligible.pci_addresses);
+    if let Some(plan) = storage.as_ref() {
+        telemetry.watch_ssds(
+            &plan
+                .devices
+                .iter()
+                .map(|device| (device.alias, device.block_name.clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
     let gpu_count = eligible.pci_addresses.len();
     let ssd_ready = storage
         .as_ref()
@@ -1671,10 +1680,14 @@ impl Session<'_> {
                         .sum(),
                 ),
                 self.ledger.hardware_line(),
-                self.ledger.throttle_line(),
+                // Live while the session runs; the result shows the ledger's, from the reports.
+                self.telemetry
+                    .throttle
+                    .row()
+                    .unwrap_or_else(|| self.ledger.throttle_line()),
             ],
             result_rows: Vec::new(),
-            footer: None,
+            footer: self.telemetry.throttle.alert().map(str::to_owned),
         }
     }
 
@@ -1693,6 +1706,13 @@ impl Session<'_> {
         view.phases_row = self.phases_row();
         self.current = current;
         "DONE".clone_into(&mut view.state);
+        if let Some(row) = view
+            .fault_rows
+            .iter_mut()
+            .find(|row| row.starts_with("THROTTLE"))
+        {
+            *row = self.ledger.throttle_line();
+        }
         view.result_rows = result_rows;
         view.footer = Some(footer.to_owned());
         let frame = render(&view, &self.telemetry, TerminalSize::current(), true);

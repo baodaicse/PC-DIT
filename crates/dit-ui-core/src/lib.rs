@@ -3,6 +3,8 @@
 mod dashboard;
 mod unified;
 
+mod throttle;
+pub use throttle::{THROTTLE_ALERT_FOR, ThrottleLive, throttle_count};
 pub use unified::{
     DashboardMeter, FINAL_FRAME_ENV, UnifiedDashboard, boxify, decorate, load_final_frame,
     render_result_frame, render_unified_dashboard, save_final_frame, wrap_result_rows,
@@ -340,6 +342,7 @@ pub struct UiState {
     live: LiveUtilization,
     duration_limit: Option<Duration>,
     session_seed: Option<u64>,
+    throttle: ThrottleLive,
 }
 
 impl UiState {
@@ -364,7 +367,20 @@ impl UiState {
             live: LiveUtilization::default(),
             duration_limit: None,
             session_seed: None,
+            throttle: ThrottleLive::default(),
         }
+    }
+
+    /// A device's throttling since the run started, for the live THROTTLE row and its alert.
+    pub fn update_throttle(&mut self, label: &str, reading: Option<(u64, Option<u64>)>) {
+        let seconds = self.started.elapsed().as_secs();
+        let clock = format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+        self.throttle.update(label, reading, &clock);
     }
 
     pub fn set_system_info(&mut self, system: SystemInfo) {

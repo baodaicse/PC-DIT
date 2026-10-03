@@ -6,7 +6,7 @@ use super::{
 use dit_contracts::Verdict;
 use dit_system::{GpuTelemetry, collect_gpu_inventory, collect_gpu_telemetry, format_gpu_summary};
 use dit_ui_core::{
-    DashboardMeter, InPlaceRenderer, PickerEntry, TerminalSize, UnifiedDashboard,
+    DashboardMeter, InPlaceRenderer, PickerEntry, TerminalSize, ThrottleLive, UnifiedDashboard,
     render_device_picker, render_unified_dashboard,
 };
 use serde::{Deserialize, Serialize};
@@ -426,6 +426,8 @@ fn run_multi(
     let pci_inventory = collect_gpu_inventory();
     let mut parent_telemetry = collect_gpu_telemetry(&pci_inventory);
     let mut last_parent_telemetry = Instant::now();
+    let mut slowdowns = vec![dit_system::SlowdownCounter::default(); selected.len()];
+    let mut throttle = ThrottleLive::default();
     let mut system = host.system_info();
     system.gpu = format_gpu_summary(&pci_inventory);
     let mut snapshots = selected.iter().map(initial_snapshot).collect::<Vec<_>>();
@@ -444,6 +446,13 @@ fn run_multi(
         if last_parent_telemetry.elapsed() >= Duration::from_secs(1) {
             parent_telemetry = collect_gpu_telemetry(&pci_inventory);
             last_parent_telemetry = Instant::now();
+            track_throttle(
+                &mut throttle,
+                &mut slowdowns,
+                &snapshots,
+                &parent_telemetry,
+                started.elapsed(),
+            );
         }
         merge_parent_telemetry(&mut snapshots, &parent_telemetry);
         if let Some(renderer) = renderer.as_mut() {
@@ -453,6 +462,7 @@ fn run_multi(
                 &snapshots,
                 started.elapsed(),
                 args,
+                &throttle,
                 TerminalSize::current(),
                 true,
             ))?;
@@ -512,6 +522,7 @@ fn run_multi(
             &snapshots,
             started.elapsed(),
             args,
+            &throttle,
             TerminalSize::current(),
             true,
         ))?;
@@ -651,13 +662,45 @@ fn aggregate_verdict(reports: &[DeviceReportView], missing: usize) -> Verdict {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Each selected GPU's slowdowns since the run started, on the live THROTTLE row as `GPU<n>` in
+/// selection order (the names the result counts them under).
+fn track_throttle(
+    live: &mut ThrottleLive,
+    counters: &mut [dit_system::SlowdownCounter],
+    devices: &[GpuProgressSnapshot],
+    telemetry: &[GpuTelemetry],
+    elapsed: Duration,
+) {
+    let now = Instant::now();
+    for (position, (device, counter)) in devices.iter().zip(counters.iter_mut()).enumerate() {
+        let Some(sample) = device
+            .pci_address
+            .as_deref()
+            .and_then(|pci| telemetry.iter().find(|s| s.pci_address == pci))
+        else {
+            continue;
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let reading = sample.throttle_reasons_mask.map(|mask| {
+            counter.observe(mask, now);
+            (counter.episodes, Some(counter.seconds(now).round() as u64))
+        });
+        live.update(
+            &format!("GPU{}", position + 1),
+            reading,
+            &format_duration(elapsed.as_secs()),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_multi_gpu_ui(
     system: &dit_ui_core::SystemInfo,
     live: &dit_ui_core::LiveUtilization,
     devices: &[GpuProgressSnapshot],
     elapsed: Duration,
     args: &RunArgs,
+    throttle: &ThrottleLive,
     size: TerminalSize,
     color: bool,
 ) -> String {
@@ -774,7 +817,7 @@ fn render_multi_gpu_ui(
         .iter()
         .map(|device| device.matrix_results_verified)
         .sum();
-    let running_rows = visible
+    let mut running_rows: Vec<String> = visible
         .iter()
         .map(|(position, device)| {
             format!(
@@ -820,9 +863,17 @@ fn render_multi_gpu_ui(
                     .to_owned(),
             calculations_completed: calculations,
             failures,
-            running_rows,
-            footer: "TEMP LIMIT default OFF | Ctrl+C drains workers and preserves all reports"
-                .to_owned(),
+            running_rows: {
+                running_rows.extend(throttle.row());
+                running_rows
+            },
+            footer: throttle.alert().map_or_else(
+                || {
+                    "TEMP LIMIT default OFF | Ctrl+C drains workers and preserves all reports"
+                        .to_owned()
+                },
+                str::to_owned,
+            ),
         },
         size,
         color,
@@ -1226,6 +1277,7 @@ mod tests {
                 &snapshots,
                 Duration::from_secs(10),
                 &args,
+                &ThrottleLive::default(),
                 TerminalSize {
                     rows: 40,
                     cols: 140,

@@ -7,7 +7,7 @@ use super::combined_view::{format_bytes, format_duration};
 use dit_system::LiveSensorSampler;
 use dit_ui_core::{
     DashboardMeter, HostSampler, InPlaceRenderer, LiveUtilization, SystemInfo, TerminalSize,
-    UnifiedDashboard, render_unified_dashboard,
+    ThrottleLive, UnifiedDashboard, render_unified_dashboard,
 };
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -215,6 +215,8 @@ struct Frame<'a> {
     live: &'a LiveUtilization,
     memory: (u64, u64, u64),
     now_unix: u64,
+    /// The CPU's thermal throttling since the view started, and its footer alert.
+    throttle: &'a ThrottleLive,
 }
 
 fn dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
@@ -479,10 +481,17 @@ fn power_dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
 
 /// The screen of the view's mode.
 fn model(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
-    match frame.args.mode {
+    let mut model = match frame.args.mode {
         ViewMode::CpuRam => dashboard(frame, progress),
         ViewMode::Power => power_dashboard(frame, progress),
+    };
+    if let Some(row) = frame.throttle.row() {
+        model.running_rows.push(row);
     }
+    if let Some(alert) = frame.throttle.alert() {
+        alert.clone_into(&mut model.footer);
+    }
+    model
 }
 
 /// Whether `pid` still runs (a zombie waiting for its parent counts as gone).
@@ -511,6 +520,8 @@ pub fn command(args: &CpuRamViewArgs) -> io::Result<()> {
     let mut live = LiveUtilization::default();
     let mut last_sensor: Option<Instant> = None;
     let (mut temperature, mut power) = (None, None);
+    let mut throttle = ThrottleLive::default();
+    let mut throttle_start = None;
     loop {
         let alive = running(args.pid);
         progress.follow(&args.log);
@@ -525,6 +536,16 @@ pub fn command(args: &CpuRamViewArgs) -> io::Result<()> {
                     .preferred_cpu_power()
                     .map(|reading| reading.milliwatts as f64 / 1000.0);
             }
+            let start = throttle_start.get_or_insert_with(|| snapshot.throttle_groups.clone());
+            let since_start = dit_system::throttle_delta(start, &snapshot.throttle_groups)
+                .map(|delta| (delta.events, delta.longest_ms.map(|ms| ms / 1000)));
+            let clock = format_duration(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+                    .saturating_sub(args.started_unix),
+            );
+            throttle.update("CPU", since_start, &clock);
             last_sensor = Some(Instant::now());
         }
         live = {
@@ -545,6 +566,7 @@ pub fn command(args: &CpuRamViewArgs) -> io::Result<()> {
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            throttle: &throttle,
         };
         let text =
             render_unified_dashboard(&model(&frame, &progress), TerminalSize::current(), true);
@@ -605,6 +627,7 @@ mod tests {
         args.title = "UNIFIED POWER CAMPAIGN".into();
         let system = SystemInfo::default();
         let live = LiveUtilization::default();
+        let throttle = ThrottleLive::default();
         let frame = Frame {
             args: &args,
             system: &system,
@@ -612,6 +635,7 @@ mod tests {
             live: &live,
             memory: (32 << 30, 16 << 30, 4 << 30),
             now_unix: 2000,
+            throttle: &throttle,
         };
         let text = render_unified_dashboard(
             &model(&frame, &progress),
@@ -637,6 +661,41 @@ mod tests {
         }
     }
 
+    /// The live THROTTLE row closes the running rows; a new throttle event takes the footer.
+    #[test]
+    fn the_cpu_throttle_shows_live_with_a_footer_alert() {
+        let progress = Progress::default();
+        let args = args();
+        let system = SystemInfo::default();
+        let live = LiveUtilization::default();
+        let screen = |throttle: &ThrottleLive| {
+            model(
+                &Frame {
+                    args: &args,
+                    system: &system,
+                    numa: 1,
+                    live: &live,
+                    memory: (32 << 30, 16 << 30, 4 << 30),
+                    now_unix: 2000,
+                    throttle,
+                },
+                &progress,
+            )
+        };
+        let mut throttle = ThrottleLive::default();
+        throttle.update("CPU", Some((0, Some(0))), "00:00:01");
+        let quiet = screen(&throttle);
+        assert_eq!(quiet.running_rows.last().unwrap(), "THROTTLE      CPU 0");
+        assert!(quiet.footer.starts_with("TEMP LIMIT"));
+        throttle.update("CPU", Some((1, Some(3))), "00:01:10");
+        let alerted = screen(&throttle);
+        assert_eq!(
+            alerted.running_rows.last().unwrap(),
+            "THROTTLE      CPU 1 (3 s)"
+        );
+        assert!(alerted.footer.starts_with("! THROTTLE CPU +1 at 00:01:10"));
+    }
+
     #[test]
     fn the_running_screen_is_the_shared_dashboard_with_the_cpu_ram_rows() {
         let mut progress = Progress::default();
@@ -650,6 +709,7 @@ mod tests {
             ..SystemInfo::default()
         };
         let live = LiveUtilization::default();
+        let throttle = ThrottleLive::default();
         let frame = Frame {
             args: &args,
             system: &system,
@@ -657,6 +717,7 @@ mod tests {
             live: &live,
             memory: (32 << 30, 16 << 30, 4 << 30),
             now_unix: 2000,
+            throttle: &throttle,
         };
         let text = render_unified_dashboard(
             &dashboard(&frame, &progress),

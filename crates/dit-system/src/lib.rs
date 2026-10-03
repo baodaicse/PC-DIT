@@ -22,7 +22,8 @@ pub use compute_oracle::{
 pub use engine::{SeedSource, SystemRunConfig, run_system};
 pub use error::SystemDitError;
 pub use gpu::{
-    GpuDevice, GpuTelemetry, collect_gpu_inventory, collect_gpu_telemetry, format_gpu_summary,
+    GpuDevice, GpuTelemetry, SLOWDOWN_MASK, SlowdownCounter, collect_gpu_inventory,
+    collect_gpu_telemetry, format_gpu_summary,
 };
 pub use inventory::{CpuInventory, CpuThread, MemoryInventory, NumaNode, SystemInventory};
 pub use memory::{LockPolicy, MemoryTarget};

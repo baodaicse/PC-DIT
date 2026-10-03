@@ -269,20 +269,9 @@ impl Throttle {
         }
     }
 
-    /// `3 (42 s)`, `3 (2 min 05 s)`, or the bare count without a time.
+    /// `3 (42 s)`, `3 (2 min 05 s)`, or the bare count without a time, as the live row shows it.
     fn shown(self) -> String {
-        match self.seconds {
-            Some(seconds) if self.events > 0 && seconds >= 60 => {
-                format!(
-                    "{} ({} min {:02} s)",
-                    self.events,
-                    seconds / 60,
-                    seconds % 60
-                )
-            }
-            Some(seconds) if self.events > 0 => format!("{} ({seconds} s)", self.events),
-            _ => self.events.to_string(),
-        }
+        dit_ui_core::throttle_count(self.events, self.seconds)
     }
 }
 

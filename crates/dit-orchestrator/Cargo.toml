@@ -11,6 +11,7 @@ ctrlc.workspace = true
 dit-contracts = { path = "../dit-contracts" }
 dit-system = { path = "../dit-system" }
 dit-ui-core = { path = "../dit-ui-core" }
+nvme-inventory = { path = "../nvme-inventory" }
 nix = { workspace = true, features = ["signal"] }
 serde.workspace = true
 serde_json.workspace = true

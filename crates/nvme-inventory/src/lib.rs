@@ -707,6 +707,31 @@ fn build_stable_id(
     )
 }
 
+/// Thermal management entries (levels 1 and 2) and the seconds spent there between two SMART
+/// readings: the drive's own throttling. `None` when the drive does not report it.
+#[must_use]
+pub fn thermal_throttle_between(
+    start: &SmartSnapshot,
+    now: &SmartSnapshot,
+) -> Option<(u64, Option<u64>)> {
+    now.thermal_level1_transitions?;
+    let grew = |field: fn(&SmartSnapshot) -> Option<u64>| {
+        field(now)
+            .unwrap_or(0)
+            .saturating_sub(field(start).unwrap_or(0))
+    };
+    Some((
+        grew(|s| s.thermal_level1_transitions) + grew(|s| s.thermal_level2_transitions),
+        Some(grew(|s| s.thermal_level1_seconds) + grew(|s| s.thermal_level2_seconds)),
+    ))
+}
+
+/// One SMART reading of `device` with `nvme smart-log`, for a live screen.
+#[must_use]
+pub fn read_smart(device: &Path) -> SmartSnapshot {
+    collect_smart(Path::new("nvme"), device)
+}
+
 fn collect_smart(program: &Path, device: &Path) -> SmartSnapshot {
     let output = match Command::new(program)
         .args(["smart-log", &device.to_string_lossy(), "-o", "json"])
@@ -981,6 +1006,27 @@ mod tests {
         assert_eq!(smart.thermal_level1_transitions, Some(2));
         assert_eq!(smart.thermal_level1_seconds, Some(40));
         assert_eq!(smart.thermal_level2_transitions, None);
+    }
+
+    /// The drive's throttling is the growth of its thermal management counters; a drive that
+    /// does not report them reads `None`.
+    #[test]
+    fn thermal_throttle_is_the_growth_of_the_thermal_management_counters() {
+        let smart = |transitions: Option<u64>, seconds: u64| SmartSnapshot {
+            thermal_level1_transitions: transitions,
+            thermal_level2_transitions: Some(1),
+            thermal_level1_seconds: Some(seconds),
+            thermal_level2_seconds: Some(5),
+            ..SmartSnapshot::default()
+        };
+        assert_eq!(
+            thermal_throttle_between(&smart(Some(4), 100), &smart(Some(7), 160)),
+            Some((3, Some(60)))
+        );
+        assert_eq!(
+            thermal_throttle_between(&smart(None, 0), &smart(None, 0)),
+            None
+        );
     }
 
     #[test]
