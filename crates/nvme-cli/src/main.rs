@@ -839,9 +839,11 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
         args.reserve_free_mib,
         None,
     )?;
-    level_rows.push(
-        "           Writes stop at the level; the test then re-reads and re-verifies what it wrote until the time is up. Only new test files are used.".to_owned(),
-    );
+    level_rows.extend([
+        "           Writes stop at the level; the test then re-reads and re-verifies what it wrote"
+            .to_owned(),
+        "           until the time is up. Only new test files are used.".to_owned(),
+    ]);
     let default_minutes = args.duration_seconds.max(60) / 60;
     print!("\x1b[H\x1b[2J");
     println!(
@@ -1268,7 +1270,8 @@ fn room_rows(ssds: &[SsdRoom]) -> Vec<String> {
                 .file_name()
                 .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
             let detail = if let Some(reason) = &room.refused {
-                format!("not used: {reason}")
+                // The reason without its parenthesis, so the row fits a 128-column console.
+                format!("not used: {}", reason.split(" (").next().unwrap_or(reason))
             } else if let Some(free) = room.free_bytes {
                 let leftovers = if room.leftover_bytes > 0 {
                     format!(
@@ -3039,7 +3042,7 @@ mod tests {
     #[test]
     fn the_free_space_rows_mark_the_test_volume() {
         let mut efi = volume("/dev/nvme1n1p1", 1, None);
-        efi.refused = Some("not an ordinary data partition".into());
+        efi.refused = Some("not an ordinary data partition (boot/recovery types excluded)".into());
         let mut data = volume("/dev/nvme1n1p3", 400, Some(120));
         data.leftover_bytes = 12 << 30;
         let rows = room_rows(&[ssd(
@@ -3047,7 +3050,7 @@ mod tests {
             vec![efi, volume("/dev/nvme1n1p2", 500, Some(20)), data],
         )]);
         assert!(rows[1].starts_with("[1] /dev/nvme1n1  Fixture SSD"));
-        assert!(rows[2].contains("nvme1n1p1") && rows[2].contains("not used: not an ordinary"));
+        assert!(rows[2].ends_with("not used: not an ordinary data partition"));
         assert!(rows[3].contains("free   20.0 GiB") && !rows[3].contains("TEST VOLUME"));
         assert!(
             rows[4].contains("free  120.0 GiB (incl. 12.0 GiB old DIT files)   <- TEST VOLUME")
