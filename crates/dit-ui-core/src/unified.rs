@@ -498,6 +498,10 @@ fn part_colors(line: &str) -> Vec<Option<&'static str>> {
             color_range(from, to, state_badge(&word));
         }
     }
+    // A throttle alert (footer) opens with a warning badge.
+    if let Some(at) = find_chars(&chars, "! THROTTLE") {
+        color_range(at, at + "! THROTTLE".len(), BADGE_WARN);
+    }
     if let Some(at) = find_chars(&chars, "FAIL BY PART") {
         for (from, to) in segments(at + "FAIL BY PART".len()) {
             let text: String = chars[from..to].iter().collect();
@@ -1099,6 +1103,18 @@ mod tests {
         );
         assert!(painted.contains(&format!("{GRAY}SSD1 N/A")), "{painted:?}");
         assert!(!painted.contains(&format!("{YELLOW}CPU 0")), "{painted:?}");
+    }
+
+    /// A throttle alert opens with a warning badge and stays yellow after it.
+    #[test]
+    fn a_throttle_alert_opens_with_a_badge() {
+        let line = "| ! THROTTLE CPU +1 at 00:12:31 - it slowed itself down |".to_owned();
+        let painted = paint(&[line], 0, "", false);
+        assert!(
+            painted.contains(&format!("{BADGE_WARN}! THROTTLE")),
+            "{painted:?}"
+        );
+        assert!(painted.contains(&format!("{YELLOW} CPU +1")), "{painted:?}");
     }
 
     /// The result frame of a pass shows the progress complete; any other verdict keeps the
