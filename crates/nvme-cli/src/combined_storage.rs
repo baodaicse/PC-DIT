@@ -6,10 +6,10 @@
 //! Ctrl+C meant for the tests must not unmount their directories) and releases everything only
 //! on SIGTERM or when its parent disappears.
 use super::{
-    FS_SYNC_PERIOD, InventoryFlags, WriteLevel, auto_storage, automatic_plans, mib,
-    parse_selection, parse_write_level, picker_entries, prepare_offering_repair,
-    read_operator_line, render_picker, revalidate, scan, scan_options, scan_releasing_stale,
-    write_selection_file, write_setup_outcome,
+    FS_SYNC_PERIOD, InventoryFlags, WriteLevel, ask_write_level, auto_storage, automatic_plans,
+    mib, parse_selection, picker_entries, prepare_offering_repair, read_operator_line,
+    render_picker, revalidate, room_rows, rooms_of, scan, scan_options, scan_releasing_stale,
+    survey_selection, write_level_rows, write_selection_file, write_setup_outcome,
 };
 use dit_ui_core::TerminalSize;
 use serde::Serialize;
@@ -154,23 +154,27 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
         return Ok(ExitCode::SUCCESS);
     }
     let selection = parse_selection(&inventory, request.trim())?;
+    let ssds = survey_selection(&inventory, &selection, &args.flags)?;
+    let (mut level_rows, fits) = write_level_rows(
+        &ssds,
+        args.capacity_mib,
+        args.write_budget_mib,
+        args.reserve_free_mib,
+        None,
+    )?;
+    level_rows.push(
+        "           The data chain writes its records once on the first SSD: 16 GiB (Standard/Heavy) or 4 GiB (Light).".to_owned(),
+    );
+    print!("\x1b[H\x1b[2J");
     println!(
         "{}",
         dit_ui_core::decorate(&dit_ui_core::option_screen(
             "DIT COMBINED STRESS // SSD WRITE LEVEL",
-            &[vec![
-                format!(
-                    "WRITE      L) Light {} MiB (default)   S) Standard {} MiB   H) Heavy {} MiB  (per SSD)",
-                    args.write_budget_mib,
-                    WriteLevel::Standard.budget_for(args.write_budget_mib),
-                    WriteLevel::Heavy.budget_for(args.write_budget_mib)
-                ),
-                "           The data chain writes its records once on the first SSD: 16 GiB (Standard/Heavy) or 4 GiB (Light).".to_owned(),
-            ]],
+            &[room_rows(&ssds), level_rows],
             TerminalSize::current(),
         ))
     );
-    let level = parse_write_level(&prompt("Write level [L] > ")?);
+    let level = ask_write_level(&fits)?;
     let capacity_mib = level.capacity_for(args.capacity_mib, args.write_budget_mib);
     let write_budget_mib = level.budget_for(args.write_budget_mib);
     let chain_working_set_mib = if level == WriteLevel::Light {
@@ -178,13 +182,15 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
     } else {
         CHAIN_WORKING_SET_MIB
     };
-    let required = mib(capacity_mib.min(write_budget_mib))?
-        .checked_add(mib(args.reserve_free_mib)?)
-        .ok_or("free-space requirement overflow")?;
-    let chain_required = required
-        .checked_add(mib(chain_working_set_mib + CHAIN_RESERVE_MIB)?)
-        .ok_or("free-space requirement overflow")?;
-    let mut plans = automatic_plans(&inventory, &selection, &args.flags, required)?;
+    let need = auto_storage::Need {
+        allocation: mib(capacity_mib.min(write_budget_mib))?,
+        reserve: mib(args.reserve_free_mib)?,
+    };
+    let chain_need = auto_storage::Need {
+        allocation: need.allocation + mib(chain_working_set_mib)?,
+        reserve: need.reserve + mib(CHAIN_RESERVE_MIB)?,
+    };
+    let mut plans = automatic_plans(&inventory, &selection, &args.flags, need, &ssds)?;
     // The first SSD also carries the chain: prefer a volume with room for both.
     let mut chain_note = None;
     if let Some(first) = selection.devices.first() {
@@ -193,7 +199,12 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
             .iter()
             .find(|device| device.stable_id == first.stable_id)
             .ok_or("selected SSD disappeared")?;
-        match auto_storage::plan(device, &args.flags.protected_devices, chain_required) {
+        match auto_storage::plan(
+            device,
+            &args.flags.protected_devices,
+            chain_need,
+            rooms_of(&ssds, &device.stable_id),
+        ) {
             Ok(mut plan) => {
                 plan.alias = first.display_index;
                 plans[0] = plan;
@@ -224,12 +235,12 @@ pub(super) fn command(args: &CombinedStorageArgs) -> Result<ExitCode, Box<dyn st
     let mut devices = Vec::with_capacity(plans.len());
     for (position, plan) in plans.iter().enumerate() {
         println!("Preparing [{}] {} ...", plan.alias, plan.node.display());
-        let need = if position == 0 && chain_note.is_none() {
-            chain_required
+        let required = if position == 0 && chain_note.is_none() {
+            chain_need.on(plan.capacity_bytes)
         } else {
-            required
+            need.on(plan.capacity_bytes)
         };
-        match prepare_offering_repair(&mut areas, plan, &session, need) {
+        match prepare_offering_repair(&mut areas, plan, &session, required) {
             Ok(directory) => {
                 let selected = selection
                     .devices

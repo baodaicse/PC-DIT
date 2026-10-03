@@ -339,12 +339,193 @@ fn volume_allowed(block: &Block) -> Result<()> {
     Ok(())
 }
 
-pub fn plan(device: &NvmeDevice, protected: &[PathBuf], required: u64) -> Result<VolumePlan> {
-    guard_namespace(device, protected)?;
-    choose_volume(device, &block_tree(&device.device_node)?, required)
+/// What a test needs on a volume: the bytes it allocates and the free space it must leave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Need {
+    pub allocation: u64,
+    pub reserve: u64,
 }
 
-fn choose_volume(device: &NvmeDevice, tree: &Block, required: u64) -> Result<VolumePlan> {
+impl Need {
+    /// Free bytes a volume of `size` bytes must have: the allocation plus a reserve of at least
+    /// 1 % of the volume. A large volume is never filled to its last gigabytes: the filesystem
+    /// needs room for its own metadata, and NTFS and ext4 fragment and slow down when nearly full.
+    #[must_use]
+    pub fn on(self, size: u64) -> u64 {
+        self.allocation.saturating_add(self.reserve.max(size / 100))
+    }
+}
+
+/// One volume of an SSD with the room a test has on it, for the write-level screen and the
+/// choice of the test volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeRoom {
+    pub node: PathBuf,
+    pub filesystem: String,
+    pub size_bytes: u64,
+    /// What a test could fill: the free space plus `leftover_bytes`. `None` when not measured.
+    pub free_bytes: Option<u64>,
+    /// Files of interrupted tests, which preparation removes before it checks the space.
+    pub leftover_bytes: u64,
+    /// Why no test uses this volume (boot partition, unsupported filesystem, ...).
+    pub refused: Option<String>,
+    /// Why the free space of a usable volume could not be measured.
+    pub note: Option<String>,
+}
+
+/// Each volume of `device` and the room a test has on it. Volumes a test may use are measured
+/// read-only: a mounted one through its mount, any other mounted read-only on a private directory
+/// (ext4 without replaying its journal) and unmounted at once. Nothing is written.
+///
+/// # Errors
+///
+/// Fails when the SSD itself may not be tested (system, boot or results media, holders).
+pub fn survey(device: &NvmeDevice, protected: &[PathBuf]) -> Result<Vec<VolumeRoom>> {
+    guard_namespace(device, protected)?;
+    let tree = block_tree(&device.device_node)?;
+    refuse_dit_media(&tree)?;
+    Ok(volumes(device, &tree)
+        .into_iter()
+        .map(|block| {
+            let mut room = VolumeRoom {
+                node: block.name.clone(),
+                filesystem: block.fstype.clone().unwrap_or_default(),
+                size_bytes: block.size,
+                free_bytes: None,
+                leftover_bytes: 0,
+                refused: None,
+                note: None,
+            };
+            let measured = match eligible(device, block) {
+                Err(error) => {
+                    room.refused = Some(error.to_string());
+                    return room;
+                }
+                Ok((_, mounts)) => match mounts.first().map(Path::new) {
+                    Some(mount) if protected_mount(mount) => {
+                        room.refused = Some("protected mount".into());
+                        return room;
+                    }
+                    Some(mount) => measure_mounted(mount),
+                    None => measure_unmounted(block),
+                },
+            };
+            match measured {
+                Ok((free, leftovers)) => {
+                    room.free_bytes = Some(free.saturating_add(leftovers));
+                    room.leftover_bytes = leftovers;
+                }
+                Err(error) => room.note = Some(error.to_string()),
+            }
+            room
+        })
+        .collect())
+}
+
+/// Free space and interrupted-test files of a volume mounted elsewhere.
+fn measure_mounted(mount: &Path) -> Result<(u64, u64)> {
+    let device = mount.metadata()?.dev();
+    Ok((
+        fs2::available_space(mount)?,
+        stale_bytes(mount, device, boot_time()),
+    ))
+}
+
+/// Free space and interrupted-test files of an unmounted volume: mounted read-only on a private
+/// directory (ext4 with `noload`, so its journal is not replayed), measured, unmounted.
+fn measure_unmounted(block: &Block) -> Result<(u64, u64)> {
+    let (filesystem, options) = match block.fstype.as_deref() {
+        Some("ntfs") => ("ntfs3", "ro,nosuid,nodev,noexec"),
+        Some("ext4") => ("ext4", "ro,noload,nosuid,nodev,noexec"),
+        Some(other) => (other, "ro,nosuid,nodev,noexec"),
+        None => return Err("no filesystem".into()),
+    };
+    let device = block.name.metadata()?.rdev();
+    let name = block
+        .name
+        .file_name()
+        .ok_or("volume without a name")?
+        .to_string_lossy()
+        .into_owned();
+    let mount = PathBuf::from(format!(
+        "{MOUNT_PREFIX}measure-{}-{name}",
+        std::process::id()
+    ));
+    DirBuilder::new().mode(0o700).create(&mount)?;
+    let mounted = output(
+        "mount",
+        &[
+            "-t".as_ref(),
+            filesystem.as_ref(),
+            "-o".as_ref(),
+            options.as_ref(),
+            "--".as_ref(),
+            block.name.as_os_str(),
+            mount.as_os_str(),
+        ],
+    );
+    let measured = if mount.metadata().is_ok_and(|meta| meta.dev() == device) {
+        let measured = fs2::available_space(&mount)
+            .map(|free| (free, stale_bytes(&mount, device, boot_time())))
+            .map_err(Into::into);
+        output("umount", &["--".as_ref(), mount.as_os_str()]).map_err(|error| {
+            format!(
+                "the read-only measuring mount {} could not be unmounted: {error}",
+                mount.display()
+            )
+        })?;
+        measured
+    } else {
+        Err(mounted
+            .err()
+            .unwrap_or_else(|| "read-only mount did not map to the volume".into()))
+    };
+    let _ = fs::remove_dir(&mount);
+    measured
+}
+
+/// Bytes the files of interrupted tests take at the top of `mount`: what [`remove_stale`] frees.
+fn stale_bytes(mount: &Path, device: u64, boot: Option<u64>) -> u64 {
+    let Ok(entries) = fs::read_dir(mount) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            entry
+                .path()
+                .symlink_metadata()
+                .is_ok_and(|meta| is_stale(&name, &meta, device, boot))
+        })
+        .filter_map(|entry| fs::read_dir(entry.path()).ok())
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|file| {
+            let name = file.file_name().to_string_lossy().into_owned();
+            file.path()
+                .symlink_metadata()
+                .ok()
+                .filter(|meta| meta.is_file() && meta.dev() == device && is_test_file(&name))
+        })
+        .map(|meta| meta.blocks() * 512)
+        .sum()
+}
+
+/// Picks the test volume of `device` for a test that needs `need`. With `rooms` (the
+/// [`survey`] of this SSD) the volume with the most room is taken and any without enough is
+/// refused before anything is mounted; without, the largest volume, as before measuring.
+pub fn plan(
+    device: &NvmeDevice,
+    protected: &[PathBuf],
+    need: Need,
+    rooms: &[VolumeRoom],
+) -> Result<VolumePlan> {
+    guard_namespace(device, protected)?;
+    choose_volume(device, &block_tree(&device.device_node)?, need, rooms)
+}
+
+fn refuse_dit_media(tree: &Block) -> Result<()> {
     if tree.ro
         || std::iter::once(tree).chain(&tree.children).any(|block| {
             block.label.as_deref().is_some_and(|label| {
@@ -355,31 +536,72 @@ fn choose_volume(device: &NvmeDevice, tree: &Block, required: u64) -> Result<Vol
     {
         return Err("read-only disk or disk containing DIT boot/results media".into());
     }
-    let mut candidates = Vec::new();
-    let mut rejected = Vec::new();
-    let blocks: Vec<&Block> = if device.partition_details.is_empty() {
+    Ok(())
+}
+
+/// The volumes of an SSD: its partitions, or the whole namespace when it has none.
+fn volumes<'a>(device: &NvmeDevice, tree: &'a Block) -> Vec<&'a Block> {
+    if device.partition_details.is_empty() {
         vec![tree]
     } else {
         tree.children.iter().collect()
-    };
-    for block in blocks {
+    }
+}
+
+/// A volume a test may use: its stable identity and current mount points.
+fn eligible<'a>(device: &'a NvmeDevice, block: &Block) -> Result<(&'a DeviceId, &'a [String])> {
+    volume_allowed(block)?;
+    if block.name == device.device_node && device.partitions.is_empty() {
+        return Ok((&device.stable_id, &device.mount_points));
+    }
+    let part = device
+        .partition_details
+        .iter()
+        .find(|part| part.device_node == block.name)
+        .ok_or("partition is not in the selected inventory")?;
+    if part.active_swap || !part.holders.is_empty() {
+        return Err("active swap or block holders".into());
+    }
+    Ok((&part.stable_id, &part.mount_points))
+}
+
+/// Bytes as GiB with one decimal, as the setup screens show sizes.
+#[must_use]
+pub fn gib(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let value = bytes as f64 / f64::from(1u32 << 30);
+    format!("{value:.1} GiB")
+}
+
+fn choose_volume(
+    device: &NvmeDevice,
+    tree: &Block,
+    need: Need,
+    rooms: &[VolumeRoom],
+) -> Result<VolumePlan> {
+    refuse_dit_media(tree)?;
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+    for block in volumes(device, tree) {
+        let required = need.on(block.size);
+        let free = rooms
+            .iter()
+            .find(|room| room.node == block.name)
+            .and_then(|room| room.free_bytes);
         let attempt = (|| -> Result<VolumePlan> {
-            volume_allowed(block)?;
-            let (id, mounts) = if block.name == device.device_node && device.partitions.is_empty() {
-                (&device.stable_id, &device.mount_points)
-            } else {
-                let part = device
-                    .partition_details
-                    .iter()
-                    .find(|part| part.device_node == block.name)
-                    .ok_or("partition is not in the selected inventory")?;
-                if part.active_swap || !part.holders.is_empty() {
-                    return Err("active swap or block holders".into());
-                }
-                (&part.stable_id, &part.mount_points)
-            };
+            let (id, mounts) = eligible(device, block)?;
             if block.size < required {
                 return Err("volume capacity is below test budget plus free-space reserve".into());
+            }
+            if let Some(free) = free
+                && free < required
+            {
+                return Err(format!(
+                    "{} free, the test needs {} including the reserve",
+                    gib(free),
+                    gib(required)
+                )
+                .into());
             }
             let existing_mount = mounts.first().map(PathBuf::from);
             if let Some(mount) = &existing_mount
@@ -399,18 +621,20 @@ fn choose_volume(device: &NvmeDevice, tree: &Block, required: u64) -> Result<Vol
             })
         })();
         match attempt {
-            Ok(candidate) => candidates.push(candidate),
+            Ok(candidate) => candidates.push((free, candidate)),
             Err(error) => rejected.push(format!("{}: {error}", block.name.display())),
         }
     }
-    candidates.sort_by(|a, b| {
-        b.capacity_bytes
-            .cmp(&a.capacity_bytes)
+    // The most room first (a measured volume before an unmeasured one), then the largest.
+    candidates.sort_by(|(free_a, a), (free_b, b)| {
+        free_b
+            .cmp(free_a)
+            .then(b.capacity_bytes.cmp(&a.capacity_bytes))
             .then(a.node.cmp(&b.node))
     });
-    candidates.into_iter().next().ok_or_else(|| {
+    candidates.into_iter().next().map(|(_, candidate)| candidate).ok_or_else(|| {
         format!(
-            "No safe test filesystem on {}. {}. No partition will be created or formatted",
+            "No safe test filesystem with enough room on {}. {}. No partition will be created or formatted",
             device.device_node.display(),
             rejected.join("; ")
         )
@@ -1170,6 +1394,60 @@ mod tests {
         }
     }
 
+    fn need(allocation: u64) -> Need {
+        Need {
+            allocation,
+            reserve: 0,
+        }
+    }
+
+    fn room(node: &str, free: Option<u64>) -> VolumeRoom {
+        VolumeRoom {
+            node: node.into(),
+            filesystem: "ext4".into(),
+            size_bytes: 0,
+            free_bytes: free,
+            leftover_bytes: 0,
+            refused: None,
+            note: None,
+        }
+    }
+
+    /// The reserve is the larger of the base and 1 % of the volume.
+    #[test]
+    fn the_reserve_grows_with_the_volume() {
+        let need = Need {
+            allocation: 16 << 30,
+            reserve: 4 << 30,
+        };
+        assert_eq!(need.on(100 << 30), 20 << 30);
+        assert_eq!(need.on(2000 << 30), (16 << 30) + (20 << 30));
+    }
+
+    /// Measured, the volume with the most room is the test volume, whatever its size, and a
+    /// volume without enough room is refused before anything is mounted.
+    #[test]
+    fn the_volume_with_the_most_room_is_chosen() {
+        let mut disk = device();
+        let mut tree = block();
+        add_partition(&mut disk, &mut tree, "1", 20_000);
+        add_partition(&mut disk, &mut tree, "2", 40_000);
+        let rooms = [
+            room("/dev/nvme9n1p1", Some(15_000)),
+            room("/dev/nvme9n1p2", Some(3_000)),
+        ];
+        let plan = choose_volume(&disk, &tree, need(10_000), &rooms).unwrap();
+        assert_eq!(plan.node, Path::new("/dev/nvme9n1p1"));
+        let error = choose_volume(&disk, &tree, need(16_000), &rooms).unwrap_err();
+        assert!(
+            error.to_string().contains("free, the test needs"),
+            "{error}"
+        );
+        // Unmeasured, the largest volume as before.
+        let plan = choose_volume(&disk, &tree, need(10_000), &[]).unwrap();
+        assert_eq!(plan.node, Path::new("/dev/nvme9n1p2"));
+    }
+
     fn block() -> Block {
         Block {
             name: "/dev/nvme9n1".into(),
@@ -1288,14 +1566,17 @@ mod tests {
         add_partition(&mut disk, &mut tree, "2", 40_000);
         add_partition(&mut disk, &mut tree, "3", 90_000);
         tree.children[2].parttype = Some("de94bba4-06d1-4d40-a16a-bfd50179d6ac".into());
-        let plan = choose_volume(&disk, &tree, 10_000).unwrap();
+        let plan = choose_volume(&disk, &tree, need(10_000), &[]).unwrap();
         assert_eq!(plan.node, Path::new("/dev/nvme9n1p2"));
         assert_eq!(plan.target_id, DeviceId("partition-2".into()));
         tree.children.reverse();
-        assert_eq!(choose_volume(&disk, &tree, 10_000).unwrap(), plan);
-        assert!(choose_volume(&disk, &tree, 99_000).is_err());
+        assert_eq!(
+            choose_volume(&disk, &tree, need(10_000), &[]).unwrap(),
+            plan
+        );
+        assert!(choose_volume(&disk, &tree, need(99_000), &[]).is_err());
         disk.partition_details.clear();
-        assert!(choose_volume(&disk, &tree, 10_000).is_err());
+        assert!(choose_volume(&disk, &tree, need(10_000), &[]).is_err());
     }
 
     #[test]
@@ -1305,12 +1586,12 @@ mod tests {
         add_partition(&mut disk, &mut tree, "1", 20_000);
         add_partition(&mut disk, &mut tree, "2", 40_000);
         tree.children[0].label = Some("DIT-RESULTS".into());
-        assert!(choose_volume(&disk, &tree, 10_000).is_err());
+        assert!(choose_volume(&disk, &tree, need(10_000), &[]).is_err());
     }
 
     #[test]
     fn changed_uuid_or_type_is_refused_before_mount() {
-        let plan = choose_volume(&device(), &block(), 10_000).unwrap();
+        let plan = choose_volume(&device(), &block(), need(10_000), &[]).unwrap();
         assert!(verify_signature(&plan, "UUID=fixture-uuid\nTYPE=ext4\n").is_ok());
         assert!(verify_signature(&plan, "UUID=changed\nTYPE=ext4\n").is_err());
         assert!(verify_signature(&plan, "UUID=fixture-uuid\nTYPE=ntfs\n").is_err());

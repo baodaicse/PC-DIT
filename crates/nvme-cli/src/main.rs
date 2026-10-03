@@ -563,12 +563,11 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::AutoPlan(args) => {
             let inventory = scan(&scan_options(&args.flags))?;
             let selection = parse_selection(&inventory, &args.devices)?;
-            let plans = automatic_plans(
-                &inventory,
-                &selection,
-                &args.flags,
-                mib(args.required_free_mib)?,
-            )?;
+            let need = auto_storage::Need {
+                allocation: mib(args.required_free_mib)?,
+                reserve: 0,
+            };
+            let plans = automatic_plans(&inventory, &selection, &args.flags, need, &[])?;
             println!("{}", serde_json::to_string_pretty(&plans)?);
             Ok(ExitCode::SUCCESS)
         }
@@ -831,28 +830,30 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     let request = read_operator_line()?;
     let selection = parse_selection(&inventory, request.trim())?;
 
+    let ssds = survey_selection(&inventory, &selection, &args.flags)?;
+    let (mut level_rows, fits) = write_level_rows(
+        &ssds,
+        args.capacity_mib,
+        args.write_budget_mib,
+        args.reserve_free_mib,
+        None,
+    )?;
+    level_rows.push(
+        "           Writes stop at the level; the test then re-reads and re-verifies what it wrote until the time is up. Only new test files are used.".to_owned(),
+    );
     let default_minutes = args.duration_seconds.max(60) / 60;
+    print!("\x1b[H\x1b[2J");
     println!(
         "{}",
         dit_ui_core::decorate(&dit_ui_core::option_screen(
             "DIT CPU-SSD // DURATION AND WRITE LEVEL",
             &[
                 vec![
-                    "DURATION   1) 10 min   2) 30 min   3) 60 min   or type minutes (1-1440)".to_owned(),
+                    "DURATION   1) 10 min   2) 30 min   3) 60 min   or type minutes (1-1440)"
+                        .to_owned(),
                 ],
-                vec![
-                    format!(
-                        "WRITE      L) Light {} MiB (default)   S) Standard {} MiB   H) Heavy {} MiB  (per SSD)",
-                        args.write_budget_mib,
-                        WriteLevel::Standard.budget_mib(args),
-                        WriteLevel::Heavy.budget_mib(args)
-                    ),
-                    "           Writes stop at the level; the test then re-reads and re-verifies what it wrote until the time is up.".to_owned(),
-                    format!(
-                        "           Each SSD needs that much free space plus {} MiB left untouched. Only new test files are used.",
-                        args.reserve_free_mib
-                    ),
-                ],
+                room_rows(&ssds),
+                level_rows,
             ],
             TerminalSize::current(),
         ))
@@ -860,15 +861,14 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     print!("Duration [{default_minutes}] > ");
     io::stdout().flush()?;
     let duration_seconds = parse_ssd_minutes(&read_operator_line()?, default_minutes) * 60;
-    print!("Write level [L] > ");
-    io::stdout().flush()?;
-    let level = parse_write_level(&read_operator_line()?);
+    let level = ask_write_level(&fits)?;
     let (capacity_mib, write_budget_mib) = (level.capacity_mib(args), level.budget_mib(args));
 
-    let required = mib(capacity_mib.min(write_budget_mib))?
-        .checked_add(mib(args.reserve_free_mib)?)
-        .ok_or("free-space requirement overflow")?;
-    let plans = automatic_plans(&inventory, &selection, &args.flags, required)?;
+    let need = auto_storage::Need {
+        allocation: mib(capacity_mib.min(write_budget_mib))?,
+        reserve: mib(args.reserve_free_mib)?,
+    };
+    let plans = automatic_plans(&inventory, &selection, &args.flags, need, &ssds)?;
     println!();
     println!(
         "SSD selection accepted: starting DEEP data-preserving test for {duration_seconds}s, write level {} ({write_budget_mib} MiB per SSD).",
@@ -891,7 +891,7 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
     if !validation.valid {
         return Err(format!("selection changed: {:?}", validation.errors).into());
     }
-    if automatic_plans(&fresh, &selection, &args.flags, required)? != plans {
+    if automatic_plans(&fresh, &selection, &args.flags, need, &ssds)? != plans {
         return Err("automatic storage plan changed; cancel and select again".into());
     }
     let mut setup_file = File::create_new(args.output_dir.join("auto-storage-plan.json"))?;
@@ -917,12 +917,17 @@ fn interactive_command(args: &InteractiveArgs) -> Result<ExitCode, Box<dyn std::
                 .iter()
                 .find(|device| device.stable_id == plan.namespace_id)
                 .ok_or("selected SSD disappeared during preparation")?;
-            let mut checked = auto_storage::plan(device, &args.flags.protected_devices, required)?;
+            let mut checked = auto_storage::plan(
+                device,
+                &args.flags.protected_devices,
+                need,
+                rooms_of(&ssds, &device.stable_id),
+            )?;
             checked.alias = plan.alias;
             if &checked != plan {
                 return Err("volume plan changed during preparation; select again".into());
             }
-            prepare_offering_repair(&mut areas, plan, &session, required)
+            prepare_offering_repair(&mut areas, plan, &session, need.on(plan.capacity_bytes))
         })();
         let directory = match prepared {
             Ok(directory) => directory,
@@ -1018,7 +1023,8 @@ fn automatic_plans(
     inventory: &Inventory,
     selection: &SelectionPlan,
     flags: &InventoryFlags,
-    required: u64,
+    need: auto_storage::Need,
+    ssds: &[SsdRoom],
 ) -> Result<Vec<auto_storage::VolumePlan>, Box<dyn std::error::Error>> {
     selection
         .devices
@@ -1029,7 +1035,12 @@ fn automatic_plans(
                 .iter()
                 .find(|device| device.stable_id == selected.stable_id)
                 .ok_or("selected SSD disappeared")?;
-            let mut plan = auto_storage::plan(device, &flags.protected_devices, required)?;
+            let mut plan = auto_storage::plan(
+                device,
+                &flags.protected_devices,
+                need,
+                rooms_of(ssds, &device.stable_id),
+            )?;
             plan.alias = selected.display_index;
             Ok(plan)
         })
@@ -1077,6 +1088,308 @@ impl WriteLevel {
             Self::Light => "LIGHT",
             Self::Standard => "STANDARD",
             Self::Heavy => "HEAVY",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Standard => "Standard",
+            Self::Heavy => "Heavy",
+        }
+    }
+}
+
+const WRITE_LEVELS: [WriteLevel; 3] = [WriteLevel::Light, WriteLevel::Standard, WriteLevel::Heavy];
+
+/// One selected SSD and the room on its volumes ([`auto_storage::survey`]).
+struct SsdRoom {
+    alias: usize,
+    id: DeviceId,
+    node: PathBuf,
+    model: String,
+    rooms: Vec<auto_storage::VolumeRoom>,
+}
+
+/// Measures every volume of the selected SSDs once, read-only: the write-level screen shows it
+/// and the choice of each SSD's test volume uses it.
+fn survey_selection(
+    inventory: &Inventory,
+    selection: &SelectionPlan,
+    flags: &InventoryFlags,
+) -> Result<Vec<SsdRoom>, Box<dyn std::error::Error>> {
+    println!("Measuring the free space of the selected SSDs (read-only) ...");
+    selection
+        .devices
+        .iter()
+        .map(|selected| {
+            let device = inventory
+                .devices
+                .iter()
+                .find(|device| device.stable_id == selected.stable_id)
+                .ok_or("selected SSD disappeared")?;
+            let rooms =
+                auto_storage::survey(device, &flags.protected_devices).map_err(|error| {
+                    format!(
+                        "SSD [{}] {}: {error}",
+                        selected.display_index,
+                        device.device_node.display()
+                    )
+                })?;
+            Ok(SsdRoom {
+                alias: selected.display_index,
+                id: device.stable_id.clone(),
+                node: device.device_node.clone(),
+                model: device.model.clone(),
+                rooms,
+            })
+        })
+        .collect()
+}
+
+fn rooms_of<'a>(ssds: &'a [SsdRoom], id: &DeviceId) -> &'a [auto_storage::VolumeRoom] {
+    ssds.iter()
+        .find(|ssd| &ssd.id == id)
+        .map_or(&[], |ssd| ssd.rooms.as_slice())
+}
+
+/// Each write level with whether the selected SSDs have room for it.
+type LevelFits = Vec<(WriteLevel, Fit)>;
+
+/// Whether a test fits the selected SSDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Fit {
+    Fits,
+    /// A usable volume could not be measured: preparation checks its room.
+    Unmeasured {
+        alias: usize,
+    },
+    /// The SSD's roomiest volume and what that volume would need.
+    NoRoom {
+        alias: usize,
+        free: u64,
+        required: u64,
+    },
+    NoVolume {
+        alias: usize,
+    },
+}
+
+impl Fit {
+    fn refused(&self) -> bool {
+        matches!(self, Self::NoRoom { .. } | Self::NoVolume { .. })
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Fits => "[FITS]".to_owned(),
+            Self::Unmeasured { alias } => {
+                format!("[CHECKED AT START] SSD [{alias}]: free space not measured")
+            }
+            Self::NoRoom {
+                alias,
+                free,
+                required,
+            } => format!(
+                "[NO ROOM] SSD [{alias}] has {} free, needs {}",
+                auto_storage::gib(*free),
+                auto_storage::gib(*required)
+            ),
+            Self::NoVolume { alias } => format!("[NO ROOM] SSD [{alias}] has no usable volume"),
+        }
+    }
+}
+
+/// Whether every SSD has a volume with room for `need` (the first SSD needs `first` instead, as
+/// it also carries the COMBINED data chain). The first SSD short of room decides.
+fn level_fit(ssds: &[SsdRoom], need: auto_storage::Need, first: Option<auto_storage::Need>) -> Fit {
+    let mut overall = Fit::Fits;
+    for (position, ssd) in ssds.iter().enumerate() {
+        let need = if position == 0 {
+            first.unwrap_or(need)
+        } else {
+            need
+        };
+        let usable: Vec<_> = ssd
+            .rooms
+            .iter()
+            .filter(|room| room.refused.is_none())
+            .collect();
+        if usable.iter().any(|room| {
+            room.free_bytes
+                .is_some_and(|free| free >= need.on(room.size_bytes))
+        }) {
+            continue;
+        }
+        if usable.iter().any(|room| room.free_bytes.is_none()) {
+            if overall == Fit::Fits {
+                overall = Fit::Unmeasured { alias: ssd.alias };
+            }
+            continue;
+        }
+        return usable
+            .iter()
+            .filter_map(|room| room.free_bytes.map(|free| (free, need.on(room.size_bytes))))
+            .max()
+            .map_or(Fit::NoVolume { alias: ssd.alias }, |(free, required)| {
+                Fit::NoRoom {
+                    alias: ssd.alias,
+                    free,
+                    required,
+                }
+            });
+    }
+    overall
+}
+
+/// The setup screen's free-space rows: each selected SSD's volumes with their room, the one the
+/// test will use marked.
+fn room_rows(ssds: &[SsdRoom]) -> Vec<String> {
+    let mut rows = vec![
+        "FREE SPACE  measured read-only; files of interrupted DIT tests count as free (removed first)"
+            .to_owned(),
+    ];
+    for ssd in ssds {
+        rows.push(format!(
+            "[{}] {}  {}",
+            ssd.alias,
+            ssd.node.display(),
+            ssd.model.trim()
+        ));
+        let test_volume = ssd
+            .rooms
+            .iter()
+            .filter(|room| room.refused.is_none())
+            .max_by_key(|room| (room.free_bytes, room.size_bytes))
+            .map(|room| room.node.clone());
+        for room in &ssd.rooms {
+            let name = room
+                .node
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            let detail = if let Some(reason) = &room.refused {
+                format!("not used: {reason}")
+            } else if let Some(free) = room.free_bytes {
+                let leftovers = if room.leftover_bytes > 0 {
+                    format!(
+                        " (incl. {} old DIT files)",
+                        auto_storage::gib(room.leftover_bytes)
+                    )
+                } else {
+                    String::new()
+                };
+                let marker = if test_volume.as_ref() == Some(&room.node) {
+                    "   <- TEST VOLUME"
+                } else {
+                    ""
+                };
+                format!("free {:>10}{leftovers}{marker}", auto_storage::gib(free))
+            } else {
+                format!(
+                    "free space not measured: {}",
+                    room.note.as_deref().unwrap_or("unknown")
+                )
+            };
+            rows.push(format!(
+                "    {name:<14} {:<6} {:>10}   {detail}",
+                room.filesystem,
+                auto_storage::gib(room.size_bytes)
+            ));
+        }
+    }
+    rows
+}
+
+/// A size in MiB as the level rows show it: whole GiB when it is one.
+fn level_size(mebibytes: u64) -> String {
+    if mebibytes.is_multiple_of(1024) {
+        format!("{} GiB", mebibytes / 1024)
+    } else {
+        format!("{mebibytes} MiB")
+    }
+}
+
+/// The setup screen's write-level rows, each level with whether every selected SSD has room
+/// for it ([FITS] green, [NO ROOM] red), and that fit for the prompt.
+fn write_level_rows(
+    ssds: &[SsdRoom],
+    light_capacity_mib: u64,
+    light_budget_mib: u64,
+    reserve_mib: u64,
+    first_extra: Option<(u64, u64)>,
+) -> Result<(Vec<String>, LevelFits), Box<dyn std::error::Error>> {
+    let mut rows = Vec::new();
+    let mut fits = Vec::new();
+    for (position, level) in WRITE_LEVELS.into_iter().enumerate() {
+        let allocation = level
+            .capacity_for(light_capacity_mib, light_budget_mib)
+            .min(level.budget_for(light_budget_mib));
+        let need = auto_storage::Need {
+            allocation: mib(allocation)?,
+            reserve: mib(reserve_mib)?,
+        };
+        let first = first_extra
+            .map(
+                |(extra, reserve)| -> Result<_, Box<dyn std::error::Error>> {
+                    Ok(auto_storage::Need {
+                        allocation: need.allocation + mib(extra)?,
+                        reserve: need.reserve + mib(reserve)?,
+                    })
+                },
+            )
+            .transpose()?;
+        let fit = level_fit(ssds, need, first);
+        let key = &level.label()[..1];
+        let name = format!(
+            "{key}) {}{}",
+            level.title(),
+            if level == WriteLevel::Light {
+                " (default)"
+            } else {
+                ""
+            }
+        );
+        rows.push(format!(
+            "{}{name:<22} {:>7} per SSD   {}",
+            if position == 0 {
+                "WRITE      "
+            } else {
+                "           "
+            },
+            level_size(level.budget_for(light_budget_mib)),
+            fit.describe()
+        ));
+        fits.push((level, fit));
+    }
+    rows.push(format!(
+        "           Each SSD needs the level's size free plus a reserve left untouched: 1 % of the volume, at least {}.",
+        level_size(reserve_mib)
+    ));
+    Ok((rows, fits))
+}
+
+/// Asks for the write level until the answer is one every selected SSD has room for.
+fn ask_write_level(fits: &[(WriteLevel, Fit)]) -> Result<WriteLevel, Box<dyn std::error::Error>> {
+    if let Some((_, fit)) = fits.iter().find(|(level, _)| *level == WriteLevel::Light)
+        && fit.refused()
+    {
+        return Err(format!(
+            "no write level fits: {}. Free space on the SSD, or use Format SSD in the control center",
+            fit.describe()
+        )
+        .into());
+    }
+    loop {
+        print!("Write level [L] > ");
+        io::stdout().flush()?;
+        let level = parse_write_level(&read_operator_line()?);
+        match fits.iter().find(|(candidate, _)| *candidate == level) {
+            Some((_, fit)) if fit.refused() => println!(
+                "  {} does not fit: {}. Choose a smaller level.",
+                level.label(),
+                fit.describe()
+            ),
+            _ => return Ok(level),
         }
     }
 }
@@ -2638,6 +2951,89 @@ mod tests {
                 WriteLevel::Heavy.budget_mib(&args)
             ),
             (65_536, 65_536)
+        );
+    }
+
+    fn volume(node: &str, size_gib: u64, free_gib: Option<u64>) -> auto_storage::VolumeRoom {
+        auto_storage::VolumeRoom {
+            node: node.into(),
+            filesystem: "ntfs".into(),
+            size_bytes: size_gib << 30,
+            free_bytes: free_gib.map(|free| free << 30),
+            leftover_bytes: 0,
+            refused: None,
+            note: None,
+        }
+    }
+
+    fn ssd(alias: usize, rooms: Vec<auto_storage::VolumeRoom>) -> SsdRoom {
+        SsdRoom {
+            alias,
+            id: DeviceId(format!("ssd-{alias}")),
+            node: format!("/dev/nvme{alias}n1").into(),
+            model: "Fixture SSD".into(),
+            rooms,
+        }
+    }
+
+    /// A level fits when every selected SSD has a volume with its size free plus the reserve
+    /// (1 % of the volume, at least the base); the first SSD short of room is named.
+    #[test]
+    fn write_levels_fit_by_the_room_on_every_ssd() {
+        let mut efi = volume("/dev/nvme2n1p1", 1, None);
+        efi.refused = Some("not an ordinary data partition".into());
+        let ssds = vec![
+            ssd(1, vec![volume("/dev/nvme1n1p1", 500, Some(30))]),
+            ssd(2, vec![efi, volume("/dev/nvme2n1p2", 100, Some(10))]),
+        ];
+        let (rows, fits) = write_level_rows(&ssds, 4096, 2048, 4096, None).unwrap();
+        assert_eq!(fits[0].1, Fit::Fits);
+        assert_eq!(
+            fits[1].1,
+            Fit::NoRoom {
+                alias: 2,
+                free: 10 << 30,
+                required: 20 << 30
+            }
+        );
+        assert!(matches!(fits[2].1, Fit::NoRoom { alias: 1, .. }));
+        assert!(rows[0].contains("L) Light (default)") && rows[0].ends_with("[FITS]"));
+        assert!(rows[1].contains("[NO ROOM] SSD [2] has 10.0 GiB free, needs 20.0 GiB"));
+        // A volume that could not be measured leaves the level to the check at the start.
+        let unmeasured = vec![ssd(1, vec![volume("/dev/nvme1n1p1", 500, None)])];
+        let (_, fits) = write_level_rows(&unmeasured, 4096, 2048, 4096, None).unwrap();
+        assert!(
+            fits.iter()
+                .all(|(_, fit)| *fit == Fit::Unmeasured { alias: 1 })
+        );
+        // No room even for Light: setup stops before asking.
+        let full = vec![ssd(1, vec![volume("/dev/nvme1n1p1", 500, Some(3))])];
+        let (_, fits) = write_level_rows(&full, 4096, 2048, 4096, None).unwrap();
+        assert!(
+            ask_write_level(&fits)
+                .unwrap_err()
+                .to_string()
+                .contains("no write level fits")
+        );
+    }
+
+    /// Every volume is listed with its size; usable ones with their free space, the roomiest
+    /// marked as the test volume; the others with why they are not used.
+    #[test]
+    fn the_free_space_rows_mark_the_test_volume() {
+        let mut efi = volume("/dev/nvme1n1p1", 1, None);
+        efi.refused = Some("not an ordinary data partition".into());
+        let mut data = volume("/dev/nvme1n1p3", 400, Some(120));
+        data.leftover_bytes = 12 << 30;
+        let rows = room_rows(&[ssd(
+            1,
+            vec![efi, volume("/dev/nvme1n1p2", 500, Some(20)), data],
+        )]);
+        assert!(rows[1].starts_with("[1] /dev/nvme1n1  Fixture SSD"));
+        assert!(rows[2].contains("nvme1n1p1") && rows[2].contains("not used: not an ordinary"));
+        assert!(rows[3].contains("free   20.0 GiB") && !rows[3].contains("TEST VOLUME"));
+        assert!(
+            rows[4].contains("free  120.0 GiB (incl. 12.0 GiB old DIT files)   <- TEST VOLUME")
         );
     }
 

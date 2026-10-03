@@ -735,6 +735,13 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
             let text_color =
                 if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer)) {
                     RED
+                } else if line.contains("[NO ROOM]") {
+                    // A setup option the hardware has no room for (an SSD write level).
+                    RED
+                } else if line.contains("[FITS]") {
+                    GREEN
+                } else if line.contains("[CHECKED AT START]") {
+                    YELLOW
                 } else if line.contains("RESULT: ") {
                     // The verdict is its badge; the rest of the row stays plain.
                     "\x1b[37m"
@@ -1034,6 +1041,27 @@ mod tests {
             let next = after.find('\x1b').map_or("", |i| &after[i..]);
             assert!(next.is_empty() || next.starts_with(RESET), "{painted:?}");
         }
+    }
+
+    /// Setup options are coloured by whether they fit: green, red when there is no room, yellow
+    /// when it is checked at the start.
+    #[test]
+    fn setup_options_are_coloured_by_their_fit() {
+        let colour = |text: &str| {
+            let painted = paint(&[format!("| {text} |")], 0, "", false);
+            [GREEN, RED, YELLOW]
+                .into_iter()
+                .find(|code| painted.contains(&format!("{code} S) Standard")))
+        };
+        assert_eq!(colour("S) Standard  16 GiB per SSD   [FITS]"), Some(GREEN));
+        assert_eq!(
+            colour("S) Standard  16 GiB per SSD   [NO ROOM] SSD [1] has 2.0 GiB free"),
+            Some(RED)
+        );
+        assert_eq!(
+            colour("S) Standard  16 GiB per SSD   [CHECKED AT START] SSD [1]"),
+            Some(YELLOW)
+        );
     }
 
     /// The result frame of a pass shows the progress complete; any other verdict keeps the
