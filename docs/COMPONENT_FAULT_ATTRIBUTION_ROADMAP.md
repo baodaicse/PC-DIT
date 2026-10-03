@@ -447,7 +447,9 @@ cộng `dit_attribution=1`. Mục mặc định vẫn là control center thườ
 
 **Cập nhật 2026-10-03:** mục này nay là mục test đầu tiên và là mục mặc định (`set default=fault-attribution`);
 mục control center thường (`--id control-center`) đã bỏ. Mọi lần chạy từ control center đều bật F3/F4 và
-kết quả mang dấu `+ATTRIBUTION`. Các mục CPU-RAM Safe/Full unattended và Operator shell giữ nguyên.
+kết quả mang dấu `+ATTRIBUTION`. Hai mục CPU-RAM Safe/Full unattended cũng đã bỏ (CPU-RAM chạy từ control
+center); chỉ giữ Operator shell, Reboot, Power off. Profile `safe/full` vẫn dùng được khi gõ tay `cpu_dit_profile=`
+trên dòng lệnh kernel (test QEMU).
 
 | Trong chế độ này | Chạy thêm |
 |---|---|

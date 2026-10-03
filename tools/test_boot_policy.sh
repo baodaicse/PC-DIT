@@ -165,6 +165,13 @@ grep -Fq 'menuentry "DIT-01 Fault Attribution (control center + component checks
 [[ "$(grep -c 'cpu_dit_profile=menu' "$GRUB_CONFIG")" -eq 1 ]]
 grep -A1 -- '--id fault-attribution' "$GRUB_CONFIG" | grep -Fq 'cpu_dit_profile=menu dit_attribution=1'
 [[ "$(grep -m1 '^menuentry "DIT-01 ' "$GRUB_CONFIG")" == *'--id fault-attribution'* ]]
+# No CPU-RAM entries of their own (Safe/Full unattended): CPU-RAM runs from the control center.
+# The operator shell stays.
+if grep -Eq 'cpu_dit_profile=(safe|full)|menuentry "DIT-01 CPU-RAM' "$GRUB_CONFIG"; then
+    printf 'BOOT_POLICY_FAIL: the CPU-RAM boot entries were removed; run CPU-RAM from the control center\n' >&2
+    exit 2
+fi
+grep -A1 -- 'menuentry "DIT-01 Operator shell only (no load)"' "$GRUB_CONFIG" | grep -Fq 'cpu_dit_profile=shell'
 if grep -Fq -- '--id control-center' "$GRUB_CONFIG"; then
     printf 'BOOT_POLICY_FAIL: the plain control center entry was removed; attribution is the default\n' >&2
     exit 2
