@@ -155,6 +155,9 @@ pub fn summarize(
     for event in &findings.hardware {
         ledger.add_hardware(event);
     }
+    for (cell, reading) in &findings.throttle {
+        ledger.add_throttle(*cell, *reading);
+    }
     // Step F6 on what the report gives: addresses, bits and hardware counts (no timing).
     fault_signatures::rank(&mut ledger, &fault_signatures::Context::default());
     let system = HostSampler::detect().system_info();
@@ -180,9 +183,10 @@ pub fn summarize(
         Err(error) => format!("Fail summary not written ({error}): {}", csv_path.display()),
     };
     format!(
-        "{}\n{}\n{csv}",
+        "{}\n{}\n{}\n{csv}",
         ledger.fail_line(&machine, 0),
-        ledger.hardware_line()
+        ledger.hardware_line(),
+        ledger.throttle_line()
     )
 }
 

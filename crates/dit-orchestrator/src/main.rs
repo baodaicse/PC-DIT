@@ -746,7 +746,10 @@ fn module_result_rows(verdict: &str, completion: &str, storage: &str) -> Vec<Str
     for line in lines {
         if line.starts_with("Fail summary") {
             csv.push(format!("CSV      {line}"));
-        } else if line.starts_with("FAIL BY PART") || line.starts_with("HW EVENTS") {
+        } else if ["FAIL BY PART", "HW EVENTS", "THROTTLE"]
+            .iter()
+            .any(|key| line.starts_with(key))
+        {
             ledger.push(line.to_owned());
         } else {
             notes.push(format!("NOTE     {line}"));

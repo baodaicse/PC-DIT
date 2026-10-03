@@ -249,6 +249,52 @@ impl HardwareEvent {
     }
 }
 
+/// How often a device slowed itself down for heat (or a hardware signal) during a run, and for
+/// how long when it says. Counted apart from failures, like hardware events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Throttle {
+    pub events: u64,
+    pub seconds: Option<u64>,
+}
+
+impl Throttle {
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            events: self.events.saturating_add(other.events),
+            seconds: match (self.seconds, other.seconds) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+
+    /// `3 (42 s)`, `3 (2 min 05 s)`, or the bare count without a time.
+    fn shown(self) -> String {
+        match self.seconds {
+            Some(seconds) if self.events > 0 && seconds >= 60 => {
+                format!(
+                    "{} ({} min {:02} s)",
+                    self.events,
+                    seconds / 60,
+                    seconds % 60
+                )
+            }
+            Some(seconds) if self.events > 0 => format!("{} ({seconds} s)", self.events),
+            _ => self.events.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ThrottleReport {
+    pub cell: String,
+    /// `false` when the device does not report throttling (no counters).
+    pub available: bool,
+    pub events: u64,
+    pub seconds: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CellCount {
     pub confirmed: u64,
@@ -268,6 +314,8 @@ pub struct Ledger {
     cells: BTreeMap<Component, CellCount>,
     unresolved: BTreeMap<Vec<Component>, u64>,
     hardware: BTreeMap<Component, BTreeMap<String, u64>>,
+    /// Throttling per device; `None` for a device measured without throttle counters.
+    throttle: BTreeMap<Component, Option<Throttle>>,
     by_phase: BTreeMap<String, BTreeMap<String, u64>>,
     events: Vec<FaultEvent>,
     kept_per_cell: BTreeMap<String, usize>,
@@ -329,6 +377,7 @@ pub struct LedgerReport {
     pub cells: Vec<CellReport>,
     pub unresolved: BTreeMap<String, u64>,
     pub hardware_events: Vec<HardwareReport>,
+    pub throttle: Vec<ThrottleReport>,
     pub by_phase: BTreeMap<String, BTreeMap<String, u64>>,
     pub events: Vec<FaultEvent>,
     pub details_dropped: u64,
@@ -429,6 +478,40 @@ impl Ledger {
                 .entry(event.kind.clone())
                 .or_default() += event.delta;
         }
+    }
+
+    /// Throttling of a device in one layer or phase: `None` when it has no throttle counters
+    /// (it shows `N/A` until some reading of it is available).
+    pub fn add_throttle(&mut self, cell: Component, reading: Option<Throttle>) {
+        let entry = self.throttle.entry(cell).or_insert(None);
+        if let Some(reading) = reading {
+            *entry = Some(entry.map_or(reading, |known| known.plus(reading)));
+        }
+    }
+
+    #[must_use]
+    pub fn throttle_of(&self, cell: Component) -> Option<Option<Throttle>> {
+        self.throttle.get(&cell).copied()
+    }
+
+    /// `THROTTLE` line: every device measured, as `FAIL BY PART` lists cells: how often it
+    /// slowed itself down, `N/A` when it has no throttle counters.
+    #[must_use]
+    pub fn throttle_line(&self) -> String {
+        if self.throttle.is_empty() {
+            return "THROTTLE      none measured".to_owned();
+        }
+        let parts: Vec<String> = self
+            .throttle
+            .iter()
+            .map(|(cell, reading)| {
+                reading.map_or_else(
+                    || format!("{} N/A", cell.label()),
+                    |throttle| format!("{} {}", cell.label(), throttle.shown()),
+                )
+            })
+            .collect();
+        format!("THROTTLE      {}", parts.join(" | "))
     }
 
     #[must_use]
@@ -539,6 +622,16 @@ impl Ledger {
                     })
                 })
                 .collect(),
+            throttle: self
+                .throttle
+                .iter()
+                .map(|(cell, reading)| ThrottleReport {
+                    cell: cell.label(),
+                    available: reading.is_some(),
+                    events: reading.map_or(0, |throttle| throttle.events),
+                    seconds: reading.and_then(|throttle| throttle.seconds),
+                })
+                .collect(),
             by_phase: self.by_phase.clone(),
             events: self.events.clone(),
             details_dropped: self.details_dropped,
@@ -580,11 +673,17 @@ impl Ledger {
             let _ = write!(cells, "?{group}={count};");
         }
         fields.push(cells.trim_end_matches(';').to_owned());
+        // Throttling joins the hardware events column (the header stays the same).
         fields.push(
             report
                 .hardware_events
                 .iter()
                 .map(|h| format!("{} {} +{}", h.cell, h.kind, h.delta))
+                .chain(self.throttle.iter().filter_map(|(cell, reading)| {
+                    reading
+                        .filter(|throttle| throttle.events > 0)
+                        .map(|throttle| format!("{} throttle +{}", cell.label(), throttle.shown()))
+                }))
                 .collect::<Vec<_>>()
                 .join("; "),
         );
@@ -704,6 +803,46 @@ mod tests {
         assert_eq!(report.failures_total, 1000);
         assert_eq!(report.events.len(), 64);
         assert_eq!(report.details_dropped, 936);
+    }
+
+    /// Each device's throttling adds up over layers and phases; a device without counters shows
+    /// N/A until a reading of it is available; the CSV carries the non-zero ones.
+    #[test]
+    fn throttle_is_counted_per_device() {
+        let mut ledger = Ledger::default();
+        assert_eq!(ledger.throttle_line(), "THROTTLE      none measured");
+        ledger.add_throttle(Component::Cpu, None);
+        ledger.add_throttle(
+            Component::Gpu(1),
+            Some(Throttle {
+                events: 2,
+                seconds: Some(30),
+            }),
+        );
+        ledger.add_throttle(
+            Component::Gpu(1),
+            Some(Throttle {
+                events: 1,
+                seconds: Some(95),
+            }),
+        );
+        ledger.add_throttle(
+            Component::Ssd(1),
+            Some(Throttle {
+                events: 0,
+                seconds: Some(0),
+            }),
+        );
+        assert_eq!(
+            ledger.throttle_line(),
+            "THROTTLE      CPU N/A | GPU1 3 (2 min 05 s) | SSD1 0"
+        );
+        let row = ledger.csv_row(&CsvMeta::default());
+        assert!(row.contains("GPU1 throttle +3 (2 min 05 s)"), "{row}");
+        assert!(!row.contains("SSD1 throttle"));
+        let report = ledger.report();
+        assert!(!report.throttle[0].available);
+        assert_eq!(report.throttle[1].events, 3);
     }
 
     #[test]

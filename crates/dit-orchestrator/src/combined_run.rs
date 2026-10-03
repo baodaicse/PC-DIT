@@ -637,7 +637,7 @@ fn run_session(
     let csv = session.append_fail_summary(verdict, &report_path);
     let failures: u64 = session.totals.values().map(|t| t.failures).sum();
     let summary = format!(
-        "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\n{}\n{}\n{ranked}Report: {}\n{stored}\n{csv}\n{cleanup}{release}",
+        "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\n{}\n{}\n{}\n{ranked}Report: {}\n{stored}\n{csv}\n{cleanup}{release}",
         session.settings.level.label(),
         session.settings.intensity.label(),
         combined::grade(
@@ -649,6 +649,7 @@ fn run_session(
         session.layer_summary(),
         session.ledger.fail_line(&session.machine_cells(), 0),
         session.ledger.hardware_line(),
+        session.ledger.throttle_line(),
         report_path.display()
     );
     let shown = session.renderer.is_some();
@@ -1327,6 +1328,9 @@ impl Session<'_> {
             }
             self.ledger.add_hardware(event);
         }
+        for (cell, reading) in &findings.throttle {
+            self.ledger.add_throttle(*cell, *reading);
+        }
     }
 
     /// Fault-event files of a layer's run directory (one per GPU worker with several GPUs).
@@ -1667,6 +1671,7 @@ impl Session<'_> {
                         .sum(),
                 ),
                 self.ledger.hardware_line(),
+                self.ledger.throttle_line(),
             ],
             result_rows: Vec::new(),
             footer: None,

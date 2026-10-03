@@ -1116,7 +1116,7 @@ run_result() {
             grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && ledger_args+=(--attribution)
             while IFS= read -r line; do
                 case "$line" in
-                    'FAIL BY PART'*|'HW EVENTS'*) ledger_rows+=("$line") ;;
+                    'FAIL BY PART'*|'HW EVENTS'*|'THROTTLE'*) ledger_rows+=("$line") ;;
                     'Fail summary'*) csv_rows+=("CSV      $line") ;;
                 esac
             done < <("$SUITE" "${ledger_args[@]}" 2>/dev/null)

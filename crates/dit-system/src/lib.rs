@@ -37,5 +37,6 @@ pub use safety::{
 };
 pub use telemetry::{
     KernelEventEvidence, LiveSensorSampler, PowerReading, SensorReport, TelemetryAvailability,
-    TelemetryEvidence, TelemetrySnapshot, TemperatureReading, collect_sensor_report,
+    TelemetryEvidence, TelemetrySnapshot, TemperatureReading, ThrottleDelta, ThrottleGroup,
+    collect_sensor_report, throttle_delta,
 };

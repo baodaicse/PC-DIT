@@ -5,7 +5,7 @@
 //! Until the GPU pipeline has boundary checks (step F3), a GPU result that is wrong after the
 //! round trip stays unresolved between its `PCIe` link, the GPU and its VRAM, instead of being
 //! blamed on the GPU.
-use crate::fault_ledger::{Attribution, Component, FaultEvent, HardwareEvent};
+use crate::fault_ledger::{Attribution, Component, FaultEvent, HardwareEvent, Throttle};
 use dit_contracts::FaultRecord;
 use serde_json::Value;
 
@@ -14,11 +14,17 @@ use serde_json::Value;
 pub struct Findings {
     pub failures: Vec<FaultEvent>,
     pub hardware: Vec<HardwareEvent>,
+    /// Each device the report measured throttling of: `None` without throttle counters.
+    pub throttle: Vec<(Component, Option<Throttle>)>,
 }
 
 impl Findings {
     fn fail(&mut self, event: FaultEvent) {
         self.failures.push(event);
+    }
+
+    fn throttled(&mut self, cell: Component, reading: Option<Throttle>) {
+        self.throttle.push((cell, reading));
     }
 
     fn hw(&mut self, cell: Component, kind: &str, delta: u64) {
@@ -254,12 +260,19 @@ fn cpu_ram_platform(report: &Value, found: &mut Findings) {
         "machine_check",
         u64_at(report, "/telemetry/kernel_events/machine_check_events"),
     );
-    found.hw(
-        Component::Platform,
-        "throttle",
-        u64_at(report, "/telemetry/throttle_core_delta")
-            + u64_at(report, "/telemetry/throttle_package_delta"),
-    );
+    // The CPU's own thermal throttling, each core and package once; N/A without counters.
+    if let Some(throttle) = report.pointer("/telemetry/throttle") {
+        found.throttled(
+            Component::Cpu,
+            throttle.as_object().map(|_| Throttle {
+                events: u64_at(throttle, "/events"),
+                seconds: throttle
+                    .pointer("/longest_ms")
+                    .and_then(Value::as_u64)
+                    .map(|ms| ms / 1000),
+            }),
+        );
+    }
     found.hw(
         Component::Platform,
         "oom_kill",
@@ -504,6 +517,7 @@ pub fn gpu(report: &Value, phase: &str, index_of: &dyn Fn(&str) -> u8) -> Findin
             let one = gpu_device(device, number);
             found.failures.extend(one.failures);
             found.hardware.extend(one.hardware);
+            found.throttle.extend(one.throttle);
         }
         return found.in_phase(phase);
     }
@@ -578,6 +592,26 @@ fn gpu_device(report: &Value, gpu: u8) -> Findings {
 
 /// Link AER and width, ECC and kernel-log warnings: corrected events, counted apart.
 fn gpu_hardware(report: &Value, gpu: u8, found: &mut Findings) {
+    // Slowdowns for heat or a hardware signal (not the power cap), from the stress sampler.
+    if let Some(stress) = report
+        .pointer("/detection/stress")
+        .filter(|stress| stress.is_object())
+    {
+        found.throttled(
+            Component::Gpu(gpu),
+            stress
+                .pointer("/slowdown_episodes")
+                .and_then(Value::as_u64)
+                .map(|events| Throttle {
+                    events,
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    seconds: stress
+                        .pointer("/slowdown_seconds")
+                        .and_then(Value::as_f64)
+                        .map(|seconds| seconds.round().max(0.0) as u64),
+                }),
+        );
+    }
     let link = Component::PcieGpu(gpu);
     for (pointer, kind) in [
         ("/detection/link/aer_delta/correctable", "aer_corrected"),
@@ -800,6 +834,33 @@ fn ssd_hardware(
             "error_log_entries",
             grew("/smart/error_log_entries"),
         );
+        found.hw(
+            Component::Ssd(number),
+            "warning_temp_min",
+            grew("/smart/warning_temperature_minutes"),
+        );
+        found.hw(
+            Component::Ssd(number),
+            "critical_temp_min",
+            grew("/smart/critical_temperature_minutes"),
+        );
+        // The drive's own thermal management (levels 1 and 2); N/A when it does not report it.
+        if after.pointer("/smart/available").and_then(Value::as_bool) == Some(true) {
+            let reported = after
+                .pointer("/smart/thermal_level1_transitions")
+                .is_some_and(Value::is_u64);
+            found.throttled(
+                Component::Ssd(number),
+                reported.then(|| Throttle {
+                    events: grew("/smart/thermal_level1_transitions")
+                        + grew("/smart/thermal_level2_transitions"),
+                    seconds: Some(
+                        grew("/smart/thermal_level1_seconds")
+                            + grew("/smart/thermal_level2_seconds"),
+                    ),
+                }),
+            );
+        }
         let counters = |device: &Value| -> Vec<(String, u64)> {
             device
                 .pointer("/aer/counters")
@@ -1364,6 +1425,72 @@ mod tests {
         assert_eq!(
             ledger.hardware_line(),
             "HW EVENTS     RAM edac_corrected +2"
+        );
+    }
+
+    /// Throttling is read per device: the CPU from its deduplicated counters (N/A without
+    /// them), each GPU from its slowdown episodes, each SSD from its thermal management counters.
+    #[test]
+    fn throttle_is_read_for_each_device() {
+        let throttled = |report: Value, find: &dyn Fn(&Value) -> Findings| find(&report).throttle;
+        let cpu = |throttle: Value| {
+            throttled(
+                serde_json::json!({"telemetry": {"throttle": throttle}}),
+                &|report| cpu_ram(report, ""),
+            )
+        };
+        assert_eq!(
+            cpu(serde_json::json!({"events": 3, "longest_ms": 2500})),
+            [(
+                Component::Cpu,
+                Some(Throttle {
+                    events: 3,
+                    seconds: Some(2)
+                })
+            )]
+        );
+        assert_eq!(cpu(Value::Null), [(Component::Cpu, None)]);
+        let gpu = throttled(
+            serde_json::json!({"selected_device": {"pci_address": ""},
+                "detection": {"stress": {"slowdown_episodes": 2, "slowdown_seconds": 14.4}}}),
+            &|report| gpu(report, "", &|_| 1),
+        );
+        assert_eq!(
+            gpu,
+            [(
+                Component::Gpu(1),
+                Some(Throttle {
+                    events: 2,
+                    seconds: Some(14)
+                })
+            )]
+        );
+        let smart = |transitions: u64, seconds: u64| {
+            serde_json::json!({"stable_id": "ssd-a", "smart": {"available": true,
+                "thermal_level1_transitions": transitions, "thermal_level2_transitions": 0,
+                "thermal_level1_seconds": seconds, "thermal_level2_seconds": 0,
+                "warning_temperature_minutes": transitions}})
+        };
+        let report = serde_json::json!({
+            "inventory_before": [smart(4, 100)],
+            "inventory_after": [smart(6, 142)],
+        });
+        let found = ssd(&report, "", &|_| Some(1));
+        assert_eq!(
+            found.throttle,
+            [(
+                Component::Ssd(1),
+                Some(Throttle {
+                    events: 2,
+                    seconds: Some(42)
+                })
+            )]
+        );
+        assert!(
+            found
+                .hardware
+                .iter()
+                .any(|event| event.kind == "warning_temp_min" && event.delta == 2)
         );
     }
 }

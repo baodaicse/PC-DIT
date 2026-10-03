@@ -58,9 +58,56 @@ pub struct TelemetrySnapshot {
     pub edac_uncorrected: Vec<CounterReading>,
     pub throttle_core: Vec<CounterReading>,
     pub throttle_package: Vec<CounterReading>,
+    /// The thermal-throttle counters once per core and once per package: every logical CPU of
+    /// a core or package shows the same counter, so the per-CPU lists above repeat them.
+    #[serde(default)]
+    pub throttle_groups: Vec<ThrottleGroup>,
     pub cgroup_memory_events: BTreeMap<String, u64>,
     pub machine_check_cpu_count: u64,
     pub machine_check_bank_count: u64,
+}
+
+/// One core's or one package's thermal-throttle counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThrottleGroup {
+    /// `package<P>` or `package<P>-core<C>`.
+    pub key: String,
+    /// Times it started throttling since boot.
+    pub count: u64,
+    /// Time it spent throttled since boot, when the kernel reports it.
+    pub total_time_ms: Option<u64>,
+}
+
+/// CPU thermal throttling during a run, each core and package counted once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThrottleDelta {
+    /// Times a core or a package started throttling.
+    pub events: u64,
+    /// Longest time any one core or package spent throttled, when the kernel reports it.
+    pub longest_ms: Option<u64>,
+}
+
+/// Throttling between two readings of the counters; `None` when the CPU has none (AMD CPUs, for
+/// example: the counters come from the Intel thermal-throttle driver).
+#[must_use]
+pub fn throttle_delta(start: &[ThrottleGroup], end: &[ThrottleGroup]) -> Option<ThrottleDelta> {
+    if end.is_empty() {
+        return None;
+    }
+    let mut delta = ThrottleDelta::default();
+    for group in end {
+        let before = start.iter().find(|earlier| earlier.key == group.key);
+        delta.events = delta.events.saturating_add(
+            group
+                .count
+                .saturating_sub(before.map_or(group.count, |b| b.count)),
+        );
+        if let Some(total) = group.total_time_ms {
+            let spent = total.saturating_sub(before.and_then(|b| b.total_time_ms).unwrap_or(total));
+            delta.longest_ms = Some(delta.longest_ms.unwrap_or(0).max(spent));
+        }
+    }
+    Some(delta)
 }
 
 impl TelemetrySnapshot {
@@ -122,6 +169,9 @@ pub struct TelemetryEvidence {
     pub edac_uncorrected_delta: u64,
     pub throttle_core_delta: u64,
     pub throttle_package_delta: u64,
+    /// Throttling with each core and package counted once; `None` without counters.
+    #[serde(default)]
+    pub throttle: Option<ThrottleDelta>,
     pub cgroup_oom_delta: u64,
     pub cgroup_oom_kill_delta: u64,
     pub kernel_events: KernelEventEvidence,
@@ -232,6 +282,7 @@ impl TelemetryCollector {
             edac_uncorrected: collect_edac(sys_root, "ue_count"),
             throttle_core: collect_throttle(sys_root, "core_throttle_count"),
             throttle_package: collect_throttle(sys_root, "package_throttle_count"),
+            throttle_groups: collect_throttle_groups(sys_root),
             cgroup_memory_events: collect_memory_events(Path::new(&self.cgroup_root)),
             machine_check_cpu_count: count_machine_check_cpus(sys_root),
             machine_check_bank_count: count_machine_check_banks(sys_root),
@@ -322,6 +373,7 @@ pub(crate) fn build_evidence(
         throttle_package_delta: end
             .throttle_package_total()
             .saturating_sub(start.throttle_package_total()),
+        throttle: throttle_delta(&start.throttle_groups, &end.throttle_groups),
         cgroup_oom_delta: end
             .cgroup_event("oom")
             .saturating_sub(start.cgroup_event("oom")),
@@ -705,6 +757,51 @@ fn collect_throttle(sys_root: &Path, counter_name: &str) -> Vec<CounterReading> 
         .collect()
 }
 
+/// [`ThrottleGroup`]s: each logical CPU's counters filed under its core and its package
+/// (`topology/core_id`, `topology/physical_package_id`), so siblings count once.
+fn collect_throttle_groups(sys_root: &Path) -> Vec<ThrottleGroup> {
+    let mut groups: BTreeMap<String, ThrottleGroup> = BTreeMap::new();
+    for cpu in child_directories(&sys_root.join("devices/system/cpu")) {
+        let is_cpu = cpu
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("cpu"))
+            .is_some_and(|id| id.parse::<u32>().is_ok());
+        let counters = cpu.join("thermal_throttle");
+        if !is_cpu || !counters.is_dir() {
+            continue;
+        }
+        let package = read_u64(cpu.join("topology/physical_package_id")).unwrap_or(0);
+        let core = read_u64(cpu.join("topology/core_id"));
+        for (scope, key) in [
+            (
+                "core",
+                core.map(|core| format!("package{package}-core{core}")),
+            ),
+            ("package", Some(format!("package{package}"))),
+        ] {
+            let (Some(key), Some(count)) = (
+                key,
+                read_u64(counters.join(format!("{scope}_throttle_count"))),
+            ) else {
+                continue;
+            };
+            let time = read_u64(counters.join(format!("{scope}_throttle_total_time_ms")));
+            let group = groups.entry(key.clone()).or_insert(ThrottleGroup {
+                key,
+                count: 0,
+                total_time_ms: None,
+            });
+            group.count = group.count.max(count);
+            group.total_time_ms = match (group.total_time_ms, time) {
+                (Some(known), Some(read)) => Some(known.max(read)),
+                (known, read) => known.or(read),
+            };
+        }
+    }
+    groups.into_values().collect()
+}
+
 fn collect_memory_events(cgroup_root: &Path) -> BTreeMap<String, u64> {
     let Some(text) = read_trimmed(cgroup_root.join("memory.events")) else {
         return BTreeMap::new();
@@ -816,15 +913,67 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CounterReading, TelemetrySnapshot, TemperatureReading, energy_delta, parse_kernel_events,
-        parse_key_value_counters, sane_temperature,
+        CounterReading, TelemetrySnapshot, TemperatureReading, ThrottleDelta,
+        collect_throttle_groups, energy_delta, parse_kernel_events, parse_key_value_counters,
+        sane_temperature, throttle_delta,
     };
+    use std::fs;
 
     #[test]
     fn parses_cgroup_memory_events() {
         let events = parse_key_value_counters("low 2\noom 3\noom_kill 1\n");
         assert_eq!(events.get("oom"), Some(&3));
         assert_eq!(events.get("oom_kill"), Some(&1));
+    }
+
+    /// Every logical CPU of a core or package shows the same counter: each core and package is
+    /// counted once, and the longest throttled time is the one reported.
+    #[test]
+    fn throttle_counts_each_core_and_package_once() {
+        let root = std::env::temp_dir().join(format!("dit-throttle-{}", std::process::id()));
+        let write = |cpu: u32, core: u64, core_count: u64, package_count: u64, package_ms: u64| {
+            let dir = root.join(format!("devices/system/cpu/cpu{cpu}"));
+            fs::create_dir_all(dir.join("thermal_throttle")).unwrap();
+            fs::create_dir_all(dir.join("topology")).unwrap();
+            fs::write(dir.join("topology/physical_package_id"), "0\n").unwrap();
+            fs::write(dir.join("topology/core_id"), format!("{core}\n")).unwrap();
+            let counters = dir.join("thermal_throttle");
+            fs::write(
+                counters.join("core_throttle_count"),
+                format!("{core_count}\n"),
+            )
+            .unwrap();
+            fs::write(
+                counters.join("package_throttle_count"),
+                format!("{package_count}\n"),
+            )
+            .unwrap();
+            fs::write(
+                counters.join("package_throttle_total_time_ms"),
+                format!("{package_ms}\n"),
+            )
+            .unwrap();
+        };
+        // Two cores with two threads each, one package.
+        for (cpu, core) in [(0, 0), (1, 0), (2, 1), (3, 1)] {
+            write(cpu, core, 5, 10, 1000);
+        }
+        let start = collect_throttle_groups(&root);
+        assert_eq!(start.len(), 3);
+        // Core 1 throttled twice more, the package once more for 1.5 s; every thread shows it.
+        for (cpu, core, core_count) in [(0, 0, 5), (1, 0, 5), (2, 1, 7), (3, 1, 7)] {
+            write(cpu, core, core_count, 11, 2500);
+        }
+        let end = collect_throttle_groups(&root);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            throttle_delta(&start, &end),
+            Some(ThrottleDelta {
+                events: 3,
+                longest_ms: Some(1500)
+            })
+        );
+        assert_eq!(throttle_delta(&start, &[]), None);
     }
 
     #[test]

@@ -104,6 +104,21 @@ pub struct SmartSnapshot {
     pub controller_busy_time_minutes: Option<u64>,
     pub media_and_data_integrity_errors: Option<u64>,
     pub error_log_entries: Option<u64>,
+    /// Minutes the drive has spent above its warning and its critical composite temperature.
+    #[serde(default)]
+    pub warning_temperature_minutes: Option<u64>,
+    #[serde(default)]
+    pub critical_temperature_minutes: Option<u64>,
+    /// Times the drive entered thermal management level 1 (light) and 2 (heavy) throttling, and
+    /// the seconds it spent there.
+    #[serde(default)]
+    pub thermal_level1_transitions: Option<u64>,
+    #[serde(default)]
+    pub thermal_level2_transitions: Option<u64>,
+    #[serde(default)]
+    pub thermal_level1_seconds: Option<u64>,
+    #[serde(default)]
+    pub thermal_level2_seconds: Option<u64>,
     pub warning: Option<String>,
 }
 
@@ -734,6 +749,12 @@ fn smart_from_json(value: &Value) -> SmartSnapshot {
         controller_busy_time_minutes: json_u64(value, "controller_busy_time"),
         media_and_data_integrity_errors: json_u64(value, "media_errors"),
         error_log_entries: json_u64(value, "num_err_log_entries"),
+        warning_temperature_minutes: json_u64(value, "warning_temp_time"),
+        critical_temperature_minutes: json_u64(value, "critical_comp_time"),
+        thermal_level1_transitions: json_u64(value, "thm_temp1_trans_count"),
+        thermal_level2_transitions: json_u64(value, "thm_temp2_trans_count"),
+        thermal_level1_seconds: json_u64(value, "thm_temp1_total_time"),
+        thermal_level2_seconds: json_u64(value, "thm_temp2_total_time"),
         warning: None,
     }
 }
@@ -946,13 +967,20 @@ mod tests {
             "data_units_written": 567,
             "controller_busy_time": 9,
             "media_errors": 0,
-            "num_err_log_entries": "4"
+            "num_err_log_entries": "4",
+            "warning_temp_time": 3,
+            "thm_temp1_trans_count": 2,
+            "thm_temp1_total_time": 40
         });
         let smart = smart_from_json(&value);
         assert!(smart.available);
         assert_eq!(smart.temperature_celsius, Some(51));
         assert_eq!(smart.data_units_read, Some(1234));
         assert_eq!(smart.error_log_entries, Some(4));
+        assert_eq!(smart.warning_temperature_minutes, Some(3));
+        assert_eq!(smart.thermal_level1_transitions, Some(2));
+        assert_eq!(smart.thermal_level1_seconds, Some(40));
+        assert_eq!(smart.thermal_level2_transitions, None);
     }
 
     #[test]

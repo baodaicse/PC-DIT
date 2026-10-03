@@ -530,6 +530,7 @@ mod tests {
             edac_uncorrected_delta: 0,
             throttle_core_delta: 0,
             throttle_package_delta: 0,
+            throttle: None,
             cgroup_oom_delta: 0,
             cgroup_oom_kill_delta: 0,
             kernel_events: KernelEventEvidence::default(),

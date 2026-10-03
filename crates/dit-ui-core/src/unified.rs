@@ -504,6 +504,21 @@ fn part_colors(line: &str) -> Vec<Option<&'static str>> {
                 color_range(from, to, RED);
             }
         }
+    } else if let Some(at) = find_chars(&chars, "THROTTLE  ") {
+        // A device that slowed itself down is yellow; one without counters grey.
+        for (from, to) in segments(at + "THROTTLE".len()) {
+            let text: String = chars[from..to].iter().collect();
+            if text.contains("N/A") {
+                color_range(from, to, GRAY);
+            } else if text
+                .split_whitespace()
+                .find(|token| token.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|token| token.parse::<u64>().ok())
+                .is_some_and(|count| count > 0)
+            {
+                color_range(from, to, YELLOW);
+            }
+        }
     } else if let Some(at) = find_chars(&chars, "HW EVENTS") {
         if find_chars(&chars, "none recorded").is_none() {
             for (from, to) in segments(at + "HW EVENTS".len()) {
@@ -727,6 +742,7 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
             let by_part = line.contains("FAIL BY PART")
                 || line.contains("PHASES")
                 || line.contains("HW EVENTS")
+                || line.contains("THROTTLE  ")
                 || line.contains("RESULT: ");
             let is_footer = !footer_key.is_empty() && line.contains(&footer_key);
             let overrides = part_colors(line);
@@ -1062,6 +1078,20 @@ mod tests {
             colour("S) Standard  16 GiB per SSD   [CHECKED AT START] SSD [1]"),
             Some(YELLOW)
         );
+    }
+
+    /// Each device of the THROTTLE line in its colour: yellow when it throttled, grey without
+    /// counters, plain at zero.
+    #[test]
+    fn throttle_parts_are_coloured_per_device() {
+        let line = "| THROTTLE      CPU 0 | GPU1 3 (42 s) | SSD1 N/A |".to_owned();
+        let painted = paint(&[line], 0, "", false);
+        assert!(
+            painted.contains(&format!("{YELLOW}GPU1 3 (42 s)")),
+            "{painted:?}"
+        );
+        assert!(painted.contains(&format!("{GRAY}SSD1 N/A")), "{painted:?}");
+        assert!(!painted.contains(&format!("{YELLOW}CPU 0")), "{painted:?}");
     }
 
     /// The result frame of a pass shows the progress complete; any other verdict keeps the

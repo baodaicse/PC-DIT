@@ -1001,6 +1001,12 @@ const THROTTLE_NAMES: [(u64, &str); 9] = [
     (0x100, "DisplayClockSetting"),
 ];
 
+/// Throttle reasons that are a slowdown for heat or a hardware signal: `HwSlowdown`,
+/// `SwThermalSlowdown`, `HwThermalSlowdown`, `HwPowerBrakeSlowdown`. The power cap (`SwPowerCap`)
+/// is left out: a loaded GPU reaches it by design, as a CPU reaches its power limit, which the
+/// kernel's CPU throttle counters leave out too.
+pub const SLOWDOWN_MASK: u64 = 0x8 | 0x20 | 0x40 | 0x80;
+
 #[must_use]
 pub fn decode_throttle(mask: u64) -> Vec<&'static str> {
     THROTTLE_NAMES
@@ -1020,6 +1026,9 @@ pub struct StressAccumulator {
     power_limit: Option<f64>,
     throttle_seen: Option<u64>,
     throttle_samples: u64,
+    slowdown_samples: u64,
+    slowdown_episodes: u64,
+    slowing_down: bool,
     first_temperature: Option<f64>,
     last_temperature: Option<f64>,
     samples: u64,
@@ -1048,6 +1057,14 @@ impl StressAccumulator {
             if mask & !0x1 != 0 {
                 self.throttle_samples += 1;
             }
+            let slowing = mask & SLOWDOWN_MASK != 0;
+            if slowing {
+                self.slowdown_samples += 1;
+                if !self.slowing_down {
+                    self.slowdown_episodes += 1;
+                }
+            }
+            self.slowing_down = slowing;
         }
     }
 
@@ -1076,6 +1093,11 @@ impl StressAccumulator {
             throttle_reasons_seen_mask: self.throttle_seen,
             throttle_reasons_seen: self.throttle_seen.map(decode_throttle).unwrap_or_default(),
             throttle_limited_samples: self.throttle_seen.map(|_| self.throttle_samples),
+            slowdown_episodes: self.throttle_seen.map(|_| self.slowdown_episodes),
+            #[allow(clippy::cast_precision_loss)]
+            slowdown_seconds: self.throttle_seen.map(|_| {
+                duration_seconds * self.slowdown_samples as f64 / self.samples.max(1) as f64
+            }),
         }
     }
 }
@@ -1101,6 +1123,10 @@ pub struct StressProfile {
     pub throttle_reasons_seen_mask: Option<u64>,
     pub throttle_reasons_seen: Vec<&'static str>,
     pub throttle_limited_samples: Option<u64>,
+    /// Times the GPU entered a slowdown ([`SLOWDOWN_MASK`]) and about how long it stayed there
+    /// (its share of the samples times the duration); `None` without throttle reasons.
+    pub slowdown_episodes: Option<u64>,
+    pub slowdown_seconds: Option<f64>,
 }
 
 /// Samples telemetry on its own thread so readings are not tied to the
@@ -1499,6 +1525,18 @@ mod tests {
         );
     }
 
+    /// Each entry into a thermal or hardware slowdown is one episode; the power cap is not one.
+    #[test]
+    fn slowdown_episodes_count_entries_into_a_heat_or_hardware_slowdown() {
+        let mut acc = StressAccumulator::default();
+        for mask in [0x1, 0x4, 0x20, 0x20, 0x4, 0x40 | 0x4, 0x1, 0x8] {
+            acc.observe(&telemetry(100.0, 80.0, Some(mask)));
+        }
+        let p = acc.finish(8.0);
+        assert_eq!(p.slowdown_episodes, Some(3));
+        assert!((p.slowdown_seconds.unwrap() - 4.0).abs() < 1e-9);
+    }
+
     #[test]
     fn missing_throttle_data_is_unavailable_not_no_throttling() {
         let mut acc = StressAccumulator::default();
@@ -1507,5 +1545,6 @@ mod tests {
         assert!(!p.throttle_reasons_available);
         assert_eq!(p.throttle_reasons_seen_mask, None);
         assert_eq!(p.throttle_limited_samples, None);
+        assert_eq!(p.slowdown_episodes, None);
     }
 }
