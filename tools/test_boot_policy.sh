@@ -156,14 +156,19 @@ fi
 # The boot menu names its build: a first information line filled at image build time, with the
 # default chosen by id so that line never becomes what boots unattended.
 grep -Fq 'menuentry "Build @DIT_BUILD_TIME@ | @DIT_IMAGE_ID@" --id build-info' "$GRUB_CONFIG"
-grep -Fq 'set default=control-center' "$GRUB_CONFIG"
-grep -Fq 'menuentry "DIT-01 Control center (CPU-RAM / CPU-NVMe)" --id control-center' "$GRUB_CONFIG"
-# Fault Attribution: its own entry (same control center, dit_attribution=1), never the default;
-# the plain control center stays without it; the CPU-RAM runner passes --confirm-on-fail with it.
+grep -Fq 'set default=fault-attribution' "$GRUB_CONFIG"
+# The control center boots with the component fault attribution checks (dit_attribution=1): it
+# is the first test entry, the default and the only control center; the plain one is gone. The
+# CPU-RAM runner passes --confirm-on-fail with it.
 grep -Fq 'menuentry "DIT-01 Fault Attribution (control center + component checks)" --id fault-attribution' "$GRUB_CONFIG"
 [[ "$(grep -c 'dit_attribution=1' "$GRUB_CONFIG")" -eq 1 ]]
+[[ "$(grep -c 'cpu_dit_profile=menu' "$GRUB_CONFIG")" -eq 1 ]]
 grep -A1 -- '--id fault-attribution' "$GRUB_CONFIG" | grep -Fq 'cpu_dit_profile=menu dit_attribution=1'
-! grep -A1 -- '--id control-center' "$GRUB_CONFIG" | grep -Fq 'dit_attribution'
+[[ "$(grep -m1 '^menuentry "DIT-01 ' "$GRUB_CONFIG")" == *'--id fault-attribution'* ]]
+if grep -Fq -- '--id control-center' "$GRUB_CONFIG"; then
+    printf 'BOOT_POLICY_FAIL: the plain control center entry was removed; attribution is the default\n' >&2
+    exit 2
+fi
 grep -Fq 'SYSTEM_ARGS+=(--confirm-on-fail)' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
 grep -Fq 'MENU_ARGS+=(--attribution-checks)' "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh"
 # Every boot entry uses the kernel's built-in Terminus 10x18 console font (larger text).

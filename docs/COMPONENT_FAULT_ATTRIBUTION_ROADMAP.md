@@ -445,6 +445,10 @@ Bật F3/F4 không cần sửa dòng lệnh kernel: menu GRUB (image và ISO) c�
 `DIT-01 Fault Attribution (control center + component checks)` (`--id fault-attribution`), là control center thường
 cộng `dit_attribution=1`. Mục mặc định vẫn là control center thường, không bật gì.
 
+**Cập nhật 2026-10-03:** mục này nay là mục test đầu tiên và là mục mặc định (`set default=fault-attribution`);
+mục control center thường (`--id control-center`) đã bỏ. Mọi lần chạy từ control center đều bật F3/F4 và
+kết quả mang dấu `+ATTRIBUTION`. Các mục CPU-RAM Safe/Full unattended và Operator shell giữ nguyên.
+
 | Trong chế độ này | Chạy thêm |
 |---|---|
 | Control center | tiêu đề `FAULT ATTRIBUTION`, hai dòng báo những kiểm nào đang bật |

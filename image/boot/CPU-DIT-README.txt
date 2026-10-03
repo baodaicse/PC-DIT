@@ -23,7 +23,9 @@ time) and its image-id; the ISO adds a second line with its own packing time
 and the NVIDIA driver it carries prebuilt. Both are information only: selecting
 one just reloads the menu.
 
-The default entry opens the shared module control center. Select CPU-RAM,
+The default (first) entry, DIT-01 Fault Attribution, opens the shared module
+control center with the component fault attribution checks on, so each FAIL is
+counted on the part that caused it (results marked +ATTRIBUTION). Select CPU-RAM,
 CPU-SSD or GPU-VRAM explicitly. Selecting an SSD starts the data-preserving
 file-mode test after stable-ID and volume revalidation; it never formats a
 selected SSD. GPU-A validates the data contract with a CPU mock backend and

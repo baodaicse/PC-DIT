@@ -172,7 +172,7 @@ có thiết bị).
 `Build <giờ build theo giờ máy build, ví dụ 2026-09-23 18:34 +07> | <image-id>`, do
 `build_boot_image.sh` điền vào lúc build. ISO thêm dòng thứ hai
 `ISO <giờ đóng ISO> | nvidia-driver-580-open prebuilt`. Hai dòng này chỉ để xem, chọn vào thì chỉ nạp
-lại menu. Mục mặc định được chọn theo `--id control-center` chứ không theo vị trí, nên các dòng
+lại menu. Mục mặc định được chọn theo `--id fault-attribution` chứ không theo vị trí, nên các dòng
 thông tin không đổi mục tự boot. `/etc/cpu-dit/build-info` và manifest cũng ghi `built_local`.
 
 ## Cách dùng

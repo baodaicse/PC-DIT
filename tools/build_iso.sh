@@ -71,14 +71,14 @@ log "Image $image_id + driver layer $layer_driver"
 # A second information line under the image's own build line in the boot menu: when this ISO
 # was packed and which driver it carries prebuilt.
 awk -v title="ISO $iso_time | $layer_driver prebuilt" '
-    /^menuentry "DIT-01 Control center/ && !done {
+    /^menuentry "DIT-01 / && !done {
         printf "menuentry \"%s\" --id iso-info {\n    configfile /boot/grub/grub.cfg\n}\n\n", title
         done = 1
     }
     { print }
     END { if (!done) exit 1 }
 ' "$WORK/root/boot/grub/grub.cfg" >"$WORK/grub.cfg" \
-    || die "boot menu has no Control center entry to place the ISO line above"
+    || die "boot menu has no DIT-01 entry to place the ISO line above"
 mv -f "$WORK/grub.cfg" "$WORK/root/boot/grub/grub.cfg"
 
 log "Creating the ${ISO_RESULT_MIB} MiB DIT-RESULTS partition"
