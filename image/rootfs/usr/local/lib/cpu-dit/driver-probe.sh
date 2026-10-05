@@ -23,9 +23,11 @@ probe_module() {
 }
 
 probe_optional_module() {
-    local module="$1"
+    # Module names use `_`; their files may use `-` (nvidia_modeset is nvidia-modeset.ko).
+    local module="$1" file="${1//_/-}"
     if find "/lib/modules/$(uname -r)" -type f \
-        \( -name "${module}.ko" -o -name "${module}.ko.xz" -o -name "${module}.ko.zst" \) \
+        \( -name "${module}.ko" -o -name "${module}.ko.xz" -o -name "${module}.ko.zst" \
+        -o -name "${file}.ko" -o -name "${file}.ko.xz" -o -name "${file}.ko.zst" \) \
         -print -quit 2>/dev/null | grep -q .; then
         probe_module "$module"
     else
@@ -55,15 +57,20 @@ done
 # so NVIDIA cards are driven only by the NVIDIA stack: baked in (nvidia-image,
 # recorded in /etc/cpu-dit/nvidia-driver-profile) or installed just before this
 # script by nvidia-driver-install.sh from a package staged on DIT-RESULTS.
+# Open or proprietary NVIDIA modules: whichever drives this machine's GPUs (GTX 9xx/10xx need the
+# proprietary ones), chosen before the rest of the NVIDIA stack loads.
+. /usr/local/lib/cpu-dit/nvidia-flavor.sh
 if [[ -f /etc/cpu-dit/nvidia-driver-profile ]]; then
     printf 'gpu_driver_profile nvidia_baked package=%s\n' \
         "$(cat /etc/cpu-dit/nvidia-driver-profile)" >>"$LOG"
+    select_nvidia_flavor "$LOG"
     for module in nvidia nvidia_modeset nvidia_drm nvidia_uvm; do
         probe_optional_module "$module"
     done
 elif [[ -f /run/cpu-dit-nvidia-driver-runtime-installed ]]; then
     printf 'gpu_driver_profile nvidia_runtime result=%s\n' \
         "$(cat /run/cpu-dit-nvidia-driver-runtime-installed)" >>"$LOG"
+    select_nvidia_flavor "$LOG"
     for module in nvidia nvidia_modeset nvidia_drm nvidia_uvm; do
         probe_optional_module "$module"
     done

@@ -175,6 +175,44 @@ có thiết bị).
 lại menu. Mục mặc định được chọn theo `--id fault-attribution` chứ không theo vị trí, nên các dòng
 thông tin không đổi mục tự boot. `/etc/cpu-dit/build-info` và manifest cũng ghi `built_local`.
 
+## Hai loại module: open và proprietary (2026-10-05)
+
+Module **open** của NVIDIA cần bộ xử lý GSP trên GPU, nên chỉ chạy từ đời Turing (GTX 16xx, RTX 20xx)
+trở lên. Trên GTX 1050 Ti thật, kernel báo GPU "does not include the required GPU System Processor
+(GSP)" và không nhận card. Đây là lý do GTX 9xx/10xx không chạy được khi ISO chỉ có
+`nvidia-driver-580-open`. Ngược lại, Blackwell (RTX 50xx) **chỉ** chạy được với module open. Bản 580
+là bản cuối cùng còn hỗ trợ Maxwell, Pascal và Volta trong module proprietary.
+
+| Đời GPU | Ví dụ | open | proprietary |
+|---|---|---|---|
+| Maxwell | GTX 750 Ti, 960, 980 | không | có |
+| Pascal | GTX 1050 Ti, 1060, 1080 | không | có |
+| Volta | Titan V | không | có |
+| Turing, Ampere, Ada | GTX 16xx, RTX 20xx/30xx/40xx | có | có |
+| Blackwell | RTX 50xx | có | không |
+
+Lớp driver nay chứa **cả hai bộ module cùng phiên bản** (580.178.04):
+
+1. `tools/build_nvidia_driver_package.sh` tải thêm `nvidia-dkms-580` và `nvidia-kernel-source-580`
+   đúng phiên bản của bản open vào `pkgs-proprietary/`. Hai gói này xung đột với bản open nên không
+   nằm chung tập phụ thuộc; phần phụ thuộc còn lại đã có sẵn trong đó.
+2. `tools/build_nvidia_driver_layer.sh` build bản open như cũ và cất vào
+   `/usr/lib/dit/nvidia-modules/open/<kernel>/`. Sau đó nó gỡ hai gói open, cài và build DKMS bản
+   proprietary, cất vào `.../proprietary/<kernel>/`, rồi trả bản open về `updates/dkms` làm mặc định.
+   Build kiểm license của từng `nvidia.ko` (open: `Dual MIT/GPL`, proprietary: `NVIDIA`). Manifest
+   của lớp ghi `kernel_module_flavors`.
+3. Khi boot, `driver-probe.sh` gọi `select_nvidia_flavor` trong `nvidia-flavor.sh` trước khi nạp
+   phần còn lại của driver. Chương trình đếm GPU NVIDIA trên PCI, nạp bản open và đếm số GPU nó
+   nhận. Nếu còn GPU chưa nhận, nó gỡ module, chép bản proprietary vào `updates/dkms`, chạy `depmod`
+   và nạp lại. Bên nào nhận được nhiều GPU hơn thì giữ; hòa thì giữ open. Ví dụ máy có cả card
+   Pascal lẫn Blackwell thì quay lại open và card Pascal không được hỗ trợ. Không cần bảng mã thiết
+   bị. Nếu không gỡ được module (console đang dùng) thì giữ open và ghi chú. Mỗi bước được ghi vào
+   `driver-probe.txt` (`nvidia_flavor ... drives N of M NVIDIA GPU(s)`), lựa chọn cuối ghi vào
+   `/run/cpu-dit-nvidia-flavor`.
+4. `tools/test_nvidia_flavor.sh` (trong `make test`) kiểm logic này trên sysfs và `modprobe` giả lập:
+   Turing, Blackwell, Pascal, Maxwell, Pascal + Turing, Pascal + Blackwell, thiếu bản proprietary,
+   module bị giữ, không có GPU.
+
 ## Cách dùng
 
 ```sh

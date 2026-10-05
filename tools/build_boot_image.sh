@@ -280,6 +280,8 @@ configure_rootfs() {
         "$ROOTFS/usr/local/lib/cpu-dit/driver-probe.sh"
     sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/partition-lookup.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/partition-lookup.sh"
+    sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-flavor.sh" \
+        "$ROOTFS/usr/local/lib/cpu-dit/nvidia-flavor.sh"
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-driver-install.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/nvidia-driver-install.sh"
     sudo install -D -m 0755 "$ROOT_DIR/target/release/dit-cli" "$ROOTFS/opt/cpu-dit-01/dit-cli"

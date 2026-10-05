@@ -62,8 +62,11 @@ log "Target kernel: $KERNEL_VERSION"
 log "Target driver: $NVIDIA_DRIVER_PACKAGE"
 
 # Reuse the offline package's resolved .deb closure when it was built for this driver and kernel.
+# An open driver's package must also carry the proprietary modules (older packages do not).
 if ! grep -q "\"nvidia_driver_package\": \"$NVIDIA_DRIVER_PACKAGE\"" "$PACKAGE_STAGE/manifest.json" 2>/dev/null \
-    || ! grep -q "\"target_kernel_version\": \"$KERNEL_VERSION\"" "$PACKAGE_STAGE/manifest.json" 2>/dev/null; then
+    || ! grep -q "\"target_kernel_version\": \"$KERNEL_VERSION\"" "$PACKAGE_STAGE/manifest.json" 2>/dev/null \
+    || { [[ "$NVIDIA_DRIVER_PACKAGE" == *-open ]] \
+        && ! compgen -G "$PACKAGE_STAGE/pkgs-proprietary/*.deb" >/dev/null; }; then
     log "No matching offline package; building it first"
     NVIDIA_DRIVER_PACKAGE="$NVIDIA_DRIVER_PACKAGE" "$ROOT_DIR/tools/build_nvidia_driver_package.sh"
 fi
@@ -93,6 +96,49 @@ sudo cp -a "$PACKAGE_STAGE/." "$WORK/merged/var/tmp/dit-layer-build/"
 sudo chroot "$WORK/merged" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
     sh /var/tmp/dit-layer-build/install.sh </dev/null \
     || die "offline install failed inside the overlay"
+
+# Both module flavors of the same driver version (image/rootfs/usr/local/lib/cpu-dit/
+# nvidia-flavor.sh chooses at boot): the open ones just built stay in updates/dkms and are kept
+# under /usr/lib/dit/nvidia-modules/open; the proprietary ones (GTX 9xx/10xx, Titan V) are built
+# by swapping the conflicting DKMS packages, then kept under .../proprietary.
+flavors_root="/usr/lib/dit/nvidia-modules"
+merged_dkms="$WORK/merged/usr/lib/modules/$KERNEL_VERSION/updates/dkms"
+if compgen -G "$PACKAGE_STAGE/pkgs-proprietary/*.deb" >/dev/null; then
+    branch="${NVIDIA_DRIVER_PACKAGE#nvidia-driver-}"
+    branch="${branch%-open}"
+    open_keep="$WORK/merged$flavors_root/open/$KERNEL_VERSION"
+    proprietary_keep="$WORK/merged$flavors_root/proprietary/$KERNEL_VERSION"
+    sudo mkdir -p "$open_keep" "$proprietary_keep"
+    sudo cp -a "$merged_dkms"/nvidia*.ko* "$open_keep/"
+    log "Building the proprietary modules (GTX 9xx/10xx, Titan V) of the same driver"
+    sudo chroot "$WORK/merged" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+        dpkg --purge --force-depends "nvidia-dkms-$branch-open" "nvidia-kernel-source-$branch-open" \
+        </dev/null || die "could not set the open module packages aside"
+    sudo chroot "$WORK/merged" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+        sh -c 'dpkg -i /var/tmp/dit-layer-build/pkgs-proprietary/*.deb' </dev/null \
+        || die "the proprietary modules did not install or build"
+    compgen -G "$merged_dkms/nvidia.ko*" >/dev/null \
+        || die "DKMS did not produce the proprietary nvidia.ko for $KERNEL_VERSION"
+    sudo cp -a "$merged_dkms"/nvidia*.ko* "$proprietary_keep/"
+    # The open modules stay the default in updates/dkms.
+    sudo rm -f "$merged_dkms"/nvidia*.ko*
+    sudo cp -a "$open_keep"/nvidia*.ko* "$merged_dkms/"
+    for flavor in open proprietary; do
+        license="$(sudo chroot "$WORK/merged" modinfo -F license \
+            "$flavors_root/$flavor/$KERNEL_VERSION/nvidia.ko" 2>/dev/null | head -1)"
+        log "  $flavor nvidia.ko: license ${license:-unknown}"
+        case "$flavor:$license" in
+            open:*GPL*) ;;
+            proprietary:NVIDIA) ;;
+            *) die "$flavor nvidia.ko has an unexpected license: ${license:-none}" ;;
+        esac
+    done
+    module_flavors='"open", "proprietary"'
+elif [[ "$NVIDIA_DRIVER_PACKAGE" == *-open ]]; then
+    module_flavors='"open"'
+else
+    module_flavors='"proprietary"'
+fi
 sudo chroot "$WORK/merged" depmod -a "$KERNEL_VERSION"
 
 # Noble is usrmerged: /lib is a symlink to usr/lib, so the install lands under usr/lib/modules.
@@ -137,6 +183,7 @@ cat >"$LAYER.manifest.json" <<EOF
   "image_id": "$IMAGE_ID",
   "target_kernel_version": "$KERNEL_VERSION",
   "nvidia_driver_package": "$NVIDIA_DRIVER_PACKAGE",
+  "kernel_module_flavors": [$module_flavors],
   "live_name": "nvidia-driver.squashfs",
   "size_bytes": $layer_bytes,
   "sha256": "$(awk '{print $1}' "$LAYER.sha256")",

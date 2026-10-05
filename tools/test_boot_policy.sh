@@ -83,6 +83,18 @@ fi
 grep -Fq 'cp /run/cpu-dit-nvidia-driver-install.txt' "$RUNNER"
 
 grep -Fq '. /usr/local/lib/cpu-dit/partition-lookup.sh' "$NVIDIA_INSTALL"
+# GTX 9xx/10xx need the proprietary NVIDIA modules (the open ones need Turing's GSP): the layer
+# builds both flavors and driver-probe.sh chooses before the NVIDIA stack loads.
+grep -Fq '. /usr/local/lib/cpu-dit/nvidia-flavor.sh' "$DRIVER_PROBE"
+# nvidia_modeset / nvidia_drm / nvidia_uvm live in files named with `-`.
+grep -Fq 'file="${1//_/-}"' "$DRIVER_PROBE"
+[[ "$(grep -c 'select_nvidia_flavor "$LOG"' "$DRIVER_PROBE")" -eq 2 ]]
+grep -Fq 'cpu-dit/nvidia-flavor.sh" \' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'pkgs-proprietary' "$ROOT_DIR/tools/build_nvidia_driver_package.sh"
+grep -Fq 'apt-get download' "$ROOT_DIR/tools/build_nvidia_driver_package.sh"
+grep -Fq 'flavors_root="/usr/lib/dit/nvidia-modules"' "$ROOT_DIR/tools/build_nvidia_driver_layer.sh"
+grep -Fq 'NVIDIA_FLAVOR_ROOT="${NVIDIA_FLAVOR_ROOT:-/usr/lib/dit/nvidia-modules}"' \
+    "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-flavor.sh"
 grep -Fq 'if [[ -f /etc/cpu-dit/nvidia-driver-profile ]]; then' "$NVIDIA_INSTALL"
 grep -Fq "lspci -nn -d 10de:" "$NVIDIA_INSTALL"
 grep -Fq 'nvidia-smi >>"$LOG" 2>&1' "$NVIDIA_INSTALL"

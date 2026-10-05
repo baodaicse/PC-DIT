@@ -100,6 +100,7 @@ test: check
 	cargo build --workspace
 	./tools/test_ui.sh '$(PROJECT_ROOT)/target/debug/dit-cli'
 	./tools/test_boot_policy.sh
+	./tools/test_nvidia_flavor.sh
 	bash -n ./tools/burn_usb.sh
 	./tools/burn_usb.sh --list >/dev/null
 	python3 ./tools/test_seed_validator.py

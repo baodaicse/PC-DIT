@@ -83,6 +83,29 @@ sudo chown "$(id -u):$(id -g)" "$STAGING_DIR/pkgs"/*.deb
 package_count=$(find "$STAGING_DIR/pkgs" -name '*.deb' | wc -l)
 (( package_count > 0 )) || die "no .deb files were downloaded"
 log "Downloaded $package_count package(s)"
+
+# The open modules need the GPU's GSP (Turing and newer). For GTX 9xx/10xx and Titan V the
+# driver layer also builds the proprietary modules of the very same version: their two packages,
+# kept apart in pkgs-proprietary/ (they conflict with the open ones, so the closure above cannot
+# hold both; the rest of their dependencies already is in it).
+mkdir -p "$STAGING_DIR/pkgs-proprietary"
+find "$STAGING_DIR/pkgs-proprietary" -mindepth 1 -delete
+if [[ "$NVIDIA_DRIVER_PACKAGE" == *-open ]]; then
+    branch="${NVIDIA_DRIVER_PACKAGE#nvidia-driver-}"
+    branch="${branch%-open}"
+    open_dkms=("$STAGING_DIR"/pkgs/nvidia-dkms-"$branch"-open_*.deb)
+    [[ -f "${open_dkms[0]}" ]] || die "nvidia-dkms-$branch-open is not in the closure"
+    driver_version="$(dpkg-deb -f "${open_dkms[0]}" Version)"
+    log "Downloading the proprietary modules of $driver_version (Maxwell, Pascal, Volta)"
+    sudo mkdir -p "$ROOTFS/var/tmp/dit-proprietary"
+    sudo chroot "$ROOTFS" sh -c "cd /var/tmp/dit-proprietary && apt-get download \
+        nvidia-dkms-$branch=$driver_version nvidia-kernel-source-$branch=$driver_version"
+    sudo cp "$ROOTFS"/var/tmp/dit-proprietary/*.deb "$STAGING_DIR/pkgs-proprietary/"
+    sudo rm -rf "$ROOTFS/var/tmp/dit-proprietary"
+    sudo chown "$(id -u):$(id -g)" "$STAGING_DIR/pkgs-proprietary"/*.deb
+    [[ "$(find "$STAGING_DIR/pkgs-proprietary" -name '*.deb' | wc -l)" -eq 2 ]] \
+        || die "the proprietary module packages were not both downloaded"
+fi
 # Leave nothing but the base rootfs's own apt lists behind (build_boot_image.sh's
 # own bootstrap already tolerates those); the .deb archives must not end up
 # baked into the generic image this rootfs also builds.
@@ -138,6 +161,15 @@ version=$(awk -F '"' '/^version = "/ { print $2; exit }' "$ROOT_DIR/Cargo.toml")
     printf '  "packages": ['
     first=1
     for deb in "$STAGING_DIR"/pkgs/*.deb; do
+        [[ $first -eq 1 ]] || printf ','
+        first=0
+        printf '"%s"' "$(basename "$deb")"
+    done
+    printf '],\n'
+    printf '  "proprietary_packages": ['
+    first=1
+    for deb in "$STAGING_DIR"/pkgs-proprietary/*.deb; do
+        [[ -f "$deb" ]] || continue
         [[ $first -eq 1 ]] || printf ','
         first=0
         printf '"%s"' "$(basename "$deb")"
