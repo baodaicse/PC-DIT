@@ -86,6 +86,11 @@ grep -Fq '. /usr/local/lib/cpu-dit/partition-lookup.sh' "$NVIDIA_INSTALL"
 # GTX 9xx/10xx need the proprietary NVIDIA modules (the open ones need Turing's GSP): the layer
 # builds both flavors and driver-probe.sh chooses before the NVIDIA stack loads.
 grep -Fq '. /usr/local/lib/cpu-dit/nvidia-flavor.sh' "$DRIVER_PROBE"
+# With the proprietary modules nvidia-drm must not take the console (black screen on GTX 10xx);
+# the probe log records what drives the screen.
+grep -Fq "printf 'options nvidia_drm modeset=0 fbdev=0\\n'" \
+    "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-flavor.sh"
+grep -Fq 'console_begin' "$DRIVER_PROBE"
 # nvidia_modeset / nvidia_drm / nvidia_uvm live in files named with `-`.
 grep -Fq 'file="${1//_/-}"' "$DRIVER_PROBE"
 [[ "$(grep -c 'select_nvidia_flavor "$LOG"' "$DRIVER_PROBE")" -eq 2 ]]

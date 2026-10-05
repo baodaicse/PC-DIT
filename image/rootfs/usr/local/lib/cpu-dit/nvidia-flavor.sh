@@ -16,6 +16,24 @@ NVIDIA_FLAVOR_MODULES="${NVIDIA_FLAVOR_MODULES:-/lib/modules/$NVIDIA_FLAVOR_KERN
 NVIDIA_FLAVOR_STATE="${NVIDIA_FLAVOR_STATE:-/run/cpu-dit-nvidia-flavor}"
 NVIDIA_FLAVOR_MODPROBE="${NVIDIA_FLAVOR_MODPROBE:-modprobe}"
 NVIDIA_FLAVOR_DEPMOD="${NVIDIA_FLAVOR_DEPMOD:-depmod}"
+# With the proprietary modules nvidia-drm leaves the console alone (see nvidia_console_kept).
+NVIDIA_FLAVOR_MODPROBE_D="${NVIDIA_FLAVOR_MODPROBE_D:-/run/modprobe.d}"
+NVIDIA_CONSOLE_CONF="zz-dit-nvidia-console.conf"
+
+# DIT needs CUDA, not nvidia-drm's display (KMS). Ubuntu's nvidia-graphics-drivers-kms.conf sets
+# nvidia_drm modeset=1, so nvidia-drm takes the console from the firmware framebuffer. With the
+# proprietary modules it loads late (after this choice, while the screens start) and on a
+# GTX 9xx/10xx the console was left black: there it stays on the firmware framebuffer (or the
+# VGA text console). The file sorts after Ubuntu's, so its options win.
+nvidia_console_kept() {
+    if [[ "$1" == proprietary ]]; then
+        mkdir -p "$NVIDIA_FLAVOR_MODPROBE_D" \
+            && printf 'options nvidia_drm modeset=0 fbdev=0\n' \
+                >"$NVIDIA_FLAVOR_MODPROBE_D/$NVIDIA_CONSOLE_CONF"
+    else
+        rm -f "$NVIDIA_FLAVOR_MODPROBE_D/$NVIDIA_CONSOLE_CONF"
+    fi
+}
 
 # NVIDIA display controllers (VGA, 3D or display class) on the PCI bus.
 nvidia_gpu_count() {
@@ -61,6 +79,7 @@ nvidia_use_flavor() {
     mkdir -p "$NVIDIA_FLAVOR_MODULES/updates/dkms" || return 1
     rm -f "$NVIDIA_FLAVOR_MODULES"/updates/dkms/nvidia*.ko*
     cp -f "$source"/nvidia*.ko* "$NVIDIA_FLAVOR_MODULES/updates/dkms/" || return 1
+    nvidia_console_kept "$1"
     "$NVIDIA_FLAVOR_DEPMOD" -a "$NVIDIA_FLAVOR_KERNEL" >/dev/null 2>&1
 }
 

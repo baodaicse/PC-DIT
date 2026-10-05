@@ -86,6 +86,7 @@ run() {
         export NVIDIA_FLAVOR_STATE="$scenario/state"
         export NVIDIA_FLAVOR_MODPROBE="$WORK/modprobe"
         export NVIDIA_FLAVOR_DEPMOD=true
+        export NVIDIA_FLAVOR_MODPROBE_D="$scenario/modprobe.d"
         # shellcheck source=/dev/null
         . "$FLAVOR_SCRIPT"
         if (( held )); then
@@ -104,6 +105,14 @@ run() {
         if [[ "$expected" != none ]]; then
             [[ "$installed" == "$expected" ]] \
                 || fail "$name: updates/dkms holds $installed, expected $expected"
+        fi
+        # nvidia-drm keeps its hands off the console with the proprietary modules only.
+        local console="$scenario/modprobe.d/zz-dit-nvidia-console.conf"
+        if [[ "$expected" == proprietary ]]; then
+            grep -qx 'options nvidia_drm modeset=0 fbdev=0' "$console" \
+                || fail "$name: nvidia-drm would take the console"
+        elif [[ -e "$console" ]]; then
+            fail "$name: the console override stayed with the open modules"
         fi
     )
 }

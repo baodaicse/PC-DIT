@@ -90,6 +90,24 @@ lspci -nnk 2>>"$LOG" \
     | sed -n '/VGA compatible controller\|3D controller\|Display controller/,+3p' \
     >>"$LOG" || true
 printf 'gpu_inventory_end\n' >>"$LOG"
+# What drives the screen, for a black screen after the NVIDIA stack loads: boot mode, the
+# framebuffers, nvidia-drm's display mode, and the kernel's lines about them.
+{
+    printf 'console_begin\n'
+    if [[ -d /sys/firmware/efi ]]; then
+        printf 'boot_mode uefi\n'
+    else
+        printf 'boot_mode legacy_bios\n'
+    fi
+    printf 'framebuffers %s\n' "$(tr '\n' ';' </proc/fb 2>/dev/null)"
+    printf 'nvidia_drm_modeset %s fbdev %s\n' \
+        "$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || printf none)" \
+        "$(cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null || printf none)"
+    printf 'nvidia_flavor_chosen %s\n' "$(cat /run/cpu-dit-nvidia-flavor 2>/dev/null || printf none)"
+    dmesg 2>/dev/null | grep -iE 'nvrm|nvidia-drm|nvidia_drm|fbcon|simpledrm|efifb|vesafb' \
+        | tail -n 20
+    printf 'console_end\n'
+} >>"$LOG" 2>&1
 printf 'completed_utc %s\n' "$(date -u --iso-8601=seconds)" >>"$LOG"
 # Best-effort, same reasoning as nvidia-driver-install.sh: the interactive menu profile never
 # reaches boot-runner.sh's own end-of-run copy, so persist here if the sibling partition happens
