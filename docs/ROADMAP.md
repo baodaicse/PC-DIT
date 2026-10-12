@@ -27,7 +27,7 @@ Trạng thái: `implemented` ở source/host gate; image/hardware validation pen
 
 ### U2.2 — Bắt lỗi khi app treo hoặc phần cứng lỗi thật (FC0–FC8)
 
-Trạng thái: `proposed` (2026-10-12), chưa code. Chi tiết: [FAULT_CATCH_ROADMAP.md](FAULT_CATCH_ROADMAP.md).
+Trạng thái: `implemented` (2026-10-12) FC0–FC7 ở source/host gate và QEMU; FC7 (hardware watchdog) tắt mặc định, FC8 tạm gác; chưa kiểm trên máy thật. Chi tiết: [FAULT_CATCH_ROADMAP.md](FAULT_CATCH_ROADMAP.md).
 
 - Kết quả thực tế: 8 ô PLATFORM đang hiện là lớp SSD treo trên NTFS (lỗi DIT); khoảng 13 phiên chết giữa chừng (phần lớn app treo, người vận hành reset) không được ghi lại.
 - Lối thoát cho người vận hành: `nvidia-smi` có timeout, console cứu hộ ở VT2, SysRq.
