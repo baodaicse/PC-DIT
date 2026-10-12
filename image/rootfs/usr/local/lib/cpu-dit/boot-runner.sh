@@ -73,7 +73,7 @@ swapoff -a 2>/dev/null || true
 # tests/ holds every test, each in a cgroup of its own (dit-watchdog), all under a memory.max
 # that leaves the machine room to answer. Without a delegated cgroup v2 nothing changes.
 setup_test_cgroups() {
-    local own service total reserve pid
+    local own service total reserve pid pids attempt log=/run/dit-cgroup-setup.log
     own="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)"
     # Only the service's own runner: a profile run started by the UI lives in a test's cgroup.
     case "$own" in
@@ -81,22 +81,33 @@ setup_test_cgroups() {
         *) return 0 ;;
     esac
     service="/sys/fs/cgroup${own%/app}"
-    [[ -w "$service/cgroup.procs" && -r "$service/cgroup.controllers" ]] || return 0
-    grep -qw memory "$service/cgroup.controllers" || return 0
-    mkdir -p "$service/app" "$service/tests" 2>/dev/null || return 0
-    # No process may stay in a cgroup that hands controllers to its children.
-    while read -r pid; do
-        echo "$pid" >"$service/app/cgroup.procs" 2>/dev/null || true
-    done <"$service/cgroup.procs"
-    echo +memory >"$service/cgroup.subtree_control" 2>/dev/null || return 0
-    echo +memory >"$service/tests/cgroup.subtree_control" 2>/dev/null || true
+    if [[ ! -w "$service/cgroup.procs" ]] || ! grep -qw memory "$service/cgroup.controllers" 2>/dev/null; then
+        echo "no delegated cgroup with the memory controller at $service" >"$log"
+        return 0
+    fi
+    mkdir -p "$service/app" "$service/tests" 2>>"$log" || return 0
+    # No process may stay in a cgroup that hands controllers to its children. The whole list is
+    # read before anything moves (moving while reading skips entries), until none is left.
+    for attempt in 1 2 3 4 5; do
+        pids="$(cat "$service/cgroup.procs" 2>/dev/null)"
+        [[ -z "$pids" ]] && break
+        for pid in $pids; do
+            echo "$pid" >"$service/app/cgroup.procs" 2>>"$log" || true
+        done
+    done
+    if ! echo +memory >"$service/cgroup.subtree_control" 2>>"$log"; then
+        echo "memory controller not enabled; still in $service: $(cat "$service/cgroup.procs" | tr '\n' ' ')" >>"$log"
+        return 0
+    fi
+    echo +memory >"$service/tests/cgroup.subtree_control" 2>>"$log" || true
     total="$(awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo)"
     reserve=$((1024 * 1024 * 1024))
     if [[ "$total" =~ ^[0-9]+$ ]] && (( total > 2 * reserve )); then
-        echo $((total - reserve)) >"$service/tests/memory.max" 2>/dev/null || true
+        echo $((total - reserve)) >"$service/tests/memory.max" 2>>"$log" || true
     fi
-    echo $((256 * 1024 * 1024)) >"$service/app/memory.min" 2>/dev/null || true
+    echo $((256 * 1024 * 1024)) >"$service/app/memory.min" 2>>"$log" || true
     export DIT_TEST_CGROUP="$service/tests"
+    echo "tests in $DIT_TEST_CGROUP" >>"$log"
 }
 setup_test_cgroups
 

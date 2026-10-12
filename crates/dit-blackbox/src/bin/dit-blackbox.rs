@@ -265,14 +265,22 @@ fn draw_watching(watched: &BTreeMap<String, Watched>, last: &BTreeMap<String, Va
     let _ = out.flush();
 }
 
-/// Brings the black box's console to the screen (once, when it writes a result).
+/// Brings the black box's console to the screen (once, when it writes a result): `chvt`, or
+/// busybox's where the `kbd` package is not installed (the image has busybox, not `kbd`).
 fn switch_console(console: u8) {
     static CHVT: StuckGate = StuckGate::new();
-    let _ = output_within(
-        Command::new("chvt").arg(console.to_string()),
-        Duration::from_secs(3),
-        &CHVT,
-    );
+    let console = console.to_string();
+    let switched = |program: &str, args: &[&str]| {
+        output_within(
+            Command::new(program).args(args),
+            Duration::from_secs(3),
+            &CHVT,
+        )
+        .is_some_and(|output| output.status.success())
+    };
+    if !switched("chvt", &[console.as_str()]) {
+        let _ = switched("busybox", &["chvt", console.as_str()]);
+    }
 }
 
 /// What one second showed of every session.
@@ -350,9 +358,11 @@ fn follow(
         "meters": meters(&status),
     });
     // A line on every change, else every 10 s.
+    // The phase without its running clock (`PHASE 6/6 OVERLAP (00:01:20 / ...)`): a line a
+    // second would wear the stick for nothing.
     let digest = format!(
         "{}|{}|{}|{}|{:?}",
-        status.phase,
+        status.phase.split(" (").next().unwrap_or(""),
         status.state,
         status.failures,
         seen.app_alive,
