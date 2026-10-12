@@ -46,6 +46,13 @@ grep -Fxq 'kernel.sysrq = 240' "$ROOT_DIR/image/rootfs/etc/sysctl.d/99-dit-sysrq
 grep -Fq 'multi-user.target.wants/dit-rescue.service' "$ROOT_DIR/tools/build_boot_image.sh"
 grep -Fq 'getty@tty2.service' "$ROOT_DIR/tools/build_boot_image.sh"
 grep -Fq 'usr/local/bin/dit-rescue' "$ROOT_DIR/tools/build_image_extension.sh"
+# FC3a: the black box owns tty3, is never the OOM killer's choice and starts with the image.
+BLACKBOX_SERVICE="$ROOT_DIR/image/rootfs/etc/systemd/system/dit-blackbox.service"
+grep -Fxq 'TTYPath=/dev/tty3' "$BLACKBOX_SERVICE"
+grep -Fxq 'OOMScoreAdjust=-1000' "$BLACKBOX_SERVICE"
+grep -Fxq 'ExecStart=/usr/local/bin/dit-blackbox watch' "$BLACKBOX_SERVICE"
+grep -Fq 'multi-user.target.wants/dit-blackbox.service' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'usr/local/bin/dit-blackbox' "$ROOT_DIR/tools/build_image_extension.sh"
 # FC2: tests run in their own memory cgroups under a delegated service cgroup.
 grep -Fxq 'Delegate=yes' "$SERVICE"
 grep -Fq 'export DIT_TEST_CGROUP="$service/tests"' "$RUNNER"

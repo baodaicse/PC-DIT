@@ -34,6 +34,8 @@ fn a_stop_the_app_does_not_answer_is_recorded_by_the_console() {
             started_unix_ms: session::unix_ms(),
             results_root: results.clone(),
             pending_cells: Vec::new(),
+            ssd_blocks: Vec::new(),
+            gpu_pcis: Vec::new(),
         },
     )
     .unwrap();

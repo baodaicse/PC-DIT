@@ -40,6 +40,13 @@ pub struct SessionInfo {
     /// Cells a failure the app has not placed yet is counted on (a single-module run counts its
     /// failures from the report at the end): `["CPU", "RAM"]`.
     pub pending_cells: Vec<String>,
+    /// The session's SSDs: (number, block device), e.g. `(2, "nvme1n1")`, so a kernel line about
+    /// `nvme1` is counted on SSD2.
+    #[serde(default)]
+    pub ssd_blocks: Vec<(u8, String)>,
+    /// The session's GPUs in their order (PCI addresses): GPU1 first.
+    #[serde(default)]
+    pub gpu_pcis: Vec<String>,
 }
 
 /// How a session is doing, rewritten every second.
@@ -280,6 +287,8 @@ mod tests {
             started_unix_ms: unix_ms(),
             results_root: results_root.to_owned(),
             pending_cells: Vec::new(),
+            ssd_blocks: Vec::new(),
+            gpu_pcis: Vec::new(),
         }
     }
 

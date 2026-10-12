@@ -664,6 +664,22 @@ fn run_session(
             started_unix_ms: session::unix_ms(),
             results_root: menu.results_root.clone(),
             pending_cells: Vec::new(),
+            ssd_blocks: session.storage.as_ref().map_or_else(Vec::new, |plan| {
+                plan.devices
+                    .iter()
+                    .filter_map(|device| {
+                        u8::try_from(device.alias)
+                            .ok()
+                            .map(|n| (n, device.block_name.clone()))
+                    })
+                    .collect()
+            }),
+            gpu_pcis: session
+                .telemetry
+                .gpus
+                .iter()
+                .map(|gpu| gpu.pci_address.clone())
+                .collect(),
         },
     )
     .ok();
@@ -673,6 +689,13 @@ fn run_session(
         }
         session.current = index;
         session.run_phase(index);
+    }
+    // Releasing the storage and copying the report can take minutes: the black box allows that
+    // while the session says it is finishing.
+    let mut finishing = session.status(&[]);
+    "FINISHING".clone_into(&mut finishing.state);
+    if let Some(writer) = session.writer.as_mut() {
+        writer.beat_now(&mut finishing);
     }
     let cleanup = session.remove_chain_file();
     let release = release_storage(holder);

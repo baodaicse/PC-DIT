@@ -1,0 +1,26 @@
+[Unit]
+Description=DIT-01 black box on tty3: a journal of every test session, and its result when the test cannot write it
+Documentation=file:/usr/share/doc/dit-suite/FAULT_CATCH_ROADMAP.md
+After=local-fs.target
+Conflicts=getty@tty3.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dit-blackbox watch
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty3
+TTYReset=yes
+Environment=TERM=linux
+Restart=always
+RestartSec=1
+# It has to keep running while the tests hold the memory: never the OOM killer's choice, its
+# memory kept for it, ahead in the CPU queue (it also locks itself in RAM). It only watches and
+# records; it never acts on a test.
+OOMScoreAdjust=-1000
+MemoryMin=64M
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

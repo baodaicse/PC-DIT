@@ -26,6 +26,39 @@ pub struct Written {
     pub report: PathBuf,
     /// `Fail summary row added to ...` or why not.
     pub csv: String,
+    /// The `FAIL BY PART` line of what was counted.
+    pub fail_line: String,
+}
+
+/// `FAIL BY PART` from a CSV row's cells (`RAM=3(c2/s1);?SSD1|SSD1-path=1[ssd_timeout]`): the
+/// failed parts only, as the result screens show them.
+#[must_use]
+pub fn fail_line(cells: &str) -> String {
+    let parts: Vec<String> = cells
+        .split(';')
+        .filter_map(|entry| {
+            let entry = entry.split('[').next()?.trim();
+            let (cell, rest) = entry.split_once('=')?;
+            let count = rest.split('(').next()?.trim();
+            let suspected = rest
+                .split("/s")
+                .nth(1)
+                .and_then(|s| s.trim_end_matches(')').parse::<u64>().ok())
+                .unwrap_or(0);
+            Some(if let Some(group) = cell.strip_prefix('?') {
+                format!("? {group} {count}")
+            } else if suspected > 0 {
+                format!("{cell} {count} ({suspected} susp)")
+            } else {
+                format!("{cell} {count}")
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        "FAIL BY PART  none".to_owned()
+    } else {
+        format!("FAIL BY PART  {}", parts.join(" | "))
+    }
 }
 
 #[derive(Serialize)]
@@ -150,6 +183,7 @@ pub fn write_result(
         verdict,
         report,
         csv,
+        fail_line: fail_line(&counts.cells),
     })
 }
 
@@ -158,6 +192,17 @@ mod tests {
     use super::*;
     use dit_orchestrator::fault_ledger::CsvCounts;
     use dit_orchestrator::session::{SessionWriter, unix_ms};
+
+    #[test]
+    fn the_fail_line_lists_the_failed_parts_of_the_cells() {
+        assert_eq!(
+            fail_line(
+                "RAM=3(c2/s1);PLATFORM=1(c1/s0)[worker_crash];?SSD1|SSD1-path=1[ssd_timeout];INVALID[x]"
+            ),
+            "FAIL BY PART  RAM 3 (1 susp) | PLATFORM 1 | ? SSD1|SSD1-path 1"
+        );
+        assert_eq!(fail_line("INVALID[app_hang]"), "FAIL BY PART  none");
+    }
 
     #[test]
     fn utc_dates_come_out_right() {
@@ -180,6 +225,8 @@ mod tests {
                 started_unix_ms: unix_ms(),
                 results_root: results.to_owned(),
                 pending_cells: vec!["CPU".to_owned(), "RAM".to_owned()],
+                ssd_blocks: Vec::new(),
+                gpu_pcis: Vec::new(),
             },
         )
         .unwrap();

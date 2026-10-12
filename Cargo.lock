@@ -227,7 +227,9 @@ name = "dit-blackbox"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dit-contracts",
  "dit-orchestrator",
+ "dit-system",
  "dit-ui-core",
  "nix",
  "serde",

@@ -48,6 +48,8 @@ impl SingleSession {
                     .iter()
                     .map(|cell| (*cell).to_owned())
                     .collect(),
+                ssd_blocks: Vec::new(),
+                gpu_pcis: Vec::new(),
             },
         )
         .ok();

@@ -463,7 +463,13 @@ impl Supervisor<'_> {
         {
             write_json_atomic(&self.args.run_dir.join("watchdog-final.json"), &record)?;
         }
-        if let Some(marker) = &self.args.recovery_marker {
+        // The durable marker is written when the run starts and when it ends, not at every sign
+        // of life: rewriting a file on a FAT stick every second left empty markers after a power
+        // loss. The black box's append-only journal follows the run in between (FC3a).
+        if let Some(marker) = &self.args.recovery_marker
+            && state != WatchdogState::Running
+            && state != WatchdogState::Stalled
+        {
             write_json_atomic(marker, &record)?;
         }
         Ok(())

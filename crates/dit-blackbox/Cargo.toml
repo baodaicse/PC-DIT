@@ -15,6 +15,7 @@ path = "src/bin/dit-rescue.rs"
 
 [dependencies]
 clap.workspace = true
+dit-contracts = { path = "../dit-contracts" }
 dit-orchestrator = { path = "../dit-orchestrator" }
 dit-system = { path = "../dit-system" }
 dit-ui-core = { path = "../dit-ui-core" }

@@ -278,6 +278,10 @@ configure_rootfs() {
         "$ROOTFS/etc/systemd/system/dit-rescue.service"
     sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/etc/sysctl.d/99-dit-sysrq.conf" \
         "$ROOTFS/etc/sysctl.d/99-dit-sysrq.conf"
+    # The black box (tty3): a journal of every session, and its result when the test cannot
+    # write it (FC3a).
+    sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/etc/systemd/system/dit-blackbox.service" \
+        "$ROOTFS/etc/systemd/system/dit-blackbox.service"
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/boot-runner.sh"
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/cpu-dit-ui.sh" \
@@ -304,6 +308,8 @@ configure_rootfs() {
         "$ROOTFS/etc/systemd/system/multi-user.target.wants/cpu-dit.service"
     sudo ln -sfn /etc/systemd/system/dit-rescue.service \
         "$ROOTFS/etc/systemd/system/multi-user.target.wants/dit-rescue.service"
+    sudo ln -sfn /etc/systemd/system/dit-blackbox.service \
+        "$ROOTFS/etc/systemd/system/multi-user.target.wants/dit-blackbox.service"
     for unit in apt-daily.timer apt-daily-upgrade.timer fstrim.timer \
         getty@tty1.service getty@tty2.service getty@tty3.service \
         serial-getty@ttyS0.service rasdaemon.service \
