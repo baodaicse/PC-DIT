@@ -756,6 +756,11 @@ impl CsvCounts {
         } else {
             "INVALID"
         };
+        self.add_marked(mark, code);
+    }
+
+    /// Marks the row with `mark[code]` (`INCOMPLETE[unknown_reset]`).
+    pub fn add_marked(&mut self, mark: &str, code: &str) {
         self.push_cell(&format!("{mark}[{code}]"));
     }
 

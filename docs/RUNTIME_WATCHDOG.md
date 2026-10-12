@@ -21,7 +21,7 @@
 | `OOM_KILLED` | cgroup memory controller ghi nhận OOM kill trong run. |
 | `STALLED_KILLED` | Đã có heartbeat/activity, sau đó hết cập nhật qua stale + grace window. |
 | `MEMORY_GUARD` | Chốt chặn bộ nhớ (`--memory-guard`, lớp CPU-RAM) dừng worker trước khi máy nghẹt RAM: áp lực bộ nhớ full ≥ 20 % (avg10) hoặc còn dưới 256 MiB trống trong 5 giây liên tiếp. Phiên INVALID `memory_guard`, không phải lỗi phần cứng. |
-| `STARTING` / `RUNNING` / `STALLED` trên partition bền ở boot kế | Mất nguồn, reset, kernel panic hoặc supervisor không kịp đóng record; **không phải PASS**. |
+| `STARTING` / `RUNNING` / `STALLED` trên partition bền ở boot kế | Mất nguồn, reset, kernel panic hoặc supervisor không kịp đóng record; **không phải PASS**. Hậu kiểm lúc boot (`dit-blackbox post-mortem`, FC3b) ghi result của phiên từ nhật ký hộp đen rồi đổi marker sang `CLOSED_AT_BOOT`. |
 
 ## Cgroup và mã thoát (FC2)
 

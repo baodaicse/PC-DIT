@@ -112,6 +112,7 @@ fn invalid(code: &str, text: String) -> Decision {
         code: code.to_owned(),
         text,
         cells: Vec::new(),
+        incomplete: false,
     })
 }
 
@@ -120,6 +121,7 @@ fn fail(code: &str, text: String, cells: &[String]) -> Decision {
         code: code.to_owned(),
         text,
         cells: cells.to_vec(),
+        incomplete: false,
     })
 }
 

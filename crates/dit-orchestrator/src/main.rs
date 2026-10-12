@@ -302,7 +302,14 @@ fn render(args: &MenuArgs) -> String {
         usize::from(TerminalSize::current().cols),
         args.attribution_checks,
     );
-    if let Some(recovery) = interrupted_run_notice(&args.results_root) {
+    // FC3b: what the post-mortem found at boot of sessions the last boot left without a result.
+    if let Ok(notice) = fs::read_to_string(POSTMORTEM_NOTICE) {
+        for line in notice.lines().filter(|line| !line.trim().is_empty()) {
+            frame.push_str("\nPREVIOUS SESSION: ");
+            frame.push_str(line);
+        }
+        frame.push('\n');
+    } else if let Some(recovery) = interrupted_run_notice(&args.results_root) {
         frame.push_str("\nWATCHDOG RECOVERY: ");
         frame.push_str(&recovery);
         frame.push_str("\nRead the matching watchdog marker before starting a new test.\n");
@@ -984,6 +991,9 @@ where
     command.arg("--");
     command
 }
+
+/// Written at boot by `dit-blackbox post-mortem` (`FC3b`).
+const POSTMORTEM_NOTICE: &str = "/run/dit-suite/postmortem-notice.txt";
 
 fn recovery_marker_path(results_root: &Path, run_id: &str, module: &str) -> PathBuf {
     results_root

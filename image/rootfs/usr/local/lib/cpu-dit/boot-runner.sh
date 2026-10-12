@@ -138,6 +138,15 @@ if [[ "$PROFILE" == menu ]]; then
         # live telemetry in /run and copies the closed report bundle here once.
         if mount_result_partition; then
             MENU_ARGS+=(--results-root /mnt/cpu-dit-results)
+            # FC3b (docs/FAULT_CATCH_ROADMAP.md): a session the last boot left without a result
+            # (the whole machine died) gets it now, from its black box journal, the board's
+            # reset reason and pstore; the menu shows what was found.
+            modprobe efi_pstore 2>/dev/null || true
+            mountpoint -q /sys/fs/pstore \
+                || mount -t pstore pstore /sys/fs/pstore 2>/dev/null || true
+            timeout --foreground --signal=TERM --kill-after=5s 60s \
+                /usr/local/bin/dit-blackbox post-mortem --results-root /mnt/cpu-dit-results \
+                2>/dev/null || true
         else
             # This path deliberately does not exist, so the orchestrator retains
             # artifacts in tmpfs instead of writing through an unmounted directory.

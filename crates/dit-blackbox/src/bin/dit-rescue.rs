@@ -230,6 +230,7 @@ fn stop(args: &Args, view: &View) -> String {
         code: "operator_rescue".to_owned(),
         text: "stopped by the operator from the rescue console; the app did not answer".to_owned(),
         cells: Vec::new(),
+        incomplete: false,
     };
     let evidence = serde_json::json!({
         "memory": view.memory,

@@ -37,6 +37,22 @@ struct Cli {
 enum Mode {
     /// Watch every session for the whole boot (`dit-blackbox.service`, tty3).
     Watch(WatchArgs),
+    /// At boot, before the menu: results for the sessions the previous boot left without one.
+    PostMortem(PostMortemArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct PostMortemArgs {
+    #[arg(long, default_value = "/mnt/cpu-dit-results")]
+    results_root: PathBuf,
+    #[arg(long, default_value = "/dev/kmsg")]
+    kmsg: PathBuf,
+    /// Where pstore records are: the kernel's, and where systemd moves them at boot.
+    #[arg(long = "pstore", default_values = ["/sys/fs/pstore", "/var/lib/systemd/pstore"])]
+    pstore: Vec<PathBuf>,
+    /// The notice the control center shows above its menu this boot.
+    #[arg(long, default_value = "/run/dit-suite/postmortem-notice.txt")]
+    notice: PathBuf,
 }
 
 #[derive(Debug, clap::Args)]
@@ -492,8 +508,150 @@ fn watch(args: &WatchArgs) -> ExitCode {
     }
 }
 
+/// The last beat's status, as the post-mortem gives it to the result.
+fn status_of(beat: Option<&Value>) -> SessionStatus {
+    let Some(beat) = beat else {
+        return SessionStatus::default();
+    };
+    SessionStatus {
+        heartbeat_unix_ms: beat["t"].as_u64().unwrap_or(0),
+        state: beat["state"].as_str().unwrap_or("").to_owned(),
+        phase: beat["phase"].as_str().unwrap_or("").to_owned(),
+        elapsed_seconds: beat["elapsed_s"].as_u64().unwrap_or(0),
+        failures: beat["failures"].as_u64().unwrap_or(0),
+        counts: serde_json::from_value(beat["counts"].clone()).unwrap_or_default(),
+        ..SessionStatus::default()
+    }
+}
+
+/// Watchdog markers still saying a run is going on (`STARTING`, `RUNNING`, `STALLED`): closed
+/// now, so the menu stops warning about them; the ones no journal covered are noted.
+fn close_markers(results_root: &std::path::Path, handled: &[String], notices: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(results_root.join("watchdog")) else {
+        return;
+    };
+    for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+        let Some(mut marker) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        if !matches!(
+            marker["state"].as_str(),
+            Some("STARTING" | "RUNNING" | "STALLED")
+        ) {
+            continue;
+        }
+        let run_id = marker["run_id"].as_str().unwrap_or("").to_owned();
+        if !handled.iter().any(|id| run_id.starts_with(id.as_str())) {
+            notices.push(format!(
+                "{} {run_id}: ended without a result and without a black box journal (watchdog marker {})",
+                marker["module"].as_str().unwrap_or("test"),
+                path.display()
+            ));
+        }
+        marker["state"] = json!("CLOSED_AT_BOOT");
+        marker["closed_by"] = json!("dit-blackbox post-mortem");
+        marker["closed_unix_ms"] = json!(session::unix_ms());
+        let tmp = path.with_extension("tmp");
+        if serde_json::to_vec_pretty(&marker).is_ok_and(|bytes| std::fs::write(&tmp, bytes).is_ok())
+        {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// `FC3b`: each session the previous boot left with an open journal gets its result from the
+/// journal's last line, the board's reset reason and pstore.
+fn post_mortem(args: &PostMortemArgs) -> ExitCode {
+    if !args.results_root.is_dir() {
+        return ExitCode::SUCCESS;
+    }
+    let kernel: Vec<String> = KernelLog::open(&args.kmsg)
+        .read_new()
+        .into_iter()
+        .filter(host::KernelLine::from_kernel)
+        .map(|line| line.message)
+        .collect();
+    let reason = dit_blackbox::postmortem::reset_reason(&kernel);
+    let mut notices = Vec::new();
+    let mut handled = Vec::new();
+    for path in dit_blackbox::postmortem::open_journals(&args.results_root) {
+        let lines = dit_blackbox::journal::read(&path);
+        let Some(mut info) = lines
+            .iter()
+            .find(|line| line["kind"] == "open")
+            .and_then(|line| serde_json::from_value::<SessionInfo>(line["session"].clone()).ok())
+        else {
+            continue;
+        };
+        // This boot's mount of the same volume.
+        info.results_root.clone_from(&args.results_root);
+        let beat = lines.iter().rev().find(|line| line["kind"] == "beat");
+        let pstore = dit_blackbox::postmortem::read_pstore(&args.pstore, info.started_unix_ms);
+        let cause = dit_blackbox::postmortem::classify(beat, reason.as_deref(), &pstore);
+        let status = status_of(beat);
+        let evidence = json!({
+            "reset_reason": reason,
+            "pstore": pstore,
+            "last_beat": beat,
+            "journal": path,
+        });
+        let written = outcome::write_for(
+            std::path::Path::new(session::ROOT),
+            &info,
+            &status,
+            &args.results_root,
+            "postmortem",
+            &cause,
+            &evidence,
+        );
+        let mut journal = Journal::open(&info);
+        journal.write(&json!({
+            "kind": "postmortem",
+            "t": session::unix_ms(),
+            "verdict": written.as_ref().map(|w| w.verdict).ok(),
+            "cause": cause,
+            "reset_reason": reason,
+        }));
+        // Recorded: the NVRAM space goes back to the firmware.
+        for (file, _) in &pstore.records {
+            if file.starts_with("/sys/fs/pstore") {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        if let Ok(written) = written {
+            notices.push(format!(
+                "{} {}: {} - {}; last seen {} ({} s in). {}",
+                info.csv.test,
+                info.run_id,
+                written.verdict,
+                cause.text,
+                status.phase,
+                status.elapsed_seconds,
+                written.csv
+            ));
+        }
+        handled.push(info.run_id.clone());
+    }
+    close_markers(&args.results_root, &handled, &mut notices);
+    nix::unistd::sync();
+    if !notices.is_empty() {
+        for notice in &notices {
+            println!("PREVIOUS SESSION: {notice}");
+        }
+        if let Some(parent) = args.notice.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&args.notice, notices.join("\n") + "\n");
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     match Cli::parse().command {
         Mode::Watch(args) => watch(&args),
+        Mode::PostMortem(args) => post_mortem(&args),
     }
 }

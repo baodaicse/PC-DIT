@@ -53,6 +53,9 @@ grep -Fxq 'OOMScoreAdjust=-1000' "$BLACKBOX_SERVICE"
 grep -Fxq 'ExecStart=/usr/local/bin/dit-blackbox watch' "$BLACKBOX_SERVICE"
 grep -Fq 'multi-user.target.wants/dit-blackbox.service' "$ROOT_DIR/tools/build_boot_image.sh"
 grep -Fq 'usr/local/bin/dit-blackbox' "$ROOT_DIR/tools/build_image_extension.sh"
+# FC3b: the post-mortem runs at boot once the results volume is mounted, before the menu.
+grep -Fq '/usr/local/bin/dit-blackbox post-mortem --results-root /mnt/cpu-dit-results' "$RUNNER"
+grep -Fq 'mount -t pstore pstore /sys/fs/pstore' "$RUNNER"
 # FC2: tests run in their own memory cgroups under a delegated service cgroup.
 grep -Fxq 'Delegate=yes' "$SERVICE"
 grep -Fq 'export DIT_TEST_CGROUP="$service/tests"' "$RUNNER"

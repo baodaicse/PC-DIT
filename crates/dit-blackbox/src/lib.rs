@@ -5,4 +5,5 @@ pub mod host;
 pub mod journal;
 pub mod kernel_events;
 pub mod outcome;
+pub mod postmortem;
 pub mod watch;

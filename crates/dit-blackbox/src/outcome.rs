@@ -17,6 +17,10 @@ pub struct Cause {
     /// Cells a failure is counted on for it (hardware evidence): one cell, or several when it
     /// cannot be placed on one. Empty: it counts no failure (test infrastructure).
     pub cells: Vec<String>,
+    /// Nothing says what happened (a reset without a reason): the session is INCOMPLETE, neither
+    /// FAIL nor INVALID.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 /// What was written.
@@ -112,6 +116,22 @@ pub fn write_result(
 ) -> Result<Written, String> {
     let info = session::read_info(dir).ok_or("the session cannot be read")?;
     let status = session::read_status(dir).unwrap_or_default();
+    write_for(root, &info, &status, dir, by, cause, evidence)
+}
+
+/// [`write_result`] from a session's description and last status as read elsewhere (the
+/// post-mortem reads them from the journal); `dir` holds the files without a results volume.
+/// # Errors
+/// The result was claimed already (by whom).
+pub fn write_for(
+    root: &Path,
+    info: &SessionInfo,
+    status: &SessionStatus,
+    dir: &Path,
+    by: &str,
+    cause: &Cause,
+    evidence: &serde_json::Value,
+) -> Result<Written, String> {
     if let Claim::Taken(who) = session::claim(&info.results_root, root, &info.run_id, by) {
         return Err(format!("the {who} already wrote this session's result"));
     }
@@ -121,14 +141,18 @@ pub fn write_result(
         &info.pending_cells,
         status.failures.saturating_sub(counts.failures()),
     );
-    if cause.cells.is_empty() {
-        counts.add_cause(&cause.code);
-    } else {
+    if !cause.cells.is_empty() {
         let cells: Vec<&str> = cause.cells.iter().map(String::as_str).collect();
         counts.add_failure(&cells, &cause.code);
+    } else if cause.incomplete && counts.failures() == 0 {
+        counts.add_marked("INCOMPLETE", &cause.code);
+    } else {
+        counts.add_cause(&cause.code);
     }
     let verdict = if counts.failures() > 0 {
         "FAIL"
+    } else if cause.incomplete {
+        "INCOMPLETE"
     } else {
         "INVALID"
     };
@@ -147,8 +171,8 @@ pub fn write_result(
         run_id: &info.run_id,
         verdict,
         cause,
-        session: &info,
-        last_status: &status,
+        session: info,
+        last_status: status,
         evidence,
         written_unix_ms: now,
     };
@@ -250,6 +274,7 @@ mod tests {
             code: "app_hang".to_owned(),
             text: "the app stopped answering".to_owned(),
             cells: Vec::new(),
+            incomplete: false,
         };
         let written =
             write_result(&root, &dir, "blackbox", &cause, &serde_json::json!({})).unwrap();
@@ -282,6 +307,7 @@ mod tests {
             code: "operator_rescue".to_owned(),
             text: "stopped from the rescue console".to_owned(),
             cells: Vec::new(),
+            incomplete: false,
         };
         let written = write_result(&root, &dir, "rescue", &cause, &serde_json::json!({})).unwrap();
         assert_eq!(written.verdict, "FAIL");
