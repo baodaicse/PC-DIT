@@ -11,6 +11,10 @@
 # and sudo to resolve and download the driver's full dependency closure -- the
 # same prerequisites `make nvidia-image` already has, just at package-build
 # time instead of whole-image-build time.
+#
+# Kernel modules: Canonical's signed ones for the image's kernel when the archive has them
+# (they load with Secure Boot on), DKMS otherwise (unsigned: Secure Boot must be off).
+# NVIDIA_MODULE_SOURCE=signed|dkms forces one; the default, auto, prefers signed.
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +23,9 @@ ROOTFS_MARKER="$ROOTFS/.cpu-dit-rootfs-ready"
 STAGING_DIR="$ROOT_DIR/dist/nvidia-driver-package-root"
 ARCHIVE="$ROOT_DIR/dist/dit-nvidia-driver-package.tar.gz"
 NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-}"
+NVIDIA_MODULE_SOURCE="${NVIDIA_MODULE_SOURCE:-auto}"
+# shellcheck source=tools/nvidia_packages.sh
+. "$ROOT_DIR/tools/nvidia_packages.sh"
 
 MOUNTED_PATHS=()
 
@@ -69,13 +76,38 @@ printf '#!/bin/sh\nexit 101\n' | sudo tee "$ROOTFS/usr/sbin/policy-rc.d" >/dev/n
 sudo chmod 0755 "$ROOTFS/usr/sbin/policy-rc.d"
 mount_chroot_filesystems
 sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+branch="$(nvidia_branch "$NVIDIA_DRIVER_PACKAGE")"
+signed_module="$(nvidia_signed_module_package "$NVIDIA_DRIVER_PACKAGE" "$KERNEL_VERSION")"
+case "$NVIDIA_MODULE_SOURCE" in
+    auto)
+        if sudo chroot "$ROOTFS" apt-cache show "$signed_module" >/dev/null 2>&1; then
+            module_source=signed
+        else
+            module_source=dkms
+        fi
+        ;;
+    signed | dkms) module_source="$NVIDIA_MODULE_SOURCE" ;;
+    *) die "invalid NVIDIA_MODULE_SOURCE: $NVIDIA_MODULE_SOURCE (auto, signed or dkms)" ;;
+esac
 # --download-only never unpacks or runs maintainer scripts; it only computes and
-# fetches the full Depends closure apt resolves for these names. build-essential
-# is explicit (not left to Recommends) since DKMS needs a compiler at install
-# time on the target, and this must work with no network there.
-sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install \
-    --download-only -y \
-    "$NVIDIA_DRIVER_PACKAGE" dkms "build-essential" "linux-headers-$KERNEL_VERSION"
+# fetches the full Depends closure apt resolves for these names.
+if [[ "$module_source" == signed ]]; then
+    log "Kernel modules: $signed_module (signed by Canonical, loads with Secure Boot on)"
+    mapfile -t wanted < <(nvidia_signed_packages "$NVIDIA_DRIVER_PACKAGE" "$KERNEL_VERSION")
+    # The modules pin the driver version they were built from; the userspace must be that one.
+    sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install \
+        --download-only -y "${wanted[@]}" \
+        || die "the archive's NVIDIA userspace does not match $signed_module (another driver version?); NVIDIA_MODULE_SOURCE=dkms builds instead, with Secure Boot off"
+    installed_check="$signed_module"
+else
+    log "Kernel modules: DKMS (no $signed_module in the archive); unsigned, Secure Boot must be off"
+    # build-essential is explicit (not left to Recommends) since DKMS needs a compiler at install
+    # time on the target, and this must work with no network there.
+    sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install \
+        --download-only -y \
+        "$NVIDIA_DRIVER_PACKAGE" dkms "build-essential" "linux-headers-$KERNEL_VERSION"
+    installed_check="$NVIDIA_DRIVER_PACKAGE"
+fi
 mkdir -p "$STAGING_DIR/pkgs"
 find "$STAGING_DIR/pkgs" -mindepth 1 -delete
 sudo cp "$ROOTFS"/var/cache/apt/archives/*.deb "$STAGING_DIR/pkgs/"
@@ -85,14 +117,27 @@ package_count=$(find "$STAGING_DIR/pkgs" -name '*.deb' | wc -l)
 log "Downloaded $package_count package(s)"
 
 # The open modules need the GPU's GSP (Turing and newer). For GTX 9xx/10xx and Titan V the
-# driver layer also builds the proprietary modules of the very same version: their two packages,
-# kept apart in pkgs-proprietary/ (they conflict with the open ones, so the closure above cannot
-# hold both; the rest of their dependencies already is in it).
+# driver layer also carries the proprietary modules of the very same version, kept apart in
+# pkgs-proprietary/: signed, Canonical's late-linked packages plus what linking them needs (only
+# the files not already in pkgs/); with DKMS, the two packages that conflict with the open ones
+# (the rest of their dependencies already is in the closure above).
 mkdir -p "$STAGING_DIR/pkgs-proprietary"
 find "$STAGING_DIR/pkgs-proprietary" -mindepth 1 -delete
-if [[ "$NVIDIA_DRIVER_PACKAGE" == *-open ]]; then
-    branch="${NVIDIA_DRIVER_PACKAGE#nvidia-driver-}"
-    branch="${branch%-open}"
+if [[ "$NVIDIA_DRIVER_PACKAGE" == *-open && "$module_source" == signed ]]; then
+    log "Downloading the signed proprietary modules (Maxwell, Pascal, Volta)"
+    sudo chroot "$ROOTFS" apt-get clean
+    mapfile -t wanted < <(nvidia_proprietary_module_packages "$branch" "$KERNEL_VERSION")
+    sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install \
+        --download-only -y "${wanted[@]}" \
+        || die "the signed proprietary modules of $branch for $KERNEL_VERSION could not be resolved"
+    for deb in "$ROOTFS"/var/cache/apt/archives/*.deb; do
+        [[ -f "$STAGING_DIR/pkgs/$(basename "$deb")" ]] && continue
+        sudo cp "$deb" "$STAGING_DIR/pkgs-proprietary/"
+    done
+    sudo chown "$(id -u):$(id -g)" "$STAGING_DIR/pkgs-proprietary"/*.deb
+    compgen -G "$STAGING_DIR/pkgs-proprietary/linux-modules-nvidia-$branch-${KERNEL_VERSION}_*.deb" >/dev/null \
+        || die "linux-modules-nvidia-$branch-$KERNEL_VERSION was not downloaded"
+elif [[ "$NVIDIA_DRIVER_PACKAGE" == *-open ]]; then
     open_dkms=("$STAGING_DIR"/pkgs/nvidia-dkms-"$branch"-open_*.deb)
     [[ -f "${open_dkms[0]}" ]] || die "nvidia-dkms-$branch-open is not in the closure"
     driver_version="$(dpkg-deb -f "${open_dkms[0]}" Version)"
@@ -144,11 +189,13 @@ while [ "$attempt" -le 6 ]; do
 done
 dpkg --configure -a || true
 install -D -m 0644 blacklist-nouveau.conf /etc/modprobe.d/dit-blacklist-nouveau.conf
-driver_status=$(dpkg-query -W -f='${db:Status-Status}' "$(cat driver-package-name.txt)" 2>/dev/null || true)
+# The package that proves the install: the signed modules, or the driver itself with DKMS.
+driver_status=$(dpkg-query -W -f='${db:Status-Status}' "$(cat installed-check.txt)" 2>/dev/null || true)
 [ "$driver_status" = installed ]
 EOF
 
-printf '%s' "$NVIDIA_DRIVER_PACKAGE" >"$STAGING_DIR/driver-package-name.txt"
+rm -f "$STAGING_DIR/driver-package-name.txt"
+printf '%s' "$installed_check" >"$STAGING_DIR/installed-check.txt"
 
 version=$(awk -F '"' '/^version = "/ { print $2; exit }' "$ROOT_DIR/Cargo.toml")
 {
@@ -158,6 +205,7 @@ version=$(awk -F '"' '/^version = "/ { print $2; exit }' "$ROOT_DIR/Cargo.toml")
     printf '  "version": "%s",\n' "$version"
     printf '  "nvidia_driver_package": "%s",\n' "$NVIDIA_DRIVER_PACKAGE"
     printf '  "target_kernel_version": "%s",\n' "$KERNEL_VERSION"
+    printf '  "module_source": "%s",\n' "$module_source"
     printf '  "packages": ['
     first=1
     for deb in "$STAGING_DIR"/pkgs/*.deb; do

@@ -37,7 +37,7 @@ Image generic chứa open kernel stack `i915`, `xe`, `amdgpu`, `amdkfd`, `radeon
 make nvidia-image NVIDIA_DRIVER_PACKAGE=nvidia-driver-NNN-open
 ```
 
-Artifact là `dist/dit-01-noble-amd64-nvidia.img`. Flavor này có rootfs/cache riêng, blacklist `nouveau`, probe duy nhất module NVIDIA và ghi package/profile vào build-info + image manifest; Secure Boot của image vẫn tắt. Thay `NNN` bằng nhánh driver đã chọn cho GPU/hardware matrix, rồi validation lại image/driver cụ thể.
+Artifact là `dist/dit-01-noble-amd64-nvidia.img`. Flavor này có rootfs/cache riêng, blacklist `nouveau`, probe duy nhất module NVIDIA và ghi package/profile vào build-info + image manifest; module NVIDIA là bản Canonical đã ký nên boot được khi Secure Boot bật (xem `docs/SECURE_BOOT.md`). Thay `NNN` bằng nhánh driver đã chọn cho GPU/hardware matrix, rồi validation lại image/driver cụ thể.
 
 ```text
 DIT-01/

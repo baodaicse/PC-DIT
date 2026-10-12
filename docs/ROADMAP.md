@@ -35,6 +35,13 @@ Trạng thái: `implemented` (2026-10-12) FC0–FC7 ở source/host gate và QEM
 - Không mất phiên: hộp đen là service độc lập, chỉ quan sát và ghi; khi app chết, treo hoặc không ghi nhận sự cố, nó tự ra result ngay trong phiên và chuyển sang màn kết quả. Chỉ khi cả máy chết mới hậu kiểm ở lần boot sau (lý do reset AMD, pstore).
 - Ghi đúng nguyên nhân: watchdog xét I/O và CPU trước khi kết luận treo; PLATFORM tách theo nguyên nhân; lỗi hạ tầng test chỉ làm phiên INVALID.
 
+### U2.3 — Boot khi Secure Boot bật
+
+Trạng thái: `implemented` (2026-10-12) ở build và QEMU; chưa kiểm trên máy thật. Chi tiết: [SECURE_BOOT.md](SECURE_BOOT.md).
+
+- `.img` và ISO dùng chuỗi Ubuntu đã ký: shim (Microsoft) → GRUB → kernel `7.0.0-38` (Canonical). BIOS không đổi.
+- Driver NVIDIA dùng module Canonical đã ký (open và proprietary), DKMS chỉ còn là đường dự phòng.
+
 ## U3 — Phát triển module và phối hợp
 
 ### CPU–RAM availability và power-platform hardening

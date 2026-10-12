@@ -98,7 +98,7 @@ image gốc. Xem các biến tùy chỉnh tại
 3. `Boot selection` → `SELECT`.
 4. Chọn `dist/dit-01-noble-amd64.img`.
 5. Nhấn `START` và chọn `Write in DD Image mode` nếu được hỏi.
-6. Eject USB an toàn, tắt Secure Boot và boot từ USB.
+6. Eject USB an toàn và boot từ USB. Không cần tắt Secure Boot (xem `docs/SECURE_BOOT.md`).
 
 Kiểm hash trên Windows trước khi ghi:
 

@@ -44,7 +44,7 @@ ban đầu là `NOT_VALIDATED`; không đổi bằng cảm nhận thủ công.
 3. Ghi BIOS/UEFI version, CPU, mainboard, từng DIMM, slot, speed, ECC, PSU và
    điều kiện tản nhiệt vào mẫu biên bản.
 4. Xác minh quạt quay, heatsink lắp đúng; lượt Safe đầu phải có người giám sát.
-5. Tắt Secure Boot cho image v1 unsigned.
+5. Ghi lại Secure Boot đang bật hay tắt vào biên bản; image boot được cả hai (chuỗi Ubuntu đã ký, xem `docs/SECURE_BOOT.md`).
 
 ## 3. Khóa image và tạo USB
 

@@ -10,6 +10,12 @@ RESULT_MIB="${RESULT_MIB:-1024}"
 # the nvidia-driver-580-open layer measured 510 MiB). 0 builds a boot partition with no room for one.
 LAYER_RESERVE_MIB="${LAYER_RESERVE_MIB:-768}"
 NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-}"
+# The image's kernel, pinned: Ubuntu signs it (Secure Boot) and publishes NVIDIA modules signed for
+# exactly this ABI, matching the driver's userspace version (linux-modules-nvidia-*-<abi>-generic).
+# Moving it means checking that both still hold for the new ABI.
+KERNEL_ABI="${KERNEL_ABI:-7.0.0-38}"
+# Ubuntu's signed UEFI chain (shim signed by Microsoft, GRUB by Canonical), taken from the archive.
+EFI_SIGNED="$BUILD_ROOT/efi-signed"
 BUILD_EPOCH=""
 BUILD_TIME_LOCAL=""
 GPU_DRIVER_PROFILE="open"
@@ -49,7 +55,11 @@ DIAGNOSTIC_PACKAGES=(
     ethtool
 )
 if [[ "$GPU_DRIVER_PROFILE" == nvidia ]]; then
-    DIAGNOSTIC_PACKAGES+=(linux-headers-generic-hwe-24.04 "$NVIDIA_DRIVER_PACKAGE")
+    # Canonical's signed modules for the pinned kernel (Secure Boot stays on), not DKMS builds.
+    # shellcheck source=tools/nvidia_packages.sh
+    . "$ROOT_DIR/tools/nvidia_packages.sh"
+    mapfile -t nvidia_packages < <(nvidia_signed_packages "$NVIDIA_DRIVER_PACKAGE" "$KERNEL_ABI-generic")
+    DIAGNOSTIC_PACKAGES+=("${nvidia_packages[@]}")
 fi
 
 MOUNTED_PATHS=()
@@ -191,11 +201,12 @@ bootstrap_rootfs() {
     sudo chmod 0755 "$ROOTFS/usr/sbin/policy-rc.d"
 
     mount_chroot_filesystems
-    log "Installing live boot, HWE kernel and minimal diagnostic userland"
+    log "Installing live boot, the pinned kernel and minimal diagnostic userland"
     sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
     sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y \
         --no-install-recommends \
-        linux-image-generic-hwe-24.04 live-boot systemd-sysv initramfs-tools \
+        "linux-image-$KERNEL_ABI-generic" "linux-modules-$KERNEL_ABI-generic" \
+        live-boot systemd-sysv initramfs-tools \
         bash ca-certificates coreutils util-linux kmod procps pciutils usbutils \
         uuid-runtime rsync less nano "${DIAGNOSTIC_PACKAGES[@]}"
     sudo chroot "$ROOTFS" update-initramfs -u -k all
@@ -217,6 +228,92 @@ verify_image_storage_tools() {
     done
     (( ${#missing[@]} == 0 )) || die "image rootfs lacks storage tools: ${missing[*]}"
     log "Storage tools present: ${IMAGE_STORAGE_TOOLS[*]}"
+}
+
+# The pinned kernel (KERNEL_ABI) and no other: the live boot uses the newest vmlinuz in /boot and
+# the NVIDIA layer the newest /lib/modules, so an older kernel left behind would only cost room.
+ensure_kernel() {
+    local kernel="linux-image-$KERNEL_ABI-generic" others
+    if ! sudo chroot "$ROOTFS" dpkg-query -W -f='${db:Status-Status}' "$kernel" 2>/dev/null \
+        | grep -qx installed; then
+        log "Installing the pinned kernel $KERNEL_ABI-generic"
+        printf '#!/bin/sh\nexit 101\n' | sudo tee "$ROOTFS/usr/sbin/policy-rc.d" >/dev/null
+        sudo chmod 0755 "$ROOTFS/usr/sbin/policy-rc.d"
+        mount_chroot_filesystems
+        sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+        sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends "$kernel" "linux-modules-$KERNEL_ABI-generic"
+        sudo chroot "$ROOTFS" apt-get clean
+        sudo rm -f "$ROOTFS/usr/sbin/policy-rc.d"
+        unmount_chroot_filesystems
+    fi
+    others="$(sudo chroot "$ROOTFS" dpkg-query -W -f='${Package} ${db:Status-Status}\n' \
+        'linux-image-*' 'linux-modules-*' 'linux-headers-*' 'linux-hwe-*' 2>/dev/null \
+        | awk -v keep="$KERNEL_ABI" '$2 == "installed" && index($1, keep) == 0 { print $1 }')"
+    if [[ -n "$others" ]]; then
+        log "Removing other kernels: $(echo $others)"
+        mount_chroot_filesystems
+        # shellcheck disable=SC2086
+        sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get purge -y $others
+        unmount_chroot_filesystems
+    fi
+    [[ -f "$ROOTFS/boot/vmlinuz-$KERNEL_ABI-generic" && -f "$ROOTFS/boot/initrd.img-$KERNEL_ABI-generic" ]] \
+        || die "the pinned kernel $KERNEL_ABI-generic is not complete in the rootfs"
+    if command -v sbverify >/dev/null 2>&1; then
+        sudo sbverify --list "$ROOTFS/boot/vmlinuz-$KERNEL_ABI-generic" 2>/dev/null \
+            | grep -q 'Canonical' || die "vmlinuz-$KERNEL_ABI-generic carries no Canonical signature"
+    fi
+    log "Kernel: $KERNEL_ABI-generic (signed)"
+}
+
+# Ubuntu's signed UEFI boot chain, downloaded once from the archive into $EFI_SIGNED: shimx64
+# (signed by Microsoft's UEFI CA), MokManager, and GRUB signed by Canonical. Firmware with Secure
+# Boot on trusts shim, shim trusts Canonical's GRUB and kernel: the USB boots without turning
+# Secure Boot off.
+fetch_signed_efi() {
+    local file
+    if [[ -s "$EFI_SIGNED/shimx64.efi.signed" && -s "$EFI_SIGNED/grubx64.efi.signed" \
+        && -s "$EFI_SIGNED/mmx64.efi" ]]; then
+        return
+    fi
+    log "Downloading Ubuntu's signed shim and GRUB"
+    sudo rm -rf "$ROOTFS/var/tmp/dit-efi" "$EFI_SIGNED"
+    sudo mkdir -p "$ROOTFS/var/tmp/dit-efi"
+    mount_chroot_filesystems
+    sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+    sudo chroot "$ROOTFS" sh -c 'cd /var/tmp/dit-efi && apt-get download shim-signed grub-efi-amd64-signed'
+    unmount_chroot_filesystems
+    mkdir -p "$EFI_SIGNED/x"
+    for file in "$ROOTFS"/var/tmp/dit-efi/*.deb; do
+        dpkg-deb -x "$file" "$EFI_SIGNED/x"
+    done
+    sudo rm -rf "$ROOTFS/var/tmp/dit-efi"
+    if [[ -f "$EFI_SIGNED/x/usr/lib/shim/shimx64.efi.signed.latest" ]]; then
+        install -m 0644 "$EFI_SIGNED/x/usr/lib/shim/shimx64.efi.signed.latest" "$EFI_SIGNED/shimx64.efi.signed"
+    else
+        install -m 0644 "$EFI_SIGNED/x/usr/lib/shim/shimx64.efi.signed" "$EFI_SIGNED/shimx64.efi.signed"
+    fi
+    install -m 0644 "$EFI_SIGNED/x/usr/lib/shim/mmx64.efi" "$EFI_SIGNED/mmx64.efi"
+    install -m 0644 "$EFI_SIGNED/x/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed" \
+        "$EFI_SIGNED/grubx64.efi.signed"
+    rm -rf "$EFI_SIGNED/x"
+    if command -v sbverify >/dev/null 2>&1; then
+        sbverify --list "$EFI_SIGNED/shimx64.efi.signed" | grep -q 'Microsoft' \
+            || die "shimx64 is not signed by Microsoft"
+        sbverify --list "$EFI_SIGNED/grubx64.efi.signed" | grep -q 'Canonical' \
+            || die "grubx64 is not signed by Canonical"
+    fi
+}
+
+# Signed GRUB reads /EFI/ubuntu/grub.cfg on the partition it was loaded from; that file finds the
+# boot payload by this build's own marker and opens the one boot menu, shared with BIOS.
+render_efi_grub_cfg() {
+    local image_id="$1" dest="$2"
+    printf '%s\n' \
+        "search --no-floppy --file --set=root /cpu-dit/boot-$image_id.mark" \
+        'set prefix=($root)/boot/grub' \
+        'configfile ($root)/boot/grub/grub.cfg' >"$dest"
+    chmod 0644 "$dest"
 }
 
 ensure_diagnostic_packages() {
@@ -388,6 +485,7 @@ make_boot_payload() {
     render_grub_cfg "$image_id" "$staging/boot/grub/grub.cfg"
     install -m 0644 "$ROOT_DIR/image/boot/CPU-DIT-README.txt" "$staging/CPU-DIT-README.txt"
     printf '%s\n' "$image_id" >"$staging/cpu-dit/image-id"
+    printf '%s\n' "$image_id" >"$staging/cpu-dit/boot-$image_id.mark"
     sudo mksquashfs "$ROOTFS" "$staging/live/filesystem.squashfs" \
         -noappend -all-root -comp zstd -Xcompression-level 15 -wildcards \
         -e 'boot/*' 'dev/*' 'proc/*' 'sys/*' 'run/*' 'tmp/*' '.cpu-dit-rootfs-ready'
@@ -444,10 +542,12 @@ EOF
     log "Installing GRUB for legacy BIOS"
     sudo grub-install --target=i386-pc --boot-directory="$boot_mount/boot" \
         --modules="part_gpt fat normal linux search search_fs_uuid" --no-floppy --recheck "$LOOP_DEVICE"
-    log "Installing removable GRUB for x86_64 UEFI"
-    sudo grub-install --target=x86_64-efi --efi-directory="$boot_mount" \
-        --boot-directory="$boot_mount/boot" --removable --no-nvram --no-uefi-secure-boot \
-        --modules="part_gpt fat normal linux search search_fs_uuid"
+    log "Installing the signed UEFI chain (shim -> Canonical GRUB): boots with Secure Boot on"
+    sudo install -D -m 0644 "$EFI_SIGNED/shimx64.efi.signed" "$boot_mount/EFI/BOOT/BOOTX64.EFI"
+    sudo install -D -m 0644 "$EFI_SIGNED/grubx64.efi.signed" "$boot_mount/EFI/BOOT/grubx64.efi"
+    sudo install -D -m 0644 "$EFI_SIGNED/mmx64.efi" "$boot_mount/EFI/BOOT/mmx64.efi"
+    render_efi_grub_cfg "$image_id" "$TEMP_DIR/efi-grub.cfg"
+    sudo install -D -m 0644 "$TEMP_DIR/efi-grub.cfg" "$boot_mount/EFI/ubuntu/grub.cfg"
     render_grub_cfg "$image_id" "$TEMP_DIR/grub.cfg"
     sudo install -m 0644 "$TEMP_DIR/grub.cfg" "$boot_mount/boot/grub/grub.cfg"
     sync
@@ -479,7 +579,8 @@ write_manifest() {
   "ubuntu_release": "24.04-noble",
   "architecture": "amd64",
   "boot_modes": ["legacy_bios", "uefi"],
-  "secure_boot": false,
+  "secure_boot": true,
+  "kernel": "$KERNEL_ABI-generic",
   "gpu_driver_profile": "$GPU_DRIVER_PROFILE",
   "nvidia_driver_package": "${NVIDIA_DRIVER_PACKAGE:-none}",
   "layer_reserve_mib": $LAYER_RESERVE_MIB,
@@ -492,6 +593,7 @@ EOF
 release_payload_fingerprint() {
     {
         sha256sum "$ROOT_DIR/target/release/dit-cli"
+        printf 'kernel %s\n' "$KERNEL_ABI"
         find "$ROOT_DIR/image" "$ROOT_DIR/vectors" -type f -print0 \
             | sort -z \
             | xargs -0 sha256sum
@@ -512,6 +614,8 @@ main() {
     "$ROOT_DIR/tools/build_image_extension.sh"
     bootstrap_rootfs
     ensure_diagnostic_packages
+    ensure_kernel
+    fetch_signed_efi
     verify_image_storage_tools
     disable_nouveau
     configure_gpu_driver_profile

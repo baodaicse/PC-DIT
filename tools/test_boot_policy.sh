@@ -192,6 +192,20 @@ grep -Fq -- '-volid DIT-BOOT' "$ISO_BUILDER"
 grep -Fq -- '-append_partition 3 0x0c' "$ISO_BUILDER"
 grep -Fq 'mkfs.fat -F 32 -n DIT-RESULTS' "$ISO_BUILDER"
 grep -Fq '::/CPU-DIT-RESULTS.ID' "$ISO_BUILDER"
+# Secure Boot: the UEFI boot is Ubuntu's signed chain (shim -> Canonical GRUB -> Canonical
+# kernel) on both the .img and the ISO, never a GRUB of our own; the NVIDIA modules are
+# Canonical's signed ones whenever the archive has them for the image's kernel.
+if grep -Fq -- '--no-uefi-secure-boot' "$ROOT_DIR/tools/build_boot_image.sh"; then
+    printf 'BOOT_POLICY_FAIL: the UEFI boot must be the signed chain, not an unsigned GRUB\n' >&2
+    exit 2
+fi
+grep -Fq 'shimx64.efi.signed" "$boot_mount/EFI/BOOT/BOOTX64.EFI"' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'grubx64.efi.signed" "$boot_mount/EFI/BOOT/grubx64.efi"' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq '"$boot_mount/EFI/ubuntu/grub.cfg"' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq "carries no Canonical signature" "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq -- '-map "$WORK/efi.img" /efi.img' "$ISO_BUILDER"
+grep -Fq 'nvidia_signed_module_package' "$NVIDIA_PACKAGE_BUILDER"
+grep -Fq 'is not signed' "$NVIDIA_LAYER_BUILDER"
 grep -Fq 'disk:iso9660' "$PARTITION_LOOKUP"
 grep -Fq 'part:vfat' "$PARTITION_LOOKUP"
 # The ISO's Apple HFS+ partition repeats the DIT-BOOT label; only FAT/ISO9660 may match.

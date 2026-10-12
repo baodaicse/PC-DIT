@@ -213,6 +213,28 @@ Lớp driver nay chứa **cả hai bộ module cùng phiên bản** (580.178.04)
    Turing, Blackwell, Pascal, Maxwell, Pascal + Turing, Pascal + Blackwell, thiếu bản proprietary,
    module bị giữ, không có GPU.
 
+## Module đã ký, Secure Boot bật (2026-10-12)
+
+Module do DKMS build không có chữ ký, nên kernel từ chối nạp chúng khi Secure Boot bật. Nay gói
+offline và lớp driver lấy module Canonical đã build và ký cho đúng kernel của image (`7.0.0-38`):
+
+- open: `linux-modules-nvidia-580-open-<kernel>` (`.ko` có sẵn);
+- proprietary: `linux-modules-nvidia-580-<kernel>`. Gói này link `.ko` lúc cài từ
+  `linux-objects-nvidia-580-<kernel>` và `linux-signatures-nvidia-<kernel>`, rồi kiểm SHA-256.
+  Việc link cần `binutils` và header kernel. Chúng nằm trong `pkgs-proprietary/` và không vào lớp,
+  vì `/usr/src` bị loại ra; object (~100 MiB) cũng bị gỡ sau khi link.
+
+Userspace vẫn đúng như `nvidia-driver-580-open` nhưng bỏ `nvidia-dkms-*` và `nvidia-kernel-source-*`.
+Danh sách gói nằm ở `tools/nvidia_packages.sh`. Hai bộ module vẫn được cất ở
+`/usr/lib/dit/nvidia-modules/{open,proprietary}`, bản open nằm ở `updates/dkms`, nên
+`nvidia-flavor.sh` không đổi. Build dừng lại nếu có `nvidia.ko` không mang chữ ký.
+
+Nguồn module được chọn tự động: dùng bản đã ký nếu archive có cho kernel của image, nếu không thì
+dùng DKMS như các mục trên (khi đó phải tắt Secure Boot). Có thể ép bằng
+`NVIDIA_MODULE_SOURCE=signed|dkms`. Manifest của gói và của lớp ghi `module_source`, manifest của
+lớp còn ghi `secure_boot`. Gói cũ chưa có `module_source` sẽ được build lại. Chi tiết toàn chuỗi boot
+ở `docs/SECURE_BOOT.md`.
+
 ## Cách dùng
 
 ```sh
@@ -284,4 +306,6 @@ Trong sandbox phát triển (có mạng + sudo + `debootstrap`, dùng lại root
   (`RESULT_MIB`) với nhiều chỗ trống cho kết quả test; driver bản khác/nhiều gói phụ thuộc hơn có
   thể lớn hơn — nếu không đủ chỗ, `--nvidia-driver-package` của `burn_usb.sh` báo lỗi copy rõ ràng,
   không âm thầm cắt bớt.
-- Secure Boot, nhiều bản driver/kernel khác nhau, và multi-GPU chưa được xét riêng cho đường này.
+- Secure Boot: từ 2026-10-12 module là bản Canonical đã ký (`linux-modules-nvidia-*`), không còn
+  DKMS khi archive có bản cho kernel của image; xem mục dưới và `docs/SECURE_BOOT.md`. Nhiều bản
+  driver/kernel khác nhau và multi-GPU chưa được xét riêng cho đường này.

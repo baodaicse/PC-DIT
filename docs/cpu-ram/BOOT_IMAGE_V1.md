@@ -22,7 +22,7 @@ read-only và tmpfs overlay. Một USB từ 4 GB trở lên là đủ cho artifa
 2. `Boot selection` → `SELECT` → chọn `cpu-dit-01-noble-amd64.img`.
 3. Nhấn `START`. Nếu Rufus hỏi phương thức, chọn `Write in DD Image mode`.
 4. Chờ Rufus hoàn tất rồi eject USB an toàn.
-5. Vào BIOS/UEFI của máy test, tắt Secure Boot và boot từ USB.
+5. Vào BIOS/UEFI của máy test và boot từ USB. Secure Boot để bật cũng được (xem `docs/SECURE_BOOT.md`).
 
 Rufus hỗ trợ ghi flat `.img` theo DD/raw mode; [FAQ chính thức của Rufus](https://github.com/pbatard/rufus/wiki/FAQ)
 cũng mô tả DD Image mode. Không format hoặc copy riêng các file bên trong image.
@@ -167,12 +167,13 @@ theo thời gian monotonic. Sensor không tồn tại hoặc không đọc đư�
 “Driver rộng” ở đây là driver nguồn mở/module/firmware do Ubuntu HWE cung cấp cho
 phạm vi CPU/RAM và diagnostic phổ biến. Image không thể cam kết mọi thiết bị đời
 mới, driver độc quyền GPU, vendor out-of-tree hoặc sensor bị firmware khóa.
-NVIDIA proprietary cần flavor riêng khớp GPU/kernel và quy trình Secure Boot;
-image mặc định dùng nouveau.
+NVIDIA cần flavor/lớp driver riêng khớp kernel; module là bản Canonical đã ký nên chạy
+được khi Secure Boot bật. Image mặc định chặn nouveau.
 
 ## Giới hạn v1
 
-- GRUB tùy biến chưa ký, do đó phải tắt Secure Boot.
+- UEFI dùng chuỗi Ubuntu đã ký (shim → GRUB → kernel của Canonical), boot được khi Secure Boot bật
+  (từ 2026-10-12, `docs/SECURE_BOOT.md`).
 - Đã kiểm boot bằng QEMU BIOS/UEFI nhưng chưa được `validated` trên USB/hardware
   matrix thật.
 - Hard watchdog có thể TERM/KILL process bị treo; kernel/firmware hard hang vẫn

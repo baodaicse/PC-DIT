@@ -65,8 +65,8 @@ dist/dit-01-noble-amd64.img
 SHA-256: 115c3afe2318285ef633827e725f33cbeb3916b72f8bc537b1a4d69916205395
 ```
 
-USB tối thiểu 4 GB. Ghi toàn bộ file `.img` ở chế độ raw/DD, tắt Secure Boot,
-boot USB. Dashboard khi test sẽ hiện phần cứng, live CPU/RAM, phase, round, target,
+USB tối thiểu 4 GB. Ghi toàn bộ file `.img` ở chế độ raw/DD rồi boot USB; không cần
+tắt Secure Boot. Dashboard khi test sẽ hiện phần cứng, live CPU/RAM, phase, round, target,
 nhiệt độ và Watt nếu kernel cung cấp sensor;
 Safe tự chạy sau 10 giây nếu không bấm phím và giữ tải ít nhất 2 phút. Full mặc
 định chạy ít nhất 30 phút, dùng 95% vùng allocatable còn lại sau reserve 512 MiB.

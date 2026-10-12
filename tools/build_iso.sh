@@ -55,6 +55,13 @@ boot_fs="$IMAGE@@$(( boot_start * 512 ))"
 log "Copying the boot payload out of DIT-BOOT"
 mcopy -s -n -i "$boot_fs" ::/live ::/cpu-dit ::/CPU-DIT-README.txt "$WORK/root/"
 mcopy -n -i "$boot_fs" ::/boot/grub/grub.cfg "$WORK/root/boot/grub/grub.cfg"
+# The signed UEFI chain of the image (shim -> Canonical GRUB, Secure Boot on) and its small
+# EFI/ubuntu/grub.cfg, which finds this build's marker on the ISO and opens the same menu.
+mkdir -p "$WORK/efi"
+mcopy -s -n -i "$boot_fs" ::/EFI "$WORK/efi/"
+for file in EFI/BOOT/BOOTX64.EFI EFI/BOOT/grubx64.efi EFI/BOOT/mmx64.efi EFI/ubuntu/grub.cfg; do
+    [[ -s "$WORK/efi/$file" ]] || die "the image's signed UEFI chain is missing $file (rebuild it: make image)"
+done
 for file in live/vmlinuz live/initrd.img live/filesystem.squashfs cpu-dit/image-id; do
     [[ -s "$WORK/root/$file" ]] || die "boot payload is missing $file"
 done
@@ -93,10 +100,26 @@ mmd -i "$WORK/results.img" ::/runs
 # id is what partition-lookup.sh matches, as the FAT label on the .img.
 log "Writing $(basename "$ISO")"
 grub-mkrescue -o "$ISO.tmp" "$WORK/root" -- \
-    -volid DIT-BOOT \
-    -append_partition 3 0x0c "$WORK/results.img" >"$WORK/grub-mkrescue.log" 2>&1 \
+    -volid DIT-BOOT >"$WORK/grub-mkrescue.log" 2>&1 \
     || { tail -n 30 "$WORK/grub-mkrescue.log" >&2; die "grub-mkrescue failed"; }
-mv -f "$ISO.tmp" "$ISO"
+# grub-mkrescue's own UEFI image (/efi.img: its GRUB, unsigned, 2.88 MB) is replaced by the
+# image's signed chain, which needs more room. Replaying the boot equipment keeps the BIOS boot,
+# the GPT EFI partition and the HFS+ one; the isohybrid-style MBR entries would overlap the
+# protective one once the EFI image grows, so the MBR keeps only the protective entry and
+# DIT-RESULTS, appended here (as partition 3, 0x0c, like before).
+log "Putting the signed UEFI chain in place of grub-mkrescue's EFI image"
+truncate -s 8M "$WORK/efi.img"
+mkfs.fat -n DIT-EFI "$WORK/efi.img" >/dev/null
+mmd -i "$WORK/efi.img" ::/EFI ::/EFI/BOOT ::/EFI/ubuntu
+for file in EFI/BOOT/BOOTX64.EFI EFI/BOOT/grubx64.efi EFI/BOOT/mmx64.efi EFI/ubuntu/grub.cfg; do
+    mcopy -i "$WORK/efi.img" "$WORK/efi/$file" "::/$file"
+done
+xorriso -indev "$ISO.tmp" -outdev "$ISO.signed" -boot_image any replay \
+    -map "$WORK/efi.img" /efi.img -boot_image any part_like_isohybrid=off \
+    -append_partition 3 0x0c "$WORK/results.img" -commit >"$WORK/xorriso-replay.log" 2>&1 \
+    || { tail -n 30 "$WORK/xorriso-replay.log" >&2; die "xorriso could not put the signed EFI image in"; }
+rm -f "$ISO.tmp"
+mv -f "$ISO.signed" "$ISO"
 
 sha="$(sha256sum "$ISO" | awk '{print $1}')"
 bytes="$(stat -c %s "$ISO")"
@@ -114,7 +137,7 @@ cat >"$ISO.manifest.json" <<EOF
   "source_image": "$(basename "$IMAGE")",
   "source_image_sha256": "$(awk '{print $1}' "$IMAGE.sha256")",
   "boot_modes": ["legacy_bios", "uefi"],
-  "secure_boot": false,
+  "secure_boot": true,
   "nvidia_driver_layer": {
     "nvidia_driver_package": "$layer_driver",
     "target_kernel_version": "$(awk -F'"' '/"target_kernel_version":/ { print $4 }' "$LAYER.manifest.json")",

@@ -139,7 +139,7 @@ nvidia-image: test
 	@test -n '$(NVIDIA_DRIVER_PACKAGE)' || { echo 'Set NVIDIA_DRIVER_PACKAGE (example: nvidia-driver-NNN-open)'; exit 2; }
 	NVIDIA_DRIVER_PACKAGE='$(NVIDIA_DRIVER_PACKAGE)' ./tools/build_boot_image.sh
 	@cd '$(PROJECT_ROOT)/dist' && sha256sum --check 'dit-01-noble-amd64-nvidia.img.sha256'
-	@printf '\nDIT-01 NVIDIA RUFUS IMAGE READY\n%s\nUse Rufus DD/raw mode; Secure Boot is disabled.\n' \
+	@printf '\nDIT-01 NVIDIA RUFUS IMAGE READY\n%s\nUse Rufus DD/raw mode; Secure Boot may stay on.\n' \
 	  '$(PROJECT_ROOT)/dist/dit-01-noble-amd64-nvidia.img'
 
 verify-image:
