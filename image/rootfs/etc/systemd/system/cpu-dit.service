@@ -14,6 +14,12 @@ TimeoutStartSec=infinity
 # Reboot / power off must not wait: the UI exits on SIGTERM at once and every test process gets
 # SIGTERM too; whatever is still running after 10 s is killed.
 TimeoutStopSec=10s
+# FC2 (docs/FAULT_CATCH_ROADMAP.md): the runner splits this service into app/ (control center,
+# watchdogs; memory kept for it) and tests/ (each test in its own cgroup, all of them under a
+# memory.max), so tests that outgrow the memory are ended by the kernel instead of stalling the
+# machine, and each test's OOM kills are its own.
+Delegate=yes
+MemoryMin=256M
 
 [Install]
 WantedBy=multi-user.target

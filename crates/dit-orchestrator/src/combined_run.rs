@@ -288,7 +288,19 @@ struct MemorySample {
     at_seconds: u64,
     mem_available_mib: u64,
     held_by_tests_mib: u64,
+    /// Memory pressure (`/proc/pressure/memory`, avg10 %): some / all tasks waiting on memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pressure_some: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pressure_full: Option<f64>,
 }
+
+/// Memory is sampled every second for this long after an overlap starts (every 5 s otherwise):
+/// the moment every layer asks for memory at once (FC2).
+const OVERLAP_CLOSE_WATCH: Duration = Duration::from_mins(2);
+/// The overlap starts its layers at least this far apart, so the timeline shows which one took
+/// the memory (FC2).
+const LAYER_START_GAP: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Totals {
@@ -360,6 +372,8 @@ struct Session<'a> {
     /// The live session for the black box and the rescue console (FC1, `FC3a`).
     writer: Option<SessionWriter>,
     last_beat: Option<Instant>,
+    /// Why the session ended early, as cause codes for its CSV row (`memory_guard`).
+    causes: Vec<&'static str>,
 }
 
 /// Mark of a result from the Fault Attribution boot entry (`fail-summary.csv` test column).
@@ -638,6 +652,7 @@ fn run_session(
         monitor,
         writer: None,
         last_beat: None,
+        causes: Vec::new(),
     };
     session.writer = SessionWriter::open(
         Path::new(session::ROOT),
@@ -1016,7 +1031,16 @@ impl Session<'_> {
             match self.launch_layer(index, layer, remaining(), true) {
                 Ok(started) => {
                     running.push(started);
+                    let launched = Instant::now();
                     self.wait_ready(&mut running, record);
+                    // FC2: the next layer starts a few seconds later at least, so the memory
+                    // timeline shows what each one took.
+                    while launched.elapsed() < LAYER_START_GAP
+                        && self.abort.is_none()
+                        && !INTERRUPTED.load(Ordering::SeqCst)
+                    {
+                        self.tick(&mut running, record);
+                    }
                 }
                 Err(error) => record.layers.push(self.not_started(index, layer, error)),
             }
@@ -1180,15 +1204,25 @@ impl Session<'_> {
             }
         }
         self.beat(running);
-        if self
-            .last_sample
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
-        {
+        let overlap_start = self
+            .phases
+            .get(self.current)
+            .is_some_and(|phase| phase.kind == PhaseKind::Overlap)
+            && self.phase_started.elapsed() < OVERLAP_CLOSE_WATCH;
+        let period = if overlap_start {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        if self.last_sample.is_none_or(|last| last.elapsed() >= period) {
             self.last_sample = Some(Instant::now());
+            let pressure = dit_system::pressure::pressure(Path::new("/proc"), "memory");
             self.timeline.push(MemorySample {
                 at_seconds: self.started.elapsed().as_secs(),
                 mem_available_mib: self.telemetry.mem_available_bytes / MIB,
                 held_by_tests_mib: held / MIB,
+                pressure_some: pressure.map(|p| p.some_avg10),
+                pressure_full: pressure.map(|p| p.full_avg10),
             });
         }
         self.draw(running, held);
@@ -1216,6 +1250,17 @@ impl Session<'_> {
             self.peaks.insert(ended.layer, ended.peak_bytes);
         }
         self.attribute(&ended, outcome, &detail, &record.label);
+        // FC2: the memory guard stopped CPU-RAM; the other layers go on no further.
+        if outcome == LayerOutcome::Invalid && detail.starts_with("memory guard") {
+            self.causes.push("memory_guard");
+            if self.abort.is_none() {
+                self.abort = Some(format!(
+                    "{} was stopped by the memory guard in phase {}: {detail}",
+                    ended.layer.label(),
+                    record.label
+                ));
+            }
+        }
         if outcome == LayerOutcome::Crashed && self.abort.is_none() {
             self.abort = Some(format!(
                 "{} ended without a report in phase {}: {detail}",
@@ -1501,8 +1546,14 @@ impl Session<'_> {
             ..self.csv_meta()
         };
         let mut counts = self.ledger.csv_counts();
-        if let Some(code) =
-            dit_orchestrator::session::app_cause(Path::new(session::ROOT), &self.run_id)
+        for code in self
+            .causes
+            .iter()
+            .copied()
+            .chain(dit_orchestrator::session::app_cause(
+                Path::new(session::ROOT),
+                &self.run_id,
+            ))
         {
             counts.add_cause(code);
         }

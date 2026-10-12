@@ -728,6 +728,11 @@ fn missing_report(dir: &Path) -> (LayerOutcome, String) {
         );
     };
     let state = str_at(&record, "state");
+    // FC2: the memory guard stopped it before the machine ran out of memory. Not a crash: the
+    // session is INVALID for the memory plan, not for the hardware.
+    if state == "MEMORY_GUARD" {
+        return (LayerOutcome::Invalid, str_at(&record, "detail").to_owned());
+    }
     if state == "WORKER_FAILED"
         && record.get("exit_code").and_then(serde_json::Value::as_i64) == Some(3)
     {

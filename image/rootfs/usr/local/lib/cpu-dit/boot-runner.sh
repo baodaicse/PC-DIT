@@ -67,6 +67,38 @@ echo " Internal disks: never mounted by the CPU-DIT runner"
 echo "============================================================"
 
 swapoff -a 2>/dev/null || true
+
+# FC2 (docs/FAULT_CATCH_ROADMAP.md): this service's cgroup (Delegate=yes) is split in two.
+# app/ holds this runner, the control center and the watchdogs, with memory kept for it;
+# tests/ holds every test, each in a cgroup of its own (dit-watchdog), all under a memory.max
+# that leaves the machine room to answer. Without a delegated cgroup v2 nothing changes.
+setup_test_cgroups() {
+    local own service total reserve pid
+    own="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)"
+    # Only the service's own runner: a profile run started by the UI lives in a test's cgroup.
+    case "$own" in
+        */cpu-dit.service | */cpu-dit.service/app) ;;
+        *) return 0 ;;
+    esac
+    service="/sys/fs/cgroup${own%/app}"
+    [[ -w "$service/cgroup.procs" && -r "$service/cgroup.controllers" ]] || return 0
+    grep -qw memory "$service/cgroup.controllers" || return 0
+    mkdir -p "$service/app" "$service/tests" 2>/dev/null || return 0
+    # No process may stay in a cgroup that hands controllers to its children.
+    while read -r pid; do
+        echo "$pid" >"$service/app/cgroup.procs" 2>/dev/null || true
+    done <"$service/cgroup.procs"
+    echo +memory >"$service/cgroup.subtree_control" 2>/dev/null || return 0
+    echo +memory >"$service/tests/cgroup.subtree_control" 2>/dev/null || true
+    total="$(awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo)"
+    reserve=$((1024 * 1024 * 1024))
+    if [[ "$total" =~ ^[0-9]+$ ]] && (( total > 2 * reserve )); then
+        echo $((total - reserve)) >"$service/tests/memory.max" 2>/dev/null || true
+    fi
+    echo $((256 * 1024 * 1024)) >"$service/app/memory.min" 2>/dev/null || true
+    export DIT_TEST_CGROUP="$service/tests"
+}
+setup_test_cgroups
 # The test screens own the console: only critical kernel messages (levels 0-2) print on it, as
 # loglevel=3 on the kernel command line means. Ubuntu's sysctl.d raises the level to 4 after
 # boot, which lets KERN_ERR lines (NVRM probes, I/O errors) overwrite the frames; the kernel

@@ -10,6 +10,7 @@ mod inventory;
 mod memory;
 pub mod pcie;
 pub mod power_platform;
+pub mod pressure;
 mod report;
 mod safety;
 mod telemetry;

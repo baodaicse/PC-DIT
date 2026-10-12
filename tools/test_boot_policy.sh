@@ -46,6 +46,10 @@ grep -Fxq 'kernel.sysrq = 240' "$ROOT_DIR/image/rootfs/etc/sysctl.d/99-dit-sysrq
 grep -Fq 'multi-user.target.wants/dit-rescue.service' "$ROOT_DIR/tools/build_boot_image.sh"
 grep -Fq 'getty@tty2.service' "$ROOT_DIR/tools/build_boot_image.sh"
 grep -Fq 'usr/local/bin/dit-rescue' "$ROOT_DIR/tools/build_image_extension.sh"
+# FC2: tests run in their own memory cgroups under a delegated service cgroup.
+grep -Fxq 'Delegate=yes' "$SERVICE"
+grep -Fq 'export DIT_TEST_CGROUP="$service/tests"' "$RUNNER"
+grep -Fq '[[ "$module" == cpu-ram ]] && watchdog_marker+=(--memory-guard)' "$UI"
 grep -Fq 'udevadm settle --timeout=5' "$DRIVER_PROBE"
 grep -Fq 'timeout --foreground --signal=TERM --kill-after=1s 5s' "$DRIVER_PROBE"
 grep -Fq 'systemd-detect-virt --quiet' "$RUNNER"

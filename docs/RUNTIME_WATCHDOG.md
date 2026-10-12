@@ -20,7 +20,13 @@
 | `WORKER_SIGNALED` | Worker bị signal nhưng không có cgroup OOM evidence. |
 | `OOM_KILLED` | cgroup memory controller ghi nhận OOM kill trong run. |
 | `STALLED_KILLED` | Đã có heartbeat/activity, sau đó hết cập nhật qua stale + grace window. |
+| `MEMORY_GUARD` | Chốt chặn bộ nhớ (`--memory-guard`, lớp CPU-RAM) dừng worker trước khi máy nghẹt RAM: áp lực bộ nhớ full ≥ 20 % (avg10) hoặc còn dưới 256 MiB trống trong 5 giây liên tiếp. Phiên INVALID `memory_guard`, không phải lỗi phần cứng. |
 | `STARTING` / `RUNNING` / `STALLED` trên partition bền ở boot kế | Mất nguồn, reset, kernel panic hoặc supervisor không kịp đóng record; **không phải PASS**. |
+
+## Cgroup và mã thoát (FC2)
+
+- Trong image, `cpu-dit.service` có `Delegate=yes`; boot runner tách cgroup của service thành `app/` (control center, watchdog; `memory.min` 256 MiB) và `tests/` (`memory.max` = RAM tổng − 1 GiB). Watchdog tạo cho mỗi worker một cgroup riêng dưới `tests/` (`DIT_TEST_CGROUP` hoặc `--cgroup-parent`), nên test vượt RAM bị kernel kết thúc thay vì làm cả máy đứng, và bộ đếm `oom_kill` là của riêng worker đó. Không có cgroup v2 được ủy quyền thì worker chạy như trước.
+- Mã thoát của watchdog: mã của chính worker khi nó tự thoát (0 PASS, 2 FAIL, 3 INVALID với các engine); 124 treo bị kill; 125 chốt chặn bộ nhớ; 126 OOM; 130 người vận hành dừng; 128 + n khi worker chết vì signal n (139 SIGSEGV, 135 SIGBUS, 132 SIGILL). Trước đây mọi kết thúc không PASS đều là 2, nên UI CPU-RAM hiện nhầm thành FAIL.
 
 ## Giới hạn cố ý
 

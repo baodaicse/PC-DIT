@@ -964,6 +964,10 @@ where
         })
         .arg("--kill-after-seconds")
         .arg("30");
+    // FC2: the CPU-RAM layer holds the arena; it is stopped first when memory runs out.
+    if module == "cpu-ram" {
+        command.arg("--memory-guard");
+    }
     if let Some(path) = heartbeat {
         command.arg("--heartbeat").arg(path);
     }

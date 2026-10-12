@@ -1172,6 +1172,8 @@ run_profile() {
     if [[ -d "$WATCHDOG_RESULTS_ROOT" ]]; then
         watchdog_marker=(--recovery-marker "$WATCHDOG_RESULTS_ROOT/watchdog/$run_id-$module.json")
     fi
+    # FC2: CPU-RAM holds most of the memory; the watchdog stops it before the machine stalls.
+    [[ "$module" == cpu-ram ]] && watchdog_marker+=(--memory-guard)
     if [[ -x "$WATCHDOG" ]]; then
         active_run_uses_watchdog=1
         setsid env CPU_DIT_UI_CHILD=1 CPU_DIT_RETURN_TO_UI=1 \
@@ -1262,10 +1264,16 @@ run_profile() {
             esac
             return
         fi
+        # The watchdog passes the runner's own code on (0 PASS, 2 FAIL, 3 INVALID) and says with
+        # its own codes when it ended the run itself: none of those is a hardware FAIL.
         case "$status" in
             0) run_result 'PASS' 'All required correctness and coverage gates passed.' "$c_green" ;;
             2) run_result 'FAIL' 'A correctness, telemetry or execution gate failed.' "$c_red" ;;
             3) run_result 'INVALID' 'Source, profile or environment is invalid.' "$c_yellow" ;;
+            124) run_result 'INVALID' 'The test stopped answering; the watchdog ended it (see watchdog-final.json).' "$c_yellow" ;;
+            125) run_result 'INVALID' 'Memory guard: the test was stopped before the machine ran out of memory.' "$c_yellow" ;;
+            126) run_result 'INVALID' 'The kernel ended the test for memory (OOM); see watchdog-final.json.' "$c_yellow" ;;
+            132|135|139) run_result 'FAIL' 'The test process crashed (illegal instruction, bus error or segmentation fault): counted on PLATFORM.' "$c_red" ;;
             130|143) run_result 'ABORTED' 'The operator stopped the active test; this is not PASS.' "$c_yellow" ;;
             *) run_result "ERROR $status" 'The runner ended unexpectedly; preserve the report.' "$c_red" ;;
         esac
