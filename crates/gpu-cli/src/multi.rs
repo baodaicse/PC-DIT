@@ -426,6 +426,10 @@ fn run_multi(
     let pci_inventory = collect_gpu_inventory();
     let mut parent_telemetry = collect_gpu_telemetry(&pci_inventory);
     let mut last_parent_telemetry = Instant::now();
+    // Later samples come from a thread of their own: a stuck nvidia-smi does not freeze the
+    // screen or the stop key (FC0).
+    let gpu_feed =
+        dit_system::GpuTelemetryFeed::start(pci_inventory.clone(), Duration::from_secs(1));
     let mut slowdowns = vec![dit_system::SlowdownCounter::default(); selected.len()];
     let mut throttle = ThrottleLive::default();
     let mut system = host.system_info();
@@ -444,7 +448,10 @@ fn run_multi(
             }
         }
         if last_parent_telemetry.elapsed() >= Duration::from_secs(1) {
-            parent_telemetry = collect_gpu_telemetry(&pci_inventory);
+            let latest = gpu_feed.samples();
+            if !latest.is_empty() {
+                parent_telemetry = latest;
+            }
             last_parent_telemetry = Instant::now();
             track_throttle(
                 &mut throttle,

@@ -4,8 +4,8 @@
 //! chain), phase and per-layer progress below.
 use dit_orchestrator::combined::{Intensity, Level};
 use dit_system::{
-    GpuDevice, GpuTelemetry, LiveSensorSampler, SlowdownCounter, ThrottleGroup,
-    collect_gpu_inventory, collect_gpu_telemetry,
+    GpuDevice, GpuTelemetry, GpuTelemetryFeed, LiveSensorSampler, SlowdownCounter, ThrottleGroup,
+    collect_gpu_inventory,
 };
 use dit_ui_core::{
     DashboardMeter, HostSampler, LiveUtilization, SystemInfo, TerminalSize, ThrottleLive,
@@ -13,6 +13,8 @@ use dit_ui_core::{
 };
 use nvme_inventory::SmartSnapshot;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MIB: f64 = 1024.0 * 1024.0;
@@ -136,6 +138,8 @@ pub struct Telemetry {
     pub gpus: Vec<GpuDevice>,
     pub gpu_live: Vec<GpuTelemetry>,
     last_gpu: Option<Instant>,
+    /// GPU samples taken off the screen's thread (step FC0), started with the first sample.
+    gpu_feed: Option<GpuTelemetryFeed>,
     pub disks: Vec<DiskMeter>,
     pub live: LiveUtilization,
     pub mem_available_bytes: u64,
@@ -147,6 +151,49 @@ pub struct Telemetry {
     /// `SSD<alias>`, its namespace and its SMART when the session began.
     ssd_smart: Vec<(String, PathBuf, SmartSnapshot)>,
     last_smart: Option<Instant>,
+    smart_feed: Option<SmartFeed>,
+}
+
+/// SMART of the watched SSDs, read on a thread of its own every [`SMART_PERIOD`]: an SSD that
+/// stopped answering holds that thread, not the screen (step FC0).
+struct SmartFeed {
+    latest: Arc<Mutex<Vec<Option<SmartSnapshot>>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl SmartFeed {
+    fn start(nodes: Vec<PathBuf>) -> Self {
+        let latest = Arc::new(Mutex::new(vec![None; nodes.len()]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (shared, flag) = (Arc::clone(&latest), Arc::clone(&stop));
+        let _ = std::thread::Builder::new()
+            .name("ssd-smart".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    let next = Instant::now() + SMART_PERIOD;
+                    while Instant::now() < next && !flag.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    for (index, node) in nodes.iter().enumerate() {
+                        let snapshot = nvme_inventory::read_smart(node);
+                        if let Ok(mut latest) = shared.lock() {
+                            latest[index] = Some(snapshot);
+                        }
+                    }
+                }
+            });
+        Self { latest, stop }
+    }
+
+    fn snapshots(&self) -> Vec<Option<SmartSnapshot>> {
+        self.latest.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for SmartFeed {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 /// SMART is an admin command: read it rarely beside the SSD layer's I/O.
@@ -169,6 +216,7 @@ impl Telemetry {
             gpus,
             gpu_live: Vec::new(),
             last_gpu: None,
+            gpu_feed: None,
             disks,
             live: LiveUtilization::default(),
             mem_available_bytes: 0,
@@ -178,6 +226,7 @@ impl Telemetry {
             slowdowns: Vec::new(),
             ssd_smart: Vec::new(),
             last_smart: None,
+            smart_feed: None,
         }
     }
 
@@ -222,28 +271,40 @@ impl Telemetry {
             let clock = format_duration(self.started.elapsed().as_secs());
             self.throttle.update("CPU", cpu, &clock);
         }
-        // nvidia-smi is the slowest source: every 2 s.
+        // nvidia-smi is the slowest source: sampled every 2 s on its own thread.
         if self
             .last_gpu
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
         {
-            self.gpu_live = collect_gpu_telemetry(&self.gpus);
+            let feed = self.gpu_feed.get_or_insert_with(|| {
+                GpuTelemetryFeed::start(self.gpus.clone(), Duration::from_secs(2))
+            });
+            self.gpu_live = feed.samples();
             self.last_gpu = Some(Instant::now());
             self.track_gpu_throttle();
         }
         if !self.ssd_smart.is_empty()
             && self
                 .last_smart
-                .is_none_or(|last| last.elapsed() >= SMART_PERIOD)
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
         {
+            let feed = self.smart_feed.get_or_insert_with(|| {
+                SmartFeed::start(
+                    self.ssd_smart
+                        .iter()
+                        .map(|(_, node, _)| node.clone())
+                        .collect(),
+                )
+            });
             let clock = format_duration(self.started.elapsed().as_secs());
-            for (label, node, start) in &self.ssd_smart {
-                let now = nvme_inventory::read_smart(node);
-                self.throttle.update(
-                    label,
-                    nvme_inventory::thermal_throttle_between(start, &now),
-                    &clock,
-                );
+            for ((label, _, start), now) in self.ssd_smart.iter().zip(feed.snapshots()) {
+                if let Some(now) = now {
+                    self.throttle.update(
+                        label,
+                        nvme_inventory::thermal_throttle_between(start, &now),
+                        &clock,
+                    );
+                }
             }
             self.last_smart = Some(Instant::now());
         }
@@ -353,16 +414,26 @@ fn gpu_meters(telemetry: &Telemetry) -> Vec<DashboardMeter> {
                 format!("{label} USAGE"),
                 live.and_then(|l| l.utilization_percent),
             )
-            .detail(format!(
-                "Clock {} / Temp {} / Power {}",
-                optional(
-                    live.and_then(|l| l.core_clock_mhz).map(|v| v / 1000.0),
-                    "GHz",
-                    2
-                ),
-                optional(live.and_then(|l| l.temperature_celsius), "C", 0),
-                optional(live.and_then(|l| l.power_watts), "W", 0)
-            )),
+            .detail(
+                // A driver that stopped answering is said, not shown as frozen numbers.
+                match dit_system::nvidia_silent_seconds()
+                    .filter(|_| device.driver.as_deref() == Some("nvidia"))
+                {
+                    Some(silent) => {
+                        format!("nvidia-smi silent {silent} s (driver not answering)")
+                    }
+                    None => format!(
+                        "Clock {} / Temp {} / Power {}",
+                        optional(
+                            live.and_then(|l| l.core_clock_mhz).map(|v| v / 1000.0),
+                            "GHz",
+                            2
+                        ),
+                        optional(live.and_then(|l| l.temperature_celsius), "C", 0),
+                        optional(live.and_then(|l| l.power_watts), "W", 0)
+                    ),
+                },
+            ),
         );
         let used = live.and_then(|l| l.vram_used_bytes);
         let total = live

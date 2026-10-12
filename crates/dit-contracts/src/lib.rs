@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod bounded;
 pub mod fault;
 pub use fault::{FaultRecord, FaultTail, FaultWriter};
 

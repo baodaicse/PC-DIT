@@ -2,8 +2,14 @@ use std::{
     fs,
     path::Path,
     process::Command,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
+    time::{Duration, Instant},
 };
+
+use dit_contracts::bounded::{StuckGate, output_within};
 
 use serde::{Deserialize, Serialize};
 
@@ -170,11 +176,14 @@ pub fn collect_gpu_telemetry(devices: &[GpuDevice]) -> Vec<GpuTelemetry> {
                 || sysfs.core_clock_mhz.is_some()
                 || sysfs.memory_clock_mhz.is_some();
             let driver = device.driver.as_deref().unwrap_or("unbound");
-            let source = if has_live_metrics {
-                format!("DRM/sysfs ({driver})")
-            } else {
-                format!("DRM/sysfs ({driver}; driver exposes no live counters)")
-            };
+            let source =
+                if let Some(silent) = nvidia_silent_seconds().filter(|_| driver == "nvidia") {
+                    format!("nvidia-smi silent {silent} s (driver not answering)")
+                } else if has_live_metrics {
+                    format!("DRM/sysfs ({driver})")
+                } else {
+                    format!("DRM/sysfs ({driver}; driver exposes no live counters)")
+                };
             GpuTelemetry {
                 pci_address: device.pci_address.clone(),
                 utilization_percent: sysfs.utilization_percent,
@@ -191,6 +200,53 @@ pub fn collect_gpu_telemetry(devices: &[GpuDevice]) -> Vec<GpuTelemetry> {
             }
         })
         .collect()
+}
+
+/// GPU telemetry sampled on a thread of its own (step FC0): a screen or a control loop reads
+/// the latest samples and never waits on `nvidia-smi` itself.
+pub struct GpuTelemetryFeed {
+    latest: Arc<Mutex<Vec<GpuTelemetry>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl GpuTelemetryFeed {
+    /// Samples `devices` every `period` until dropped (no thread without devices).
+    #[must_use]
+    pub fn start(devices: Vec<GpuDevice>, period: Duration) -> Self {
+        let latest = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        if !devices.is_empty() {
+            let (shared, flag) = (Arc::clone(&latest), Arc::clone(&stop));
+            let _ = std::thread::Builder::new()
+                .name("gpu-telemetry".into())
+                .spawn(move || {
+                    while !flag.load(Ordering::Relaxed) {
+                        let samples = collect_gpu_telemetry(&devices);
+                        if let Ok(mut latest) = shared.lock() {
+                            *latest = samples;
+                        }
+                        let next = Instant::now() + period;
+                        while Instant::now() < next && !flag.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                });
+        }
+        Self { latest, stop }
+    }
+
+    /// The latest samples (empty before the first one).
+    #[must_use]
+    pub fn samples(&self) -> Vec<GpuTelemetry> {
+        self.latest.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for GpuTelemetryFeed {
+    fn drop(&mut self) {
+        // The thread ends after its current sample; a stuck one is not waited for.
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 #[must_use]
@@ -416,46 +472,79 @@ static EXTENDED_QUERY: AtomicU8 = AtomicU8::new(0);
 const BASE_FIELDS: &str = "pci.bus_id,memory.total,memory.used,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks.current.graphics,clocks.current.memory";
 const EXTENDED_FIELDS: &str = "pci.bus_id,memory.total,memory.used,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks.current.graphics,clocks.current.memory,power.limit,clocks_throttle_reasons.active";
 
-fn run_nvidia_query(fields: &str) -> Option<String> {
-    let nvidia_smi = if Path::new("/usr/bin/nvidia-smi").is_file() {
-        "/usr/bin/nvidia-smi"
-    } else {
-        "nvidia-smi"
-    };
-    let query = [
-        format!("--query-gpu={fields}"),
-        "--format=csv,noheader,nounits".to_owned(),
-    ];
-    let output = Command::new(nvidia_smi)
-        .args(&query)
-        .env("LC_ALL", "C")
-        .output()
-        .or_else(|_| {
-            Command::new("timeout")
-                .args(["--signal=TERM", "--kill-after=1s", "2s", nvidia_smi])
-                .args(&query)
-                .env("LC_ALL", "C")
-                .output()
-        });
-    output
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+/// Every `nvidia-smi` call of this process goes through this gate (step FC0): one left waiting
+/// on a stuck driver keeps the others from starting until it ends.
+pub static NVIDIA_SMI: StuckGate = StuckGate::new();
+/// How long one `nvidia-smi` query may take before it is killed.
+pub const NVIDIA_SMI_LIMIT: Duration = Duration::from_secs(3);
+
+/// The `nvidia-smi` to run: `DIT_NVIDIA_SMI` (tests), else the driver's, else from `PATH`.
+#[must_use]
+pub fn nvidia_smi_program() -> std::ffi::OsString {
+    std::env::var_os("DIT_NVIDIA_SMI")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| {
+            if Path::new("/usr/bin/nvidia-smi").is_file() {
+                "/usr/bin/nvidia-smi".into()
+            } else {
+                "nvidia-smi".into()
+            }
+        })
+}
+
+/// Seconds `nvidia-smi` has not answered (its last call ran past [`NVIDIA_SMI_LIMIT`] or one is
+/// still stuck); `None` while it answers. A screen shows it instead of freezing.
+#[must_use]
+pub fn nvidia_silent_seconds() -> Option<u64> {
+    NVIDIA_SMI.silent_seconds()
+}
+
+enum Query {
+    Answer(String),
+    /// The driver refused the query (an unknown field, no device).
+    Refused,
+    /// No answer in time, or a stuck call still blocks the gate.
+    Silent,
+}
+
+fn run_nvidia_query(fields: &str) -> Query {
+    let mut command = Command::new(nvidia_smi_program());
+    command
+        .arg(format!("--query-gpu={fields}"))
+        .arg("--format=csv,noheader,nounits")
+        .env("LC_ALL", "C");
+    match output_within(&mut command, NVIDIA_SMI_LIMIT, &NVIDIA_SMI) {
+        Some(output) if output.status.success() => {
+            Query::Answer(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        None if NVIDIA_SMI.silent_seconds().is_some() => Query::Silent,
+        // A refusal, or it could not start (no driver installed): nothing to wait for.
+        Some(_) | None => Query::Refused,
+    }
 }
 
 fn collect_nvidia_samples() -> Vec<NvidiaSample> {
     // A driver that rejects a field fails the whole query, so probe once and fall
     // back to the base columns instead of losing all telemetry.
     if EXTENDED_QUERY.load(Ordering::Relaxed) != 2 {
-        if let Some(text) = run_nvidia_query(EXTENDED_FIELDS) {
-            EXTENDED_QUERY.store(1, Ordering::Relaxed);
-            return parse_nvidia_samples(&text);
-        }
-        if EXTENDED_QUERY.load(Ordering::Relaxed) == 0 {
-            EXTENDED_QUERY.store(2, Ordering::Relaxed);
+        match run_nvidia_query(EXTENDED_FIELDS) {
+            Query::Answer(text) => {
+                EXTENDED_QUERY.store(1, Ordering::Relaxed);
+                return parse_nvidia_samples(&text);
+            }
+            // A driver that does not answer says nothing about its columns.
+            Query::Silent => return Vec::new(),
+            Query::Refused => {
+                if EXTENDED_QUERY.load(Ordering::Relaxed) == 0 {
+                    EXTENDED_QUERY.store(2, Ordering::Relaxed);
+                }
+            }
         }
     }
-    run_nvidia_query(BASE_FIELDS).map_or_else(Vec::new, |text| parse_nvidia_samples(&text))
+    match run_nvidia_query(BASE_FIELDS) {
+        Query::Answer(text) => parse_nvidia_samples(&text),
+        Query::Refused | Query::Silent => Vec::new(),
+    }
 }
 
 fn parse_nvidia_samples(text: &str) -> Vec<NvidiaSample> {

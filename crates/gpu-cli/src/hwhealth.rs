@@ -737,15 +737,18 @@ pub fn parse_ecc_csv(text: &str, pci_address: &str) -> Option<EccSample> {
 
 fn query_ecc(pci_address: &str) -> Option<EccSample> {
     let run = |fields: &str| {
-        Command::new("timeout")
-            .args(["10", "nvidia-smi"])
+        let mut command = Command::new(dit_system::nvidia_smi_program());
+        command
             .arg(format!("--query-gpu={fields}"))
             .arg("--format=csv,noheader,nounits")
-            .env("LC_ALL", "C")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .env("LC_ALL", "C");
+        dit_contracts::bounded::output_within(
+            &mut command,
+            std::time::Duration::from_secs(10),
+            &dit_system::NVIDIA_SMI,
+        )
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     };
     // An older driver rejects the whole query for the row-remap fields; ask again without them.
     run(ECC_FIELDS)

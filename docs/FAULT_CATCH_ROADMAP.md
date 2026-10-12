@@ -466,7 +466,7 @@ Dữ liệu thực tế không nằm trong git (khoảng 670 MB); bản 4 và 5 
 
 | Bước | Trạng thái |
 |---|---|
-| FC0 `nvidia-smi` timeout | đề xuất |
+| FC0 `nvidia-smi` timeout | xong (2026-10-12): mọi `nvidia-smi` và `nvme smart-log` qua `dit_contracts::bounded` (hạn 3 s / 5 s / 10 s, lệnh kẹt bị bỏ lại, gate chặn lệnh mới); đo GPU và SMART ở luồng nền (`GpuTelemetryFeed`, `SmartFeed`); màn hiện `nvidia-smi silent N s (driver not answering)`. Test: `dit-system/tests/nvidia_smi_stuck.rs` |
 | FC1 console cứu hộ + SysRq | đề xuất |
 | FC2 chốt chặn bộ nhớ | đề xuất |
 | FC3a hộp đen tự ra result trong phiên | đề xuất; đã chốt quan sát và ghi, thời gian chờ, tự chuyển màn kết quả (2026-10-12) |

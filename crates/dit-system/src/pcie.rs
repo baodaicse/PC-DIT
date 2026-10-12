@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const PCI_DEVICES: &str = "/sys/bus/pci/devices";
 
@@ -166,19 +167,10 @@ pub fn normalize_bdf(text: &str) -> Option<String> {
 /// Replay counters of every NVIDIA GPU (empty without the driver).
 #[must_use]
 pub fn nvidia_replay_counters() -> BTreeMap<String, (Option<u64>, Option<u64>)> {
-    Command::new("timeout")
-        .args([
-            "--signal=TERM",
-            "--kill-after=2s",
-            "10s",
-            "nvidia-smi",
-            "-q",
-            "-d",
-            "PCIE",
-        ])
-        .env("LC_ALL", "C")
-        .output()
-        .ok()
+    let mut command = Command::new(crate::nvidia_smi_program());
+    command.args(["-q", "-d", "PCIE"]).env("LC_ALL", "C");
+    // The full query is slower than the telemetry one; a stuck driver still holds no caller.
+    dit_contracts::bounded::output_within(&mut command, Duration::from_secs(5), &crate::NVIDIA_SMI)
         .filter(|output| output.status.success())
         .map(|output| parse_nvidia_pcie(&String::from_utf8_lossy(&output.stdout)))
         .unwrap_or_default()

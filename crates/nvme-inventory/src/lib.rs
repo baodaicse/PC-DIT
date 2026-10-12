@@ -732,24 +732,30 @@ pub fn read_smart(device: &Path) -> SmartSnapshot {
     collect_smart(Path::new("nvme"), device)
 }
 
+/// Every `nvme smart-log` of this process: an SSD that stopped answering holds one call, not the
+/// caller (`docs/FAULT_CATCH_ROADMAP.md`, step FC0).
+pub static NVME_SMART: dit_contracts::bounded::StuckGate = dit_contracts::bounded::StuckGate::new();
+/// How long one `nvme smart-log` may take (an admin command answers in well under a second).
+const SMART_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn collect_smart(program: &Path, device: &Path) -> SmartSnapshot {
-    let output = match Command::new(program)
-        .args(["smart-log", &device.to_string_lossy(), "-o", "json"])
-        .output()
+    let mut command = Command::new(program);
+    command.args(["smart-log", &device.to_string_lossy(), "-o", "json"]);
+    let output = match dit_contracts::bounded::output_within(&mut command, SMART_LIMIT, &NVME_SMART)
     {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
+        Some(output) if output.status.success() => output,
+        Some(output) => {
             return SmartSnapshot {
-                warning: Some(format!(
-                    "nvme smart-log failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
+                warning: Some(format!("nvme smart-log failed ({})", output.status)),
                 ..SmartSnapshot::default()
             };
         }
-        Err(error) => {
+        None => {
             return SmartSnapshot {
-                warning: Some(format!("nvme smart-log unavailable: {error}")),
+                warning: Some(NVME_SMART.silent_seconds().map_or_else(
+                    || "nvme smart-log unavailable".to_owned(),
+                    |silent| format!("nvme smart-log silent {silent} s (SSD not answering)"),
+                )),
                 ..SmartSnapshot::default()
             };
         }

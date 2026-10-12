@@ -854,6 +854,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let devices = collect_gpu_inventory();
     let telemetry_start = collect_gpu_telemetry(&devices);
     let mut telemetry = telemetry_start.clone();
+    let gpu_feed = dit_system::GpuTelemetryFeed::start(devices.clone(), Duration::from_secs(1));
     let mut host = GpuHostSampler::detect();
     let mut system = host.system_info();
     system.gpu = format_gpu_summary(&devices);
@@ -1426,7 +1427,11 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             });
         }
         if last_telemetry.elapsed() >= Duration::from_secs(1) {
-            telemetry = collect_gpu_telemetry(&devices);
+            // Sampled on its own thread: a stuck nvidia-smi does not freeze this loop (FC0).
+            let latest = gpu_feed.samples();
+            if !latest.is_empty() {
+                telemetry = latest;
+            }
             last_telemetry = Instant::now();
             track_throttle(
                 &mut throttle,
