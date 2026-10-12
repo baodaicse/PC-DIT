@@ -646,12 +646,38 @@ impl Ledger {
         for (group, count) in &report.unresolved {
             let _ = write!(cells, "?{group}={count};");
         }
+        // FC5: a failure no data check saw (a crash, a thermal stop, a GPU off the bus) says why
+        // on its cell: `PLATFORM=1(c1/s0)[worker_crash]`.
+        let mut entries: Vec<String> = cells
+            .trim_end_matches(';')
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let mut marked = std::collections::BTreeSet::new();
+        for event in &self.events {
+            let Some(code) = cause_code(event) else {
+                continue;
+            };
+            if !marked.insert((event.cell.clone(), code)) {
+                continue;
+            }
+            let prefix = if event.confidence == Confidence::Unresolved {
+                format!("?{}=", event.cell)
+            } else {
+                format!("{}=", event.cell)
+            };
+            if let Some(entry) = entries.iter_mut().find(|e| e.starts_with(&prefix)) {
+                let _ = write!(entry, "[{code}]");
+            }
+        }
+        let cells = entries.join(";");
         CsvCounts {
             columns: COLUMNS.iter().map(|c| self.column_total(c)).collect(),
             unresolved: report.unresolved_total,
             confirmed: report.confirmed_total,
             suspected: report.suspected_total,
-            cells: cells.trim_end_matches(';').to_owned(),
+            cells,
             // Throttling joins the hardware events column (the header stays the same).
             hardware: report
                 .hardware_events
@@ -671,6 +697,57 @@ impl Ledger {
     #[must_use]
     pub fn csv_row(&self, meta: &CsvMeta) -> String {
         csv_row(meta, &self.csv_counts())
+    }
+}
+
+/// The cause code of a failure counted by a rule rather than by a data check
+/// (`docs/FAULT_CATCH_ROADMAP.md`, FC5): it marks the cell in the CSV row and names the cause on
+/// the result screen.
+#[must_use]
+pub fn cause_code(event: &FaultEvent) -> Option<&'static str> {
+    Some(match event.rule {
+        "gpu/thermal_policy" => "thermal_stop",
+        "cpu-ram/worker_crash" | "session/worker_crash" => "worker_crash",
+        "session/layer_stall_io_error" => "layer_stall_io_error",
+        "session/no_report" => "no_report",
+        "gpu/hardware_error" if event.candidates.iter().any(|c| c == "PLATFORM") => "gpu_off_bus",
+        _ => return None,
+    })
+}
+
+impl Ledger {
+    /// One line per cause of a failure counted by a rule (FC5), for the result screen:
+    /// `PLATFORM      cpu-ram (OVERLAP) crashed: worker 3 panicked ...`.
+    #[must_use]
+    pub fn cause_lines(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let code = cause_code(event)?;
+                seen.insert((event.layer, code)).then(|| {
+                    let what = match code {
+                        "thermal_stop" => "stopped at its temperature limit",
+                        "worker_crash" => "crashed",
+                        "gpu_off_bus" => "lost its GPU (fell off the bus)",
+                        "layer_stall_io_error" => "stopped answering, with kernel I/O errors",
+                        _ => "ended without a report",
+                    };
+                    let place = if event.phase.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", event.phase)
+                    };
+                    let label = if event.candidates.iter().any(|c| c == "PLATFORM") {
+                        "PLATFORM".to_owned()
+                    } else {
+                        event.cell.clone()
+                    };
+                    let detail: String = event.detail.chars().take(160).collect();
+                    format!("{label:<13} {}{place} {what}: {detail}", event.layer)
+                })
+            })
+            .collect()
     }
 }
 
@@ -904,6 +981,29 @@ mod tests {
             "test/rule",
             "x",
         )
+    }
+
+    #[test]
+    fn a_failure_counted_by_a_rule_says_why_on_its_cell_and_on_the_screen() {
+        let mut ledger = Ledger::default();
+        ledger.add(
+            FaultEvent::new(
+                "cpu-ram",
+                "platform:worker_crash",
+                1,
+                Attribution::Confirmed(Component::Platform),
+                "session/worker_crash",
+                "signal 11 (SIGSEGV)",
+            )
+            .in_phase("OVERLAP"),
+        );
+        ledger.add(event(Attribution::Confirmed(Component::Ram), 2));
+        let counts = ledger.csv_counts();
+        assert_eq!(counts.cells, "RAM=2(c2/s0);PLATFORM=1(c1/s0)[worker_crash]");
+        assert_eq!(
+            ledger.cause_lines(),
+            vec!["PLATFORM      cpu-ram (OVERLAP) crashed: signal 11 (SIGSEGV)".to_owned()]
+        );
     }
 
     #[test]

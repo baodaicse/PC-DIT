@@ -373,7 +373,7 @@ struct Session<'a> {
     writer: Option<SessionWriter>,
     last_beat: Option<Instant>,
     /// Why the session ended early, as cause codes for its CSV row (`memory_guard`).
-    causes: Vec<&'static str>,
+    causes: Vec<(&'static str, String)>,
 }
 
 /// Mark of a result from the Fault Attribution boot entry (`fail-summary.csv` test column).
@@ -1273,10 +1273,13 @@ impl Session<'_> {
         if matches!(record.phase, PhaseKind::Baseline(_)) {
             self.peaks.insert(ended.layer, ended.peak_bytes);
         }
-        self.attribute(&ended, outcome, &detail, &record.label);
+        self.attribute(&ended, outcome, &record.label);
         // FC2: the memory guard stopped CPU-RAM; the other layers go on no further.
         if outcome == LayerOutcome::Invalid && detail.starts_with("memory guard") {
-            self.causes.push("memory_guard");
+            self.causes.push((
+                "memory_guard",
+                format!("{} ({}): {detail}", layers::slug(ended.layer), record.label),
+            ));
             if self.abort.is_none() {
                 self.abort = Some(format!(
                     "{} was stopped by the memory guard in phase {}: {detail}",
@@ -1383,13 +1386,35 @@ impl Session<'_> {
         }
     }
 
-    fn attribute(&mut self, ended: &Running, outcome: LayerOutcome, detail: &str, phase: &str) {
+    fn attribute(&mut self, ended: &Running, outcome: LayerOutcome, phase: &str) {
         if outcome == LayerOutcome::Crashed {
-            self.ledger.add(fault_sources::crash(
+            // FC5: hardware evidence counts a failure; anything else makes the session INVALID
+            // with its cause.
+            let record: Option<serde_json::Value> =
+                std::fs::read(ended.dir.join("watchdog-final.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let ssd_cells: Vec<Component> = match ended.layer {
+                Layer::Ssd => self
+                    .machine_cells()
+                    .into_iter()
+                    .filter(|cell| matches!(cell, Component::Ssd(_) | Component::SsdPath(_)))
+                    .collect(),
+                Layer::Chain => {
+                    let (_, ssd) = self.chain_devices();
+                    vec![Component::Ssd(ssd), Component::SsdPath(ssd)]
+                }
+                Layer::CpuRam | Layer::Gpu => Vec::new(),
+            };
+            match fault_sources::layer_ending(
                 layers::slug(ended.layer),
                 phase,
-                detail,
-            ));
+                record.as_ref(),
+                &ssd_cells,
+            ) {
+                fault_sources::Ending::Fail(event) => self.ledger.add(*event),
+                fault_sources::Ending::Invalid { code, text } => self.causes.push((code, text)),
+            }
             return;
         }
         let Some(report) = layers::report_json(ended.layer, &ended.dir) else {
@@ -1570,14 +1595,14 @@ impl Session<'_> {
             ..self.csv_meta()
         };
         let mut counts = self.ledger.csv_counts();
-        for code in self
-            .causes
-            .iter()
-            .copied()
-            .chain(dit_orchestrator::session::app_cause(
-                Path::new(session::ROOT),
-                &self.run_id,
-            ))
+        for code in
+            self.causes
+                .iter()
+                .map(|(code, _)| *code)
+                .chain(dit_orchestrator::session::app_cause(
+                    Path::new(session::ROOT),
+                    &self.run_id,
+                ))
         {
             counts.add_cause(code);
         }
@@ -1586,6 +1611,20 @@ impl Session<'_> {
             Ok(()) => format!("Fail summary row added to {}", path.display()),
             Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
         }
+    }
+
+    /// Why things ended (FC5): the cause of each failure a rule counted (`PLATFORM ...`), then
+    /// each cause that made the session INVALID.
+    fn cause_rows(&self) -> Vec<String> {
+        self.ledger
+            .cause_lines()
+            .into_iter()
+            .chain(
+                self.causes
+                    .iter()
+                    .map(|(_, text)| format!("INVALID       {text} (test infrastructure)")),
+            )
+            .collect()
     }
 
     /// The session as the black box and the rescue console read it.
@@ -1874,9 +1913,13 @@ impl Session<'_> {
                     .throttle
                     .row()
                     .unwrap_or_else(|| self.ledger.throttle_line()),
-            ],
+            ]
+            .into_iter()
+            .chain(self.cause_rows())
+            .collect(),
             result_rows: Vec::new(),
-            footer: self.telemetry.throttle.alert().map(str::to_owned),
+            footer: progress_alert(running)
+                .or_else(|| self.telemetry.throttle.alert().map(str::to_owned)),
         }
     }
 
@@ -1938,7 +1981,13 @@ impl Session<'_> {
             && self.abort.is_none()
             && self.records.len() == self.phases.len()
             && self.records.iter().all(|record| record.completed);
-        let verdict = combined::session_verdict(&outcomes, completed);
+        // INVALID and FAIL are never mixed: a failure counted (a data check, or a crash with
+        // hardware evidence) makes it a FAIL, whatever else stopped the session.
+        let verdict = if self.ledger.failures_total() > 0 {
+            "FAIL"
+        } else {
+            combined::session_verdict(&outcomes, completed)
+        };
         let report = CombinedReport {
             schema_version: 1,
             module_id: combined::COMBINED_MODULE_ID,
@@ -1998,6 +2047,29 @@ impl Session<'_> {
             ),
         }
     }
+}
+
+/// A layer with no progress for a minute or more, from its watchdog's status (FC5): the footer
+/// says so while it happens, so nobody stops or resets the machine without knowing.
+fn progress_alert(running: &[Running]) -> Option<String> {
+    running.iter().find_map(|layer| {
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(layer.dir.join("watchdog-status.json")).ok()?)
+                .ok()?;
+        let age = record["progress_age_seconds"].as_u64()?;
+        (age >= 60).then(|| {
+            let moving = if record["state"] == "SLOW_IO" {
+                " (I/O still moving: slow, not stuck)"
+            } else {
+                ""
+            };
+            format!(
+                "! NO PROGRESS {} {age} s{moving}; its watchdog decides at {} s",
+                layer.layer.label(),
+                record["stale_after_seconds"].as_u64().unwrap_or(0)
+            )
+        })
+    })
 }
 
 /// Stops a layer the way the operator's Ctrl+C would: SIGINT to its watchdog, which stops the

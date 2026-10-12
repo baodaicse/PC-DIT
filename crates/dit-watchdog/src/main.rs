@@ -406,7 +406,13 @@ fn supervise(args: &SuperviseArgs) -> Result<ExitCode, Box<dyn std::error::Error
         .clone()
         .or_else(|| std::env::var_os("DIT_TEST_CGROUP").map(PathBuf::from))
         .and_then(|parent| layer_cgroup(&parent, &args.module, &args.run_id));
-    let child = worker_command(args, cgroup.as_deref())?.spawn()?;
+    // The worker's screen reads this to warn when it makes no progress (FC5).
+    let child = worker_command(args, cgroup.as_deref())?
+        .env(
+            "DIT_WATCHDOG_STATUS",
+            args.run_dir.join("watchdog-status.json"),
+        )
+        .spawn()?;
     let started_unix_ms = unix_ms();
     // The kernel gives a real cgroup its files; a directory without them is not one.
     let cgroup = cgroup.filter(|dir| dir.join("memory.events").is_file());

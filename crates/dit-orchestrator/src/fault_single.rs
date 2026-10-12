@@ -1,9 +1,7 @@
 //! Fault ledger of a single-module run (GPU-VRAM, CPU-SSD or CPU-RAM from the menu): the report
 //! counted on component cells, two lines for the completion screen and one `fail-summary.csv`
 //! row on the results volume, like a combined session.
-use dit_orchestrator::fault_ledger::{
-    Component, CsvCounts, CsvMeta, Ledger, append_csv_row, csv_row,
-};
+use dit_orchestrator::fault_ledger::{Component, CsvMeta, Ledger, append_csv_row, csv_row};
 use dit_orchestrator::fault_signatures;
 use dit_orchestrator::fault_sources;
 use dit_orchestrator::session::Claim;
@@ -169,35 +167,76 @@ fn csv_path(results_root: &Path, run_dir: &Path) -> std::path::PathBuf {
     }
 }
 
-/// The CSV row of a run that ended without a report (stopped, crashed, killed): nothing counted,
-/// so a session still has its row. `claim` says whether this run writes it; `cause` marks why
-/// it ended (`operator_rescue`).
+/// The CSV row of a run that ended without a report (stopped, crashed, killed), so a session
+/// still has its row. Its watchdog's final record (`watchdog-final.json`) says how it ended
+/// (FC5): a crash signal or a stall with kernel I/O errors counts a failure and makes it a FAIL;
+/// anything else leaves `verdict` and marks the cause. `claim` says whether this run writes the
+/// row; `cause` marks why it was stopped (`operator_rescue`). Returns the verdict and the lines
+/// for the screen.
+#[allow(clippy::too_many_arguments)]
 pub fn row_without_report(
     module: SingleModule,
     results_root: &Path,
     run_dir: &Path,
-    verdict: &str,
+    verdict: &'static str,
     attribution: bool,
     claim: &Claim,
     cause: Option<&str>,
-) -> String {
-    if let Claim::Taken(by) = claim {
-        return format!("Fail summary not written: the {by} already wrote this session's result");
-    }
-    let meta = CsvMeta {
-        time: super::local_timestamp(),
-        verdict: verdict.to_owned(),
-        ..csv_meta(module, attribution)
+    record: Option<&Value>,
+) -> (&'static str, String) {
+    let ssd_cells: &[Component] = match module {
+        SingleModule::Ssd => &[Component::Ssd(1), Component::SsdPath(1)],
+        SingleModule::Gpu | SingleModule::CpuRam => &[],
     };
-    let path = csv_path(results_root, run_dir);
-    let mut counts = CsvCounts::default();
-    if let Some(code) = cause {
-        counts.add_cause(code);
+    let mut ledger = Ledger::default();
+    let mut invalid = None;
+    // Stopped by the operator: nothing to classify.
+    if cause.is_none()
+        && record.is_some_and(|r| {
+            r["detail"]
+                .as_str()
+                .is_none_or(|d| !d.starts_with("operator requested stop"))
+        })
+    {
+        match fault_sources::layer_ending(module.directory(), "", record, ssd_cells) {
+            fault_sources::Ending::Fail(event) => ledger.add(*event),
+            fault_sources::Ending::Invalid { code, text } => invalid = Some((code, text)),
+        }
     }
-    match append_csv_row(&path, &csv_row(&meta, &counts)) {
-        Ok(()) => format!("Fail summary row added to {}", path.display()),
-        Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
+    let verdict = if ledger.failures_total() > 0 {
+        "FAIL"
+    } else {
+        verdict
+    };
+    let mut lines = ledger.cause_lines();
+    if let Some((_, text)) = &invalid {
+        lines.push(format!("INVALID       {text} (test infrastructure)"));
     }
+    let csv = if let Claim::Taken(by) = claim {
+        format!("Fail summary not written: the {by} already wrote this session's result")
+    } else {
+        let meta = CsvMeta {
+            time: super::local_timestamp(),
+            verdict: verdict.to_owned(),
+            ..csv_meta(module, attribution)
+        };
+        let path = csv_path(results_root, run_dir);
+        let mut counts = ledger.csv_counts();
+        for code in invalid
+            .as_ref()
+            .map(|(code, _)| *code)
+            .into_iter()
+            .chain(cause)
+        {
+            counts.add_cause(code);
+        }
+        match append_csv_row(&path, &csv_row(&meta, &counts)) {
+            Ok(()) => format!("Fail summary row added to {}", path.display()),
+            Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
+        }
+    };
+    lines.push(csv);
+    (verdict, lines.join("\n"))
 }
 
 /// Counts the report's failures on their cells and appends the CSV row when `claim` says this
@@ -267,6 +306,61 @@ pub fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_without_a_report_is_a_fail_only_with_hardware_evidence() {
+        let dir = std::env::temp_dir().join(format!("dit-single-ending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let none = dir.join("no-results-volume");
+        let crash = serde_json::json!({"state": "WORKER_SIGNALED", "exit_signal": 11,
+            "detail": "worker ended from signal 11"});
+        let (verdict, lines) = row_without_report(
+            SingleModule::Gpu,
+            &none,
+            &dir,
+            "INVALID",
+            false,
+            &Claim::Won,
+            None,
+            Some(&crash),
+        );
+        assert_eq!(verdict, "FAIL");
+        assert!(
+            lines.starts_with("PLATFORM      gpu-vram crashed"),
+            "{lines}"
+        );
+        let stall = serde_json::json!({"state": "STALLED_KILLED", "detail": "nothing moved",
+            "liveness": {"kernel_io": []}});
+        let (verdict, lines) = row_without_report(
+            SingleModule::Ssd,
+            &none,
+            &dir,
+            "INVALID",
+            false,
+            &Claim::Won,
+            None,
+            Some(&stall),
+        );
+        assert_eq!(verdict, "INVALID");
+        assert!(
+            lines.starts_with("INVALID       cpu-nvme stopped making progress"),
+            "{lines}"
+        );
+        let csv = std::fs::read_to_string(dir.join("fail-summary.csv")).unwrap();
+        let rows: Vec<&str> = csv.lines().skip(1).collect();
+        assert!(
+            rows[0].contains(",FAIL,") && rows[0].contains("PLATFORM=1(c1/s0)[worker_crash]"),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains(",INVALID,") && rows[1].contains("INVALID[layer_stall]"),
+            "{}",
+            rows[1]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_failing_gpu_report_gives_the_ledger_lines_and_a_csv_row() {

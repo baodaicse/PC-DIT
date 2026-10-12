@@ -1125,10 +1125,16 @@ run_result() {
         # gets its CSV row, and the black box stops waiting for this result.
         if [[ "${module:-cpu-ram}" == cpu-ram && -n "${run_id:-}" ]]; then
             local -a end_args=(session-end --run-id "$run_id" --verdict "$verdict"
-                --results-root "$WATCHDOG_RESULTS_ROOT" --run-dir "${reports:-$UI_RUN_DIR}")
+                --results-root "$WATCHDOG_RESULTS_ROOT" --run-dir "${reports:-$UI_RUN_DIR}"
+                --watchdog-dir "$watchdog_dir")
             grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && end_args+=(--attribution)
             while IFS= read -r line; do
-                [[ "$line" == 'Fail summary'* ]] && csv_rows+=("CSV      $line")
+                case "$line" in
+                    'Fail summary'*) csv_rows+=("CSV      $line") ;;
+                    # FC5: why a run without a report ended (a crash on PLATFORM, or the cause
+                    # that makes it INVALID).
+                    'PLATFORM '*|'INVALID '*) ledger_rows+=("$line") ;;
+                esac
             done < <("$SUITE" "${end_args[@]}" 2>/dev/null)
         fi
         # The order every test uses: verdict, ledger, report, CSV.
@@ -1224,7 +1230,8 @@ run_profile() {
                 grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && view_args+=(--attribution)
             fi
             view_status=0
-            DIT_UI_FINAL_FRAME="$final_frame" "$SUITE" "${view_args[@]}" || view_status=$?
+            DIT_UI_FINAL_FRAME="$final_frame" DIT_WATCHDOG_STATUS="$watchdog_dir/watchdog-status.json" \
+                "$SUITE" "${view_args[@]}" || view_status=$?
             if (( view_status != 0 && view_status != 130 )); then
                 shared_view=0
                 running_screen_initialized=0

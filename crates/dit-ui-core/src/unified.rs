@@ -81,6 +81,17 @@ pub fn render_unified_dashboard(
     if color {
         remember(dashboard);
     }
+    // FC5: a test with no progress for a minute says so in the footer, from its watchdog.
+    let alerted;
+    let dashboard = match progress_alert().filter(|_| color && dashboard.state != "DONE") {
+        Some(alert) => {
+            let mut with_alert = dashboard.clone();
+            with_alert.footer = alert;
+            alerted = with_alert;
+            &alerted
+        }
+        None => dashboard,
+    };
     let width = usize::from(size.cols).clamp(40, 240);
     let height = usize::from(size.rows).saturating_sub(1).max(1);
     let layout = |spaced: bool| {
@@ -312,6 +323,43 @@ fn meter_rows(meters: &[DashboardMeter], width: usize, spaced: bool) -> Vec<Stri
         }
     }
     rows
+}
+
+/// Set by `dit-watchdog` for its worker (and by the CPU-RAM UI for its screen): the watchdog's
+/// status file of the test being drawn.
+pub const WATCHDOG_STATUS_ENV: &str = "DIT_WATCHDOG_STATUS";
+
+/// The footer alert of a test with no progress for a minute or more (FC5), from its watchdog's
+/// status (read at most every 2 s): nobody should stop or reset the machine without knowing.
+fn progress_alert() -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+        std::sync::Mutex::new(None);
+    let path = std::env::var_os(WATCHDOG_STATUS_ENV)?;
+    let mut cache = CACHE.lock().ok()?;
+    if let Some((at, alert)) = cache.as_ref()
+        && at.elapsed() < std::time::Duration::from_secs(2)
+    {
+        return alert.clone();
+    }
+    let alert = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|record| {
+            let age = record["progress_age_seconds"].as_u64()?;
+            (age >= 60).then(|| {
+                let moving = if record["state"] == "SLOW_IO" {
+                    " (I/O still moving: slow, not stuck)"
+                } else {
+                    ""
+                };
+                format!(
+                    "! NO PROGRESS {age} s{moving}; the watchdog decides at {} s",
+                    record["stale_after_seconds"].as_u64().unwrap_or(0)
+                )
+            })
+        });
+    *cache = Some((std::time::Instant::now(), alert.clone()));
+    alert
 }
 
 /// Where the image keeps the rescue console (`docs/FAULT_CATCH_ROADMAP.md`, FC1).
@@ -727,9 +775,11 @@ fn part_colors(line: &str) -> Vec<Option<&'static str>> {
             color_range(from, to, state_badge(&word));
         }
     }
-    // A throttle alert (footer) opens with a warning badge.
-    if let Some(at) = find_chars(&chars, "! THROTTLE") {
-        color_range(at, at + "! THROTTLE".len(), BADGE_WARN);
+    // A throttle or no-progress alert (footer) opens with a warning badge.
+    for alert in ["! THROTTLE", "! NO PROGRESS"] {
+        if let Some(at) = find_chars(&chars, alert) {
+            color_range(at, at + alert.len(), BADGE_WARN);
+        }
     }
     if let Some(at) = find_chars(&chars, "FAIL BY PART") {
         for (from, to) in segments(at + "FAIL BY PART".len()) {
@@ -1004,6 +1054,9 @@ fn paint(
             } else if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer))
             {
                 RED
+            } else if line.contains("PLATFORM      ") {
+                // The cause of a failure a rule counted (FC5): red like the failure.
+                RED
             } else if line.contains("[NO ROOM]") {
                 // A setup option the hardware has no room for (an SSD write level).
                 RED
@@ -1023,6 +1076,7 @@ fn paint(
                 || line.contains("ABORTED")
                 || line.contains("TEMP LIMIT")
                 || line.contains("! THROTTLE")
+                || line.contains("! NO PROGRESS")
             {
                 YELLOW
             } else if line.contains("ENGINE")

@@ -386,7 +386,17 @@ Trong boot runner, sau khi mount phân vùng kết quả, trước menu:
 | `oom`, `memory_guard` | OOM của cgroup lớp, hoặc chốt chặn FC2 | INVALID, hạ tầng test |
 | `app_hang_reset` | nhật ký chưa đóng, mọi lớp cùng đứng, reset bằng nút nguồn | INVALID, hạ tầng test |
 | `unknown_reset` | nhật ký chưa đóng, không có lý do reset (Intel) | INCOMPLETE, không tính FAIL |
-| `operator_rescue` | dừng từ console cứu hộ (FC1) | INVALID |
+| `operator_rescue` | dừng từ console cứu hộ (FC1) | INVALID (`NOTE` bên cạnh lỗi đã đếm) |
+| `startup_stall` | watchdog `STARTUP_STALLED`: không có dấu hiệu sống trong hạn (FC4) | INVALID, hạ tầng test |
+| `killed` | lớp chết vì signal khác (SIGKILL, SIGTERM) mà không có bằng chứng OOM | INVALID, hạ tầng test |
+| `worker_error` | lớp thoát với mã lỗi mà không có report | INVALID, hạ tầng test |
+| `no_report` | không có report và không có bản ghi watchdog | INVALID, hạ tầng test |
+| `app_killed`, `app_hang`, `memory_livelock` | hộp đen: app chết hoặc treo (`FC3a`) | INVALID, hạ tầng test |
+| `ssd_timeout` | hộp đen: lớp SSD không trả lời + log NVMe của kernel (`FC3a`) | `? SSDn\|SSDn-path` |
+| `operator_restart` | nhật ký chưa đóng, reset bằng nút/phần mềm khi test vẫn chạy bình thường (`FC3b`) | INVALID |
+| `hard_hang`, `fatal_hardware_error` | lý do reset AMD: hardware watchdog hết giờ; sync flood, lỗi parity, CPU shutdown (`FC3b`) | PLATFORM |
+
+Quy tắc chung (2026-10-12): **INVALID và FAIL không bao giờ gộp**. Đã đếm lỗi (phép kiểm dữ liệu, hoặc bằng chứng phần cứng như crash do signal, log I/O của kernel, lý do reset) thì phiên là FAIL; chỉ có nguyên nhân hạ tầng test thì là INVALID và không đếm lỗi nào. Không có gì để kết luận thì là INCOMPLETE.
 
 Hiển thị:
 
@@ -472,7 +482,7 @@ Dữ liệu thực tế không nằm trong git (khoảng 670 MB); bản 4 và 5 
 | FC3a hộp đen tự ra result trong phiên | xong trên host (2026-10-12): `dit-blackbox watch` (`dit-blackbox.service`, tty3, `mlockall`, `OOMScoreAdjust=-1000`); nhật ký nối thêm `DIT-RESULTS/blackbox/<run-id>.jsonl` (dòng `open`, `beat` mỗi 10 s hoặc khi đổi, `note`, `result`, `closed`); quy tắc trong `dit_blackbox::watch` (app chết 10 s → `app_killed`/`oom`; app im 60 + 30 s → `app_hang`/`memory_livelock`, khi `FINISHING` 300 s; lớp không tiến độ quá giới hạn watchdog + 30 s + 60 s: log NVMe → FAIL `ssd_timeout` `? SSDn\|SSDn-path`, còn I/O/CPU → chỉ ghi `slow_io`, không → INVALID `layer_stall`; OOM/crash/Xid 79 của lớp mà app không ghi nhận trong 60 s); result cùng định dạng app (claim, report `blackbox/<run-id>-result.json`, CSV) rồi `chvt 3` vẽ màn kết quả. Marker watchdog chỉ ghi lúc bắt đầu/kết thúc (W4). Test: `watch.rs` (quy tắc), `tests/blackbox_watch.rs`. Chưa chạy QEMU |
 | FC3b hậu kiểm ở lần boot sau | xong trên host (2026-10-12): `dit-blackbox post-mortem` chạy trong boot runner sau khi mount `DIT-RESULTS` (nạp `efi_pstore`, mount pstore), trước menu; nhật ký không có dòng kết thúc và chưa có claim → result từ dòng `beat` cuối + lý do reset AMD + pstore theo bảng FC5 (`kernel_panic`, `mce`, `reset_under_load`, `fatal_hardware_error`, `hard_hang` → FAIL PLATFORM; `app_hang_reset`, `operator_restart` → INVALID; `unknown_reset` → INCOMPLETE), report `postmortem/<run-id>-result.json`, dòng CSV, bản ghi pstore đã chép thì xóa khỏi NVRAM; marker watchdog còn mở chuyển `CLOSED_AT_BOOT`; menu hiện `PREVIOUS SESSION: ...` thay `WATCHDOG RECOVERY`. Test: `postmortem.rs`, `tests/post_mortem.rs`. Chưa chạy QEMU |
 | FC4 watchdog | xong trên host (2026-10-12): trước khi kết luận treo, watchdog xem nhóm tiến trình worker (I/O, CPU với lớp SSD, trạng thái D) và log kernel về I/O; còn động → `SLOW_IO`, chỉ kill ở `--slow-io-limit-seconds` (1800 s); không động → grace rồi `STALLED_KILLED` với bằng chứng; hạn chót khởi động `--startup-deadline-seconds 300` cho lớp COMBINED và CPU-RAM (`STARTUP_STALLED`, mã 123); worker kẹt sau SIGKILL không còn làm watchdog treo; `watchdog-status.json` cập nhật mỗi 5 s khi đã 30 s không tiến độ. Đọc tiến trình và log kernel dùng chung ở `dit_system::procs`, `dit_system::kernel_events`. Test: `dit-watchdog/tests/liveness.rs` |
-| FC5 phân loại PLATFORM | đề xuất |
+| FC5 phân loại PLATFORM | xong trên host (2026-10-12): `fault_sources::layer_ending` phân loại lớp kết thúc không có report từ `watchdog-final.json` (crash SIGSEGV/SIGBUS/SIGILL → FAIL PLATFORM `worker_crash`; treo + log I/O kernel → FAIL `? SSD\|SSD-path` `layer_stall_io_error`; còn lại INVALID với mã); verdict COMBINED là FAIL khi đã đếm lỗi (trước đây crash vừa đếm PLATFORM vừa làm phiên INVALID); mã nguyên nhân gắn vào ô trong cột `cells` (`PLATFORM=1(c1/s0)[worker_crash]`, `INVALID[layer_stall]`); màn kết quả có dòng `PLATFORM ...` (đỏ) và `INVALID ...` (vàng) dưới FAIL BY PART; lần chạy đơn không report cũng được phân loại; cảnh báo `! NO PROGRESS ... s (I/O still moving)` ở chân màn từ 60 s (COMBINED theo từng lớp, màn test đơn qua `DIT_WATCHDOG_STATUS`). Test: `fault_sources`, `fault_ledger`, `fault_single` |
 | FC6 NTFS | đề xuất |
 | FC7 hardware watchdog | đề xuất, tùy chọn |
 | FC8 RAM nghi ngờ | tạm gác |

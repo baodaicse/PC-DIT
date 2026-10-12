@@ -77,6 +77,20 @@ struct SessionEndArgs {
     run_dir: PathBuf,
     #[arg(long)]
     attribution: bool,
+    /// The run's watchdog directory: its final record says how a run without a report ended.
+    #[arg(long)]
+    watchdog_dir: Option<PathBuf>,
+}
+
+/// The verdict word of the CPU-RAM UI as the CSV writes it.
+fn verdict_word(verdict: &str) -> &'static str {
+    match verdict {
+        "PASS" => "PASS",
+        "FAIL" => "FAIL",
+        "ABORTED" => "ABORTED",
+        "INCOMPLETE" => "INCOMPLETE",
+        _ => "INVALID",
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -269,17 +283,24 @@ fn session_end(args: &SessionEndArgs) -> ExitCode {
     let root = Path::new(dit_orchestrator::session::ROOT);
     if dit_orchestrator::session::claimed_by(&args.results_root, root, &args.run_id).is_none() {
         let claim = dit_orchestrator::session::claim(&args.results_root, root, &args.run_id, "app");
+        let record = args.watchdog_dir.as_ref().and_then(|dir| {
+            std::fs::read(dir.join("watchdog-final.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        });
         println!(
             "{}",
             fault_single::row_without_report(
                 fault_single::SingleModule::CpuRam,
                 &args.results_root,
                 &args.run_dir,
-                &args.verdict,
+                verdict_word(&args.verdict),
                 args.attribution,
                 &claim,
                 dit_orchestrator::session::app_cause(root, &args.run_id),
+                record.as_ref(),
             )
+            .1
         );
     }
     dit_orchestrator::session::close(root, &args.run_id, &args.verdict);
@@ -517,21 +538,24 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "CPU-SSD was aborted or failed before a final report was written."
         };
-        format!(
-            "{headline}\n{}",
-            fault_single::row_without_report(
-                module,
-                &args.results_root,
-                &suite_dir,
-                verdict,
-                args.attribution_checks,
-                &claim,
-                dit_orchestrator::session::app_cause(
-                    Path::new(dit_orchestrator::session::ROOT),
-                    &suite_run_id
-                ),
-            )
-        )
+        let record = std::fs::read(suite_dir.join("watchdog-final.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let (ended, lines) = fault_single::row_without_report(
+            module,
+            &args.results_root,
+            &suite_dir,
+            verdict,
+            args.attribution_checks,
+            &claim,
+            dit_orchestrator::session::app_cause(
+                Path::new(dit_orchestrator::session::ROOT),
+                &suite_run_id,
+            ),
+            record.as_ref(),
+        );
+        verdict = ended;
+        format!("{headline}\n{lines}")
     };
     session.close(verdict);
     let storage =
@@ -839,21 +863,24 @@ fn launch_gpu(
         } else {
             "GPU-VRAM was aborted or failed before a final report was written."
         };
-        format!(
-            "{headline}\n{}",
-            fault_single::row_without_report(
-                module,
-                &args.results_root,
-                &suite_dir,
-                verdict,
-                args.attribution_checks,
-                &claim,
-                dit_orchestrator::session::app_cause(
-                    Path::new(dit_orchestrator::session::ROOT),
-                    &suite_run_id
-                ),
-            )
-        )
+        let record = std::fs::read(suite_dir.join("watchdog-final.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let (ended, lines) = fault_single::row_without_report(
+            module,
+            &args.results_root,
+            &suite_dir,
+            verdict,
+            args.attribution_checks,
+            &claim,
+            dit_orchestrator::session::app_cause(
+                Path::new(dit_orchestrator::session::ROOT),
+                &suite_run_id,
+            ),
+            record.as_ref(),
+        );
+        verdict = ended;
+        format!("{headline}\n{lines}")
     };
     session.close(verdict);
     let storage =
@@ -893,9 +920,15 @@ fn module_result_rows(verdict: &str, completion: &str, storage: &str) -> Vec<Str
     for line in lines {
         if line.starts_with("Fail summary") {
             csv.push(format!("CSV      {line}"));
-        } else if ["FAIL BY PART", "HW EVENTS", "THROTTLE"]
-            .iter()
-            .any(|key| line.starts_with(key))
+        } else if [
+            "FAIL BY PART",
+            "HW EVENTS",
+            "THROTTLE",
+            "PLATFORM ",
+            "INVALID ",
+        ]
+        .iter()
+        .any(|key| line.starts_with(key))
         {
             ledger.push(line.to_owned());
         } else {

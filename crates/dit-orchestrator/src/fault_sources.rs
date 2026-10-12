@@ -991,18 +991,111 @@ pub fn chain(report: &Value, phase: &str, gpu: u8, ssd: u8) -> Findings {
     found.in_phase(phase)
 }
 
-/// A layer that ended without a report (crash, OOM, watchdog kill).
+/// How a layer that ended without a report ended (`docs/FAULT_CATCH_ROADMAP.md`, FC5). Only
+/// hardware evidence counts a failure; the rest makes the session INVALID, with its cause.
+#[derive(Clone, Debug)]
+pub enum Ending {
+    /// A failure counted on the event's cell (a crash signal: PLATFORM; a stall with kernel I/O
+    /// errors: the SSD or its path).
+    Fail(Box<FaultEvent>),
+    /// Test infrastructure: no failure counted. `code` marks the CSV row (`INVALID[code]`).
+    Invalid { code: &'static str, text: String },
+}
+
+/// What the watchdog's final record (`watchdog-final.json`) says about a layer that ended
+/// without a report. `ssd_cells` are the cells a stall with kernel I/O errors is counted on.
 #[must_use]
-pub fn crash(layer: &'static str, phase: &str, detail: &str) -> FaultEvent {
-    FaultEvent::new(
-        layer,
-        "platform:no_report",
-        1,
-        Attribution::Confirmed(Component::Platform),
-        "session/no_report",
-        detail,
-    )
-    .in_phase(phase)
+pub fn layer_ending(
+    layer: &'static str,
+    phase: &str,
+    record: Option<&Value>,
+    ssd_cells: &[Component],
+) -> Ending {
+    let invalid = |code: &'static str, text: String| Ending::Invalid { code, text };
+    let Some(record) = record else {
+        return invalid(
+            "no_report",
+            format!("{layer} ended without a report or a watchdog record"),
+        );
+    };
+    let state = record["state"].as_str().unwrap_or("");
+    let detail = record["detail"].as_str().unwrap_or("").to_owned();
+    let place = if phase.is_empty() {
+        String::new()
+    } else {
+        format!(" ({phase})")
+    };
+    let kernel_io: Vec<&str> = record
+        .pointer("/liveness/kernel_io")
+        .and_then(Value::as_array)
+        .map(|lines| lines.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    match state {
+        "STALLED_KILLED" if detail.contains("slow I/O limit") => invalid(
+            "slow_io",
+            format!("{layer}{place} made no progress although it kept doing I/O: {detail}"),
+        ),
+        "STALLED_KILLED" if !kernel_io.is_empty() && !ssd_cells.is_empty() => {
+            Ending::Fail(Box::new(
+                FaultEvent::new(
+                    layer,
+                    "session:layer_stall",
+                    1,
+                    Attribution::Unresolved(ssd_cells.to_vec()),
+                    "session/layer_stall_io_error",
+                    format!("stopped answering; kernel: {}", kernel_io.join("; ")),
+                )
+                .in_phase(phase),
+            ))
+        }
+        "STALLED_KILLED" => invalid(
+            "layer_stall",
+            format!(
+                "{layer}{place} stopped making progress and the kernel reported no I/O error: {detail}"
+            ),
+        ),
+        "STARTUP_STALLED" => invalid(
+            "startup_stall",
+            format!("{layer}{place} never showed a sign of life: {detail}"),
+        ),
+        "OOM_KILLED" => invalid(
+            "oom",
+            format!("{layer}{place} was ended by the kernel for memory (OOM)"),
+        ),
+        "MEMORY_GUARD" => invalid("memory_guard", format!("{layer}{place}: {detail}")),
+        "WORKER_SIGNALED" => {
+            let signal = record["exit_signal"].as_i64().unwrap_or(0);
+            match signal {
+                // SIGILL, SIGBUS, SIGSEGV: the test process itself broke.
+                4 | 7 | 11 => Ending::Fail(Box::new(
+                    FaultEvent::new(
+                        layer,
+                        "platform:worker_crash",
+                        1,
+                        Attribution::Confirmed(Component::Platform),
+                        "session/worker_crash",
+                        format!("signal {signal} ({detail})"),
+                    )
+                    .in_phase(phase),
+                )),
+                _ => invalid(
+                    "killed",
+                    format!("{layer}{place} was ended by signal {signal} without OOM evidence"),
+                ),
+            }
+        }
+        "WORKER_FAILED" => invalid(
+            "worker_error",
+            format!(
+                "{layer}{place} exited with code {} without a report",
+                record["exit_code"].as_i64().unwrap_or(0)
+            ),
+        ),
+        _ => invalid(
+            "no_report",
+            format!("{layer}{place} ended without a report (watchdog {state}: {detail})"),
+        ),
+    }
 }
 
 // -------------------------------------------------------------------------------- live (F1)
@@ -1127,6 +1220,42 @@ pub fn from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layer_without_a_report_counts_a_failure_only_with_hardware_evidence() {
+        let ssd = [Component::Ssd(1), Component::SsdPath(1)];
+        let ending = |record: Value| layer_ending("cpu-nvme", "OVERLAP", Some(&record), &ssd);
+        let code = |e: &Ending| match e {
+            Ending::Fail(event) => event.rule,
+            Ending::Invalid { code, .. } => code,
+        };
+        let stall = serde_json::json!({"state": "STALLED_KILLED", "detail": "nothing moved",
+            "liveness": {"kernel_io": []}});
+        assert_eq!(code(&ending(stall)), "layer_stall");
+        let stall_io = serde_json::json!({"state": "STALLED_KILLED", "detail": "nothing moved",
+            "liveness": {"kernel_io": ["nvme0 I/O timeout / reset"]}});
+        let Ending::Fail(event) = ending(stall_io) else {
+            panic!("a stall with kernel I/O errors is a failure");
+        };
+        assert_eq!(event.cell, "SSD1|SSD1-path");
+        let slow = serde_json::json!({"state": "STALLED_KILLED",
+            "detail": "no progress for 1800 s although its processes kept doing I/O (slow I/O limit 1800 s)"});
+        assert_eq!(code(&ending(slow)), "slow_io");
+        let segv =
+            serde_json::json!({"state": "WORKER_SIGNALED", "exit_signal": 11, "detail": "x"});
+        assert_eq!(code(&ending(segv)), "session/worker_crash");
+        let kill = serde_json::json!({"state": "WORKER_SIGNALED", "exit_signal": 9, "detail": "x"});
+        assert_eq!(code(&ending(kill)), "killed");
+        assert_eq!(
+            code(&ending(serde_json::json!({"state": "OOM_KILLED"}))),
+            "oom"
+        );
+        assert_eq!(
+            code(&ending(serde_json::json!({"state": "STARTUP_STALLED"}))),
+            "startup_stall"
+        );
+        assert_eq!(code(&layer_ending("gpu-vram", "", None, &[])), "no_report");
+    }
     use crate::fault_ledger::{Confidence, Ledger};
 
     #[test]
