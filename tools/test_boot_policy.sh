@@ -36,6 +36,16 @@ if grep -Fq 'systemd-udev-settle.service' "$SERVICE"; then
     exit 2
 fi
 grep -Fq 'Type=simple' "$SERVICE"
+# FC1: the rescue console owns tty2, is never the OOM killer's choice and starts with the image;
+# Magic SysRq allows F (end the biggest process) besides sync / remount / reboot.
+RESCUE_SERVICE="$ROOT_DIR/image/rootfs/etc/systemd/system/dit-rescue.service"
+grep -Fxq 'TTYPath=/dev/tty2' "$RESCUE_SERVICE"
+grep -Fxq 'OOMScoreAdjust=-1000' "$RESCUE_SERVICE"
+grep -Fxq 'ExecStart=/usr/local/bin/dit-rescue' "$RESCUE_SERVICE"
+grep -Fxq 'kernel.sysrq = 240' "$ROOT_DIR/image/rootfs/etc/sysctl.d/99-dit-sysrq.conf"
+grep -Fq 'multi-user.target.wants/dit-rescue.service' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'getty@tty2.service' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'usr/local/bin/dit-rescue' "$ROOT_DIR/tools/build_image_extension.sh"
 grep -Fq 'udevadm settle --timeout=5' "$DRIVER_PROBE"
 grep -Fq 'timeout --foreground --signal=TERM --kill-after=1s 5s' "$DRIVER_PROBE"
 grep -Fq 'systemd-detect-virt --quiet' "$RUNNER"

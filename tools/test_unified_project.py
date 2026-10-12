@@ -12,7 +12,7 @@ class UnifiedProjectTests(unittest.TestCase):
     def test_single_workspace_contains_current_engines(self):
         workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())
         members = workspace["workspace"]["members"]
-        self.assertEqual(len(members), 20)
+        self.assertEqual(len(members), 21)
         names = []
         for member in members:
             path = (ROOT / member).resolve()
@@ -20,8 +20,8 @@ class UnifiedProjectTests(unittest.TestCase):
             package = tomllib.loads((path / "Cargo.toml").read_text())
             self.assertNotIn("workspace", package)
             names.append(package["package"]["name"])
-        self.assertTrue({"dit-cli", "nvme-cli", "gpu-engine", "gpu-vulkan", "gpu-cuda", "gpu-cli", "dit-orchestrator", "dit-watchdog", "dit-chain"}.issubset(names))
-        self.assertEqual(len(set(names)), 20)
+        self.assertTrue({"dit-cli", "nvme-cli", "gpu-engine", "gpu-vulkan", "gpu-cuda", "gpu-cli", "dit-orchestrator", "dit-watchdog", "dit-chain", "dit-blackbox"}.issubset(names))
+        self.assertEqual(len(set(names)), 21)
 
     def test_no_previous_project_paths_in_active_code(self):
         old_path = re.compile(r"/home/hoang/(?:CPU-DIT-01|DIT-CPU-NVME-01)(?:/|\b)")

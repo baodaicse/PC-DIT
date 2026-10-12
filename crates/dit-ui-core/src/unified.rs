@@ -314,13 +314,39 @@ fn meter_rows(meters: &[DashboardMeter], width: usize, spaced: bool) -> Vec<Stri
     rows
 }
 
-/// The title row: the engine's name, centred (painted as a band).
+/// Where the image keeps the rescue console (`docs/FAULT_CATCH_ROADMAP.md`, FC1).
+const RESCUE_CONSOLE: &str = "/usr/local/bin/dit-rescue";
+
+/// The way out of a test screen that stopped answering, as the title band says it where the
+/// rescue console runs: the longest that fits beside the engine's name.
+fn rescue_hint(room: usize) -> Option<&'static str> {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*INSTALLED.get_or_init(|| std::path::Path::new(RESCUE_CONSOLE).is_file()) {
+        return None;
+    }
+    [
+        "Frozen? Alt+F2: rescue | Alt+PrtSc+F: free RAM",
+        "Frozen? Alt+F2: rescue",
+        "Frozen? Alt+F2",
+    ]
+    .into_iter()
+    .find(|hint| hint.len() + 2 <= room)
+}
+
+/// The title row: the engine's name, centred (painted as a band), and on the right the rescue
+/// console's key.
 fn title_row(width: usize) -> String {
     let inner = width.saturating_sub(4);
-    full_row(
-        &format!("{:^inner$}", "DIT-01 / DATA INTEGRITY TEST ENGINE"),
-        width,
-    )
+    let name = "DIT-01 / DATA INTEGRITY TEST ENGINE";
+    let mut row: Vec<char> = format!("{name:^inner$}").chars().collect();
+    let room = inner.saturating_sub(name.len()) / 2;
+    if let Some(hint) = rescue_hint(room) {
+        let start = inner - hint.len() - 1;
+        for (slot, c) in row[start..].iter_mut().zip(hint.chars()) {
+            *slot = c;
+        }
+    }
+    full_row(&row.into_iter().collect::<String>(), width)
 }
 
 /// The last dashboard drawn on a terminal, kept for [`save_final_frame`].

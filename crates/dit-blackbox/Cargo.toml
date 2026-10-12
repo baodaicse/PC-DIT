@@ -1,0 +1,25 @@
+[package]
+name = "dit-blackbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dit-blackbox"
+path = "src/bin/dit-blackbox.rs"
+
+[[bin]]
+name = "dit-rescue"
+path = "src/bin/dit-rescue.rs"
+
+[dependencies]
+clap.workspace = true
+dit-orchestrator = { path = "../dit-orchestrator" }
+dit-ui-core = { path = "../dit-ui-core" }
+nix = { workspace = true, features = ["fs", "mman", "poll", "reboot", "signal", "term"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

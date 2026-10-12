@@ -223,6 +223,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dit-blackbox"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dit-orchestrator",
+ "dit-ui-core",
+ "nix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dit-chain"
 version = "0.1.0"
 dependencies = [

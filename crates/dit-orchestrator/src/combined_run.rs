@@ -1500,7 +1500,14 @@ impl Session<'_> {
             ),
             ..self.csv_meta()
         };
-        match dit_orchestrator::fault_ledger::append_csv(&path, &self.ledger, &meta) {
+        let mut counts = self.ledger.csv_counts();
+        if let Some(code) =
+            dit_orchestrator::session::app_cause(Path::new(session::ROOT), &self.run_id)
+        {
+            counts.add_cause(code);
+        }
+        let row = dit_orchestrator::fault_ledger::csv_row(&meta, &counts);
+        match dit_orchestrator::fault_ledger::append_csv_row(&path, &row) {
             Ok(()) => format!("Fail summary row added to {}", path.display()),
             Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
         }

@@ -156,6 +156,18 @@ impl SessionWriter {
     }
 }
 
+/// Whether the operator stopped the session `run_id` from the rescue console.
+#[must_use]
+pub fn rescue_stopped(root: &Path, run_id: &str) -> bool {
+    root.join(run_id).join(RESCUE_STOP_FILE).exists()
+}
+
+/// The cause a result written by the app carries, if any (`operator_rescue`).
+#[must_use]
+pub fn app_cause(root: &Path, run_id: &str) -> Option<&'static str> {
+    rescue_stopped(root, run_id).then_some("operator_rescue")
+}
+
 /// Closes the session `run_id` under `root` without its writer (the CPU-RAM UI script, at the
 /// end of a run): the last status, marked closed.
 pub fn close(root: &Path, run_id: &str, verdict: &str) {

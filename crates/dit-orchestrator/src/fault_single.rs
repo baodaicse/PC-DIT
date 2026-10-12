@@ -2,7 +2,7 @@
 //! counted on component cells, two lines for the completion screen and one `fail-summary.csv`
 //! row on the results volume, like a combined session.
 use dit_orchestrator::fault_ledger::{
-    Component, CsvCounts, CsvMeta, Ledger, append_csv, append_csv_row, csv_row,
+    Component, CsvCounts, CsvMeta, Ledger, append_csv_row, csv_row,
 };
 use dit_orchestrator::fault_signatures;
 use dit_orchestrator::fault_sources;
@@ -170,7 +170,8 @@ fn csv_path(results_root: &Path, run_dir: &Path) -> std::path::PathBuf {
 }
 
 /// The CSV row of a run that ended without a report (stopped, crashed, killed): nothing counted,
-/// so a session still has its row. `claim` says whether this run writes it.
+/// so a session still has its row. `claim` says whether this run writes it; `cause` marks why
+/// it ended (`operator_rescue`).
 pub fn row_without_report(
     module: SingleModule,
     results_root: &Path,
@@ -178,6 +179,7 @@ pub fn row_without_report(
     verdict: &str,
     attribution: bool,
     claim: &Claim,
+    cause: Option<&str>,
 ) -> String {
     if let Claim::Taken(by) = claim {
         return format!("Fail summary not written: the {by} already wrote this session's result");
@@ -188,7 +190,11 @@ pub fn row_without_report(
         ..csv_meta(module, attribution)
     };
     let path = csv_path(results_root, run_dir);
-    match append_csv_row(&path, &csv_row(&meta, &CsvCounts::default())) {
+    let mut counts = CsvCounts::default();
+    if let Some(code) = cause {
+        counts.add_cause(code);
+    }
+    match append_csv_row(&path, &csv_row(&meta, &counts)) {
         Ok(()) => format!("Fail summary row added to {}", path.display()),
         Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
     }
@@ -207,6 +213,7 @@ pub fn summarize(
     verdict: &str,
     attribution: bool,
     claim: &Claim,
+    cause: Option<&str>,
 ) -> String {
     let Some(report) = std::fs::read(report_path)
         .ok()
@@ -238,7 +245,13 @@ pub fn summarize(
         Claim::Taken(by) => {
             format!("Fail summary not written: the {by} already wrote this session's result")
         }
-        Claim::Won => match append_csv(&csv_path, &ledger, &meta) {
+        Claim::Won => match append_csv_row(&csv_path, &{
+            let mut counts = ledger.csv_counts();
+            if let Some(code) = cause {
+                counts.add_cause(code);
+            }
+            csv_row(&meta, &counts)
+        }) {
             Ok(()) => format!("Fail summary row added to {}", csv_path.display()),
             Err(error) => format!("Fail summary not written ({error}): {}", csv_path.display()),
         },
@@ -270,6 +283,7 @@ mod tests {
             "FAIL",
             true,
             &Claim::Won,
+            None,
         );
         // The rules leave retention failures on `PCIe-GPU1|VRAM1`; the five failures sit on two
         // byte offsets only (0 and 5701632), so the ranking (F6) moves them to VRAM1 as suspected.

@@ -1,0 +1,26 @@
+[Unit]
+Description=DIT-01 rescue console on tty2 (Alt+F2): stop with a record, free memory, diagnostics, restart
+Documentation=file:/usr/share/doc/dit-suite/FAULT_CATCH_ROADMAP.md
+After=local-fs.target
+Conflicts=getty@tty2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dit-rescue
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty2
+TTYReset=yes
+TTYVHangup=yes
+Environment=TERM=linux
+Restart=always
+RestartSec=1
+# It has to answer while the tests hold the memory: never the OOM killer's choice, its memory
+# kept for it, ahead in the CPU queue (it also locks itself in RAM).
+OOMScoreAdjust=-1000
+MemoryMin=64M
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

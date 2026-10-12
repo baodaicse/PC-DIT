@@ -14,6 +14,7 @@ mkdir -p "$project_dir/dist" "$staging_dir"
 find "$staging_dir" -mindepth 1 -delete
 
 cargo build --release -p nvme-cli -p gpu-cli -p dit-orchestrator -p dit-watchdog -p dit-chain \
+    -p dit-blackbox \
     --manifest-path "$project_dir/Cargo.toml"
 
 install -D -m 0755 "$project_dir/target/release/cpu-nvme-dit" \
@@ -22,6 +23,10 @@ install -D -m 0755 "$project_dir/target/release/dit-orchestrator" \
     "$staging_dir/usr/local/bin/dit-suite"
 install -D -m 0755 "$project_dir/target/release/dit-watchdog" \
     "$staging_dir/usr/local/bin/dit-watchdog"
+install -D -m 0755 "$project_dir/target/release/dit-rescue" \
+    "$staging_dir/usr/local/bin/dit-rescue"
+install -D -m 0755 "$project_dir/target/release/dit-blackbox" \
+    "$staging_dir/usr/local/bin/dit-blackbox"
 install -D -m 0755 "$project_dir/target/release/gpu-vram-dit" \
     "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit"
 install -D -m 0755 "$project_dir/target/release/dit-chain" \
@@ -44,6 +49,8 @@ install -D -m 0644 "$project_dir/docs/UNIFIED_DASHBOARD_AND_COMBINED_PIPELINE.md
     "$staging_dir/usr/share/doc/dit-suite/UNIFIED_DASHBOARD_AND_COMBINED_PIPELINE.md"
 install -D -m 0644 "$project_dir/docs/RUNTIME_WATCHDOG.md" \
     "$staging_dir/usr/share/doc/dit-suite/RUNTIME_WATCHDOG.md"
+install -D -m 0644 "$project_dir/docs/FAULT_CATCH_ROADMAP.md" \
+    "$staging_dir/usr/share/doc/dit-suite/FAULT_CATCH_ROADMAP.md"
 install -D -m 0644 "$project_dir/docs/gpu-vram/ROADMAP.md" \
     "$staging_dir/usr/share/doc/gpu-vram-dit/ROADMAP.md"
 install -D -m 0644 "$project_dir/docs/gpu-vram/STATUS.md" \
@@ -68,6 +75,8 @@ nvme_sha=$(sha256sum "$staging_dir/opt/cpu-nvme-dit/cpu-nvme-dit" | awk '{print 
 gpu_sha=$(sha256sum "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit" | awk '{print $1}')
 suite_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-suite" | awk '{print $1}')
 watchdog_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-watchdog" | awk '{print $1}')
+rescue_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-rescue" | awk '{print $1}')
+blackbox_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-blackbox" | awk '{print $1}')
 chain_sha=$(sha256sum "$staging_dir/opt/dit-chain/dit-chain" | awk '{print $1}')
 shader_sha=$(sha256sum "$staging_dir/usr/share/gpu-vram-dit/matrix_u32.spv" | awk '{print $1}')
 install -D -m 0644 "$project_dir/crates/gpu-cuda/kernels/gemm.cu" "$staging_dir/usr/share/gpu-vram-dit/gemm.cu"
@@ -86,6 +95,8 @@ printf '%s\n' \
     '  "launchers": {' \
     '    "control_center": "/usr/local/bin/dit-suite",' \
     '    "watchdog": "/usr/local/bin/dit-watchdog",' \
+    '    "rescue_console": "/usr/local/bin/dit-rescue",' \
+    '    "black_box": "/usr/local/bin/dit-blackbox",' \
     '    "cpu_nvme": "/opt/cpu-nvme-dit/cpu-nvme-dit",' \
     '    "gpu_vram": "/opt/gpu-vram-dit/gpu-vram-dit",' \
     '    "chain": "/opt/dit-chain/dit-chain"' \
@@ -95,6 +106,8 @@ printf '%s\n' \
     "    \"gpu-vram-dit.sha256\": \"$gpu_sha\"," \
     "    \"dit-suite.sha256\": \"$suite_sha\"," \
     "    \"dit-watchdog.sha256\": \"$watchdog_sha\"," \
+    "    \"dit-rescue.sha256\": \"$rescue_sha\"," \
+    "    \"dit-blackbox.sha256\": \"$blackbox_sha\"," \
     "    \"dit-chain.sha256\": \"$chain_sha\"," \
     "    \"matrix_u32.spv.sha256\": \"$shader_sha\"" \
     '  },' \
@@ -118,6 +131,8 @@ printf '%s\n' \
         opt/gpu-vram-dit/gpu-vram-dit \
         usr/local/bin/dit-suite \
         usr/local/bin/dit-watchdog \
+        usr/local/bin/dit-rescue \
+        usr/local/bin/dit-blackbox \
         opt/dit-chain/dit-chain \
         usr/share/doc/dit-suite/COMBINED_STRESS_CHAIN_ANALYSIS.md \
         etc/dit-suite/cpu-nvme.conf \
@@ -129,7 +144,8 @@ printf '%s\n' \
         usr/share/doc/cpu-nvme-dit/AUTO_STORAGE.md \
         usr/share/doc/cpu-nvme-dit/NVME_DEEP_PIPELINE.md \
         usr/share/doc/dit-suite/UNIFIED_DASHBOARD_AND_COMBINED_PIPELINE.md \
-        usr/share/doc/dit-suite/RUNTIME_WATCHDOG.md >MANIFEST.sha256
+        usr/share/doc/dit-suite/RUNTIME_WATCHDOG.md \
+        usr/share/doc/dit-suite/FAULT_CATCH_ROADMAP.md >MANIFEST.sha256
     sha256sum \
         usr/share/doc/gpu-vram-dit/ROADMAP.md \
         usr/share/doc/gpu-vram-dit/STATUS.md \

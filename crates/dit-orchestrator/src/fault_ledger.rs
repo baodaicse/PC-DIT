@@ -695,6 +695,113 @@ impl CsvCounts {
     pub fn failures(&self) -> u64 {
         self.columns.iter().sum::<u64>() + self.unresolved
     }
+
+    /// Counts `count` failures nobody placed yet on `cells` (one cell: suspected there; more:
+    /// unresolved between them), e.g. a single run's failures seen live before its report.
+    pub fn add_pending(&mut self, cells: &[String], count: u64) {
+        if count == 0 || cells.is_empty() {
+            return;
+        }
+        self.push_cell(&format!("?{}={count}", cells.join("|")));
+        self.unresolved += count;
+    }
+
+    /// Counts one failure decided outside the app (the black box's verdict on a session: an SSD
+    /// that stopped answering, a reset under load) on `cells`, marked with its cause `code`:
+    /// `PLATFORM=1(c1/s0)[reset_under_load]`, `?SSD1|SSD1-path=1[ssd_timeout]`.
+    pub fn add_failure(&mut self, cells: &[&str], code: &str) {
+        match cells {
+            [] => {}
+            [cell] => {
+                if let Some(index) =
+                    column_of(cell).and_then(|c| COLUMNS.iter().position(|k| *k == c))
+                {
+                    if self.columns.len() < COLUMNS.len() {
+                        self.columns.resize(COLUMNS.len(), 0);
+                    }
+                    self.columns[index] += 1;
+                }
+                self.confirmed += 1;
+                let prefix = format!("{cell}=");
+                let mut entries: Vec<String> = self
+                    .cells
+                    .split(';')
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if let Some(entry) = entries.iter_mut().find(|e| e.starts_with(&prefix)) {
+                    let (count, confirmed, suspected) = parse_cell_entry(&entry[prefix.len()..]);
+                    *entry = format!(
+                        "{cell}={}(c{}/s{suspected})[{code}]",
+                        count + 1,
+                        confirmed + 1
+                    );
+                } else {
+                    entries.push(format!("{cell}=1(c1/s0)[{code}]"));
+                }
+                self.cells = entries.join(";");
+            }
+            group => {
+                self.push_cell(&format!("?{}=1[{code}]", group.join("|")));
+                self.unresolved += 1;
+            }
+        }
+    }
+
+    /// Marks the row with a cause that counts no failure: `INVALID[app_hang]` when nothing failed
+    /// (the session is INVALID for it), `NOTE[operator_rescue]` beside failures (it is a FAIL).
+    pub fn add_cause(&mut self, code: &str) {
+        let mark = if self.failures() > 0 {
+            "NOTE"
+        } else {
+            "INVALID"
+        };
+        self.push_cell(&format!("{mark}[{code}]"));
+    }
+
+    fn push_cell(&mut self, entry: &str) {
+        if self.cells.is_empty() {
+            entry.clone_into(&mut self.cells);
+        } else {
+            self.cells.push(';');
+            self.cells.push_str(entry);
+        }
+    }
+}
+
+/// `n(cX/sY)` of a cells entry, a trailing `[cause]` ignored.
+fn parse_cell_entry(text: &str) -> (u64, u64, u64) {
+    let number = |s: &str| s.parse::<u64>().unwrap_or(0);
+    let (count, rest) = text.split_once('(').unwrap_or((text, ""));
+    let inner = rest.split(')').next().unwrap_or("");
+    let (confirmed, suspected) = inner.split_once('/').unwrap_or(("", ""));
+    (
+        number(count),
+        number(confirmed.trim_start_matches('c')),
+        number(suspected.trim_start_matches('s')),
+    )
+}
+
+/// The CSV column of a cell label (`SSD2-path` -> `ssd_path`).
+fn column_of(label: &str) -> Option<&'static str> {
+    let digits = |rest: &str| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    Some(match label {
+        "CPU" => "cpu",
+        "RAM" => "ram",
+        "PLATFORM" => "platform",
+        _ if label.strip_prefix("PCIe-GPU").is_some_and(digits) => "pcie_gpu",
+        _ if label.strip_prefix("GPU").is_some_and(digits) => "gpu",
+        _ if label.strip_prefix("VRAM").is_some_and(digits) => "vram",
+        _ if label
+            .strip_prefix("SSD")
+            .and_then(|rest| rest.strip_suffix("-path"))
+            .is_some_and(digits) =>
+        {
+            "ssd_path"
+        }
+        _ if label.strip_prefix("SSD").is_some_and(digits) => "ssd",
+        _ => return None,
+    })
 }
 
 /// One `fail-summary.csv` row from its description and its counts.
@@ -792,6 +899,33 @@ mod tests {
             "test/rule",
             "x",
         )
+    }
+
+    #[test]
+    fn counts_take_failures_and_causes_decided_outside_the_app() {
+        let mut ledger = Ledger::default();
+        ledger.add(event(Attribution::Confirmed(Component::Ram), 2));
+        let mut counts = ledger.csv_counts();
+        assert_eq!(counts.cells, "RAM=2(c2/s0)");
+        counts.add_failure(&["PLATFORM"], "reset_under_load");
+        counts.add_failure(&["RAM"], "x");
+        counts.add_failure(&["SSD1", "SSD1-path"], "ssd_timeout");
+        counts.add_pending(&["CPU".to_owned(), "RAM".to_owned()], 3);
+        counts.add_cause("operator_rescue");
+        assert_eq!(
+            counts.cells,
+            "RAM=3(c3/s0)[x];PLATFORM=1(c1/s0)[reset_under_load];?SSD1|SSD1-path=1[ssd_timeout];?CPU|RAM=3;NOTE[operator_rescue]"
+        );
+        let mut clean = CsvCounts::default();
+        clean.add_cause("app_hang");
+        assert_eq!(clean.cells, "INVALID[app_hang]");
+        // cpu ram pcie_gpu gpu vram ssd ssd_path platform
+        assert_eq!(counts.columns, vec![0, 3, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(counts.unresolved, 4);
+        assert_eq!(counts.failures(), 8);
+        assert_eq!(column_of("SSD2-path"), Some("ssd_path"));
+        assert_eq!(column_of("PCIe-GPU1"), Some("pcie_gpu"));
+        assert_eq!(column_of("GPUX"), None);
     }
 
     #[test]

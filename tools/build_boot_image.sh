@@ -272,6 +272,12 @@ configure_rootfs() {
     sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/etc/hostname" "$ROOTFS/etc/hostname"
     sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/etc/systemd/system/cpu-dit.service" \
         "$ROOTFS/etc/systemd/system/cpu-dit.service"
+    # The rescue console (tty2) and Magic SysRq: a way out, with a record, when the test screen
+    # stops answering (docs/FAULT_CATCH_ROADMAP.md, FC1).
+    sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/etc/systemd/system/dit-rescue.service" \
+        "$ROOTFS/etc/systemd/system/dit-rescue.service"
+    sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/etc/sysctl.d/99-dit-sysrq.conf" \
+        "$ROOTFS/etc/sysctl.d/99-dit-sysrq.conf"
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/boot-runner.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/boot-runner.sh"
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/cpu-dit-ui.sh" \
@@ -296,8 +302,11 @@ configure_rootfs() {
     sudo mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
     sudo ln -sfn /etc/systemd/system/cpu-dit.service \
         "$ROOTFS/etc/systemd/system/multi-user.target.wants/cpu-dit.service"
+    sudo ln -sfn /etc/systemd/system/dit-rescue.service \
+        "$ROOTFS/etc/systemd/system/multi-user.target.wants/dit-rescue.service"
     for unit in apt-daily.timer apt-daily-upgrade.timer fstrim.timer \
-        getty@tty1.service serial-getty@ttyS0.service rasdaemon.service \
+        getty@tty1.service getty@tty2.service getty@tty3.service \
+        serial-getty@ttyS0.service rasdaemon.service \
         ras-mc-ctl.service smartmontools.service smartd.service lm-sensors.service \
         nvmf-autoconnect.service nvmefc-boot-connections.service getty-static.service \
         dpkg-db-backup.timer e2scrub_all.timer motd-news.timer; do
@@ -336,6 +345,10 @@ install_image_extension() {
         || die "DIT extension did not install the shared control center"
     [[ -x "$ROOTFS/usr/local/bin/dit-watchdog" ]] \
         || die "DIT extension did not install the independent runtime watchdog"
+    [[ -x "$ROOTFS/usr/local/bin/dit-rescue" ]] \
+        || die "DIT extension did not install the rescue console"
+    [[ -x "$ROOTFS/usr/local/bin/dit-blackbox" ]] \
+        || die "DIT extension did not install the black box"
     [[ -x "$ROOTFS/opt/cpu-nvme-dit/cpu-nvme-dit" ]] \
         || die "DIT extension did not install the CPU-SSD/NVMe binary"
     [[ -x "$ROOTFS/opt/gpu-vram-dit/gpu-vram-dit" ]] \

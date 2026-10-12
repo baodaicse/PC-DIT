@@ -217,55 +217,8 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             io::stdout().flush()?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ledger(args) => {
-            let claim =
-                args.session
-                    .as_deref()
-                    .map_or(dit_orchestrator::session::Claim::Won, |run_id| {
-                        dit_orchestrator::session::claim(
-                            &args.results_root,
-                            Path::new(dit_orchestrator::session::ROOT),
-                            run_id,
-                            "app",
-                        )
-                    });
-            println!(
-                "{}",
-                fault_single::summarize(
-                    fault_single::SingleModule::CpuRam,
-                    &args.report,
-                    &args.results_root,
-                    &args.run_dir,
-                    &args.run_id,
-                    &args.verdict,
-                    args.attribution,
-                    &claim,
-                )
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::SessionEnd(args) => {
-            let root = Path::new(dit_orchestrator::session::ROOT);
-            if dit_orchestrator::session::claimed_by(&args.results_root, root, &args.run_id)
-                .is_none()
-            {
-                let claim =
-                    dit_orchestrator::session::claim(&args.results_root, root, &args.run_id, "app");
-                println!(
-                    "{}",
-                    fault_single::row_without_report(
-                        fault_single::SingleModule::CpuRam,
-                        &args.results_root,
-                        &args.run_dir,
-                        &args.verdict,
-                        args.attribution,
-                        &claim,
-                    )
-                );
-            }
-            dit_orchestrator::session::close(root, &args.run_id, &args.verdict);
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Ledger(args) => Ok(ledger(&args)),
+        Command::SessionEnd(args) => Ok(session_end(&args)),
         Command::FinalFrame(args) => {
             let Some(dashboard) = dit_ui_core::load_final_frame(&args.frame) else {
                 return Ok(ExitCode::from(1));
@@ -274,6 +227,63 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `dit-suite ledger`: a finished CPU-RAM run's failures on their cells and its CSV row.
+fn ledger(args: &LedgerArgs) -> ExitCode {
+    let claim = args
+        .session
+        .as_deref()
+        .map_or(dit_orchestrator::session::Claim::Won, |run_id| {
+            dit_orchestrator::session::claim(
+                &args.results_root,
+                Path::new(dit_orchestrator::session::ROOT),
+                run_id,
+                "app",
+            )
+        });
+    println!(
+        "{}",
+        fault_single::summarize(
+            fault_single::SingleModule::CpuRam,
+            &args.report,
+            &args.results_root,
+            &args.run_dir,
+            &args.run_id,
+            &args.verdict,
+            args.attribution,
+            &claim,
+            args.session
+                .as_deref()
+                .and_then(|run_id| dit_orchestrator::session::app_cause(
+                    Path::new(dit_orchestrator::session::ROOT),
+                    run_id
+                )),
+        )
+    );
+    ExitCode::SUCCESS
+}
+
+/// `dit-suite session-end`: a CPU-RAM UI session's row when it has none yet, then closed.
+fn session_end(args: &SessionEndArgs) -> ExitCode {
+    let root = Path::new(dit_orchestrator::session::ROOT);
+    if dit_orchestrator::session::claimed_by(&args.results_root, root, &args.run_id).is_none() {
+        let claim = dit_orchestrator::session::claim(&args.results_root, root, &args.run_id, "app");
+        println!(
+            "{}",
+            fault_single::row_without_report(
+                fault_single::SingleModule::CpuRam,
+                &args.results_root,
+                &args.run_dir,
+                &args.verdict,
+                args.attribution,
+                &claim,
+                dit_orchestrator::session::app_cause(root, &args.run_id),
+            )
+        );
+    }
+    dit_orchestrator::session::close(root, &args.run_id, &args.verdict);
+    ExitCode::SUCCESS
 }
 
 fn registry(args: &MenuArgs) -> Vec<ModuleRegistration> {
@@ -487,6 +497,10 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
                 verdict_name(report.aggregate_verdict),
                 args.attribution_checks,
                 &claim,
+                dit_orchestrator::session::app_cause(
+                    Path::new(dit_orchestrator::session::ROOT),
+                    &suite_run_id
+                ),
             )
         )
     } else {
@@ -504,6 +518,10 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
                 verdict,
                 args.attribution_checks,
                 &claim,
+                dit_orchestrator::session::app_cause(
+                    Path::new(dit_orchestrator::session::ROOT),
+                    &suite_run_id
+                ),
             )
         )
     };
@@ -735,6 +753,7 @@ fn choose_gpu_profile(settings: &mut GpuSettings) -> io::Result<Option<GpuProfil
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn launch_gpu(
     args: &MenuArgs,
     settings: &mut GpuSettings,
@@ -799,6 +818,10 @@ fn launch_gpu(
             verdict_name(report.verdict),
             args.attribution_checks,
             &claim,
+            dit_orchestrator::session::app_cause(
+                Path::new(dit_orchestrator::session::ROOT),
+                &suite_run_id,
+            ),
         ));
         message
     } else {
@@ -816,6 +839,10 @@ fn launch_gpu(
                 verdict,
                 args.attribution_checks,
                 &claim,
+                dit_orchestrator::session::app_cause(
+                    Path::new(dit_orchestrator::session::ROOT),
+                    &suite_run_id
+                ),
             )
         )
     };

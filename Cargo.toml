@@ -20,6 +20,7 @@ members = [
     "crates/gpu-cli",
     "crates/dit-watchdog",
     "crates/dit-chain",
+    "crates/dit-blackbox",
 ]
 resolver = "3"
 
