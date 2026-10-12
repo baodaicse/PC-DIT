@@ -3,6 +3,7 @@
 use dit_orchestrator::fault_ledger::CsvMeta;
 use dit_orchestrator::session::{self, LayerStatus, SessionInfo, SessionStatus, SessionWriter};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -94,5 +95,49 @@ fn a_stop_the_app_does_not_answer_is_recorded_by_the_console() {
     assert!(app.try_wait().unwrap().is_none());
     let _ = app.kill();
     let _ = app.wait();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Step FC7: armed by the boot runner (the marker), the rescue console keeps the board's
+/// watchdog alive; not armed, it leaves the device alone.
+#[test]
+fn the_rescue_console_keeps_an_armed_hardware_watchdog_alive() {
+    let root = std::env::temp_dir().join(format!("dit-rescue-hw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let device = root.join("watchdog");
+    std::fs::write(&device, "").unwrap();
+    let console = |marker: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_dit-rescue"))
+            .arg("--session-root")
+            .arg(root.join("sessions"))
+            .arg("--hw-watchdog-marker")
+            .arg(marker)
+            .arg("--hw-watchdog-device")
+            .arg(&device)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut idle = console(&root.join("not-armed"));
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = idle.kill();
+    let _ = idle.wait();
+    assert_eq!(
+        std::fs::metadata(&device).unwrap().len(),
+        0,
+        "not armed: untouched"
+    );
+    let marker = root.join("dit-hw-watchdog");
+    std::fs::write(&marker, "180\n").unwrap();
+    let mut armed = console(&marker);
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = armed.kill();
+    let _ = armed.wait();
+    assert!(
+        std::fs::metadata(&device).unwrap().len() >= 1,
+        "armed: kept alive"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

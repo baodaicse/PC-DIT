@@ -56,6 +56,12 @@ grep -Fq 'usr/local/bin/dit-blackbox' "$ROOT_DIR/tools/build_image_extension.sh"
 # FC3b: the post-mortem runs at boot once the results volume is mounted, before the menu.
 grep -Fq '/usr/local/bin/dit-blackbox post-mortem --results-root /mnt/cpu-dit-results' "$RUNNER"
 grep -Fq 'mount -t pstore pstore /sys/fs/pstore' "$RUNNER"
+# FC7: the hardware watchdog is armed only with dit_hw_watchdog on the kernel command line.
+grep -Fq 'seconds="$(cmdline_value dit_hw_watchdog || true)"' "$RUNNER"
+if grep -Eq '^[[:space:]]*linux .*dit_hw_watchdog' "$GRUB_CONFIG"; then
+    printf 'BOOT_POLICY_FAIL: the hardware watchdog stays a trial, off in every boot entry\n' >&2
+    exit 2
+fi
 # FC2: tests run in their own memory cgroups under a delegated service cgroup.
 grep -Fxq 'Delegate=yes' "$SERVICE"
 grep -Fq 'export DIT_TEST_CGROUP="$service/tests"' "$RUNNER"

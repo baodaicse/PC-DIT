@@ -34,6 +34,46 @@ struct Args {
     /// How long [S] waits for the app to stop and write its own result.
     #[arg(long, default_value_t = 30)]
     stop_wait_seconds: u64,
+    /// FC7 (a trial, off unless booted with `dit_hw_watchdog`): the boot runner loaded the board's
+    /// watchdog driver and wrote its timeout here; this console then keeps it alive.
+    #[arg(long, default_value = "/run/dit-hw-watchdog")]
+    hw_watchdog_marker: PathBuf,
+    #[arg(long, default_value = "/dev/watchdog")]
+    hw_watchdog_device: PathBuf,
+}
+
+/// FC7: keeps the board's hardware watchdog alive from a thread of its own, every 10 s, once the
+/// boot runner has armed it. If the whole machine freezes (the kernel, not just the tests) the
+/// board restarts it, and the next boot's post-mortem records a hard hang. Returns the timeout
+/// in seconds the screen shows, shared with the thread.
+fn keep_hw_watchdog(
+    marker: PathBuf,
+    device: PathBuf,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let timeout = std::sync::Arc::new(AtomicU64::new(0));
+    let shared = std::sync::Arc::clone(&timeout);
+    let _ = std::thread::Builder::new()
+        .name("hw-watchdog".into())
+        .spawn(move || {
+            let mut open: Option<std::fs::File> = None;
+            loop {
+                if open.is_none()
+                    && let Ok(text) = std::fs::read_to_string(&marker)
+                {
+                    open = std::fs::OpenOptions::new().write(true).open(&device).ok();
+                    if open.is_some() {
+                        shared.store(text.trim().parse().unwrap_or(0), Ordering::Relaxed);
+                    }
+                }
+                if let Some(file) = open.as_mut() {
+                    let _ = file.write_all(b"\0");
+                    let _ = file.flush();
+                }
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+    timeout
 }
 
 /// A key pressed once waits this long for the second press that confirms it.
@@ -117,7 +157,7 @@ impl View {
             .max_by_key(|p| p.rss_bytes)
     }
 
-    fn screen(&self, message: &str, pending: Option<char>) -> String {
+    fn screen(&self, message: &str, pending: Option<char>, hw_watchdog: u64) -> String {
         let mut state = Vec::new();
         match &self.session {
             Some((_, info, status)) => {
@@ -137,6 +177,11 @@ impl View {
                 }
             }
             None => state.push(" SESSION  no test is running".to_owned()),
+        }
+        if hw_watchdog > 0 {
+            state.push(format!(
+                " BOARD    hardware watchdog on, {hw_watchdog} s: a machine that freezes restarts by itself"
+            ));
         }
         state.push(format!(
             " MEMORY   {} available of {}   pressure some {:.1} % / full {:.1} % (10 s)",
@@ -223,6 +268,7 @@ fn stop(args: &Args, view: &View) -> String {
                 deadline.saturating_duration_since(Instant::now()).as_secs()
             ),
             None,
+            0,
         ));
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -392,6 +438,10 @@ fn main() -> ExitCode {
         nix::sys::mman::MlockAllFlags::MCL_CURRENT | nix::sys::mman::MlockAllFlags::MCL_FUTURE,
     );
     raw_terminal();
+    let hw_watchdog = keep_hw_watchdog(
+        args.hw_watchdog_marker.clone(),
+        args.hw_watchdog_device.clone(),
+    );
     let mut message = String::new();
     let mut pending: Option<(char, Instant)> = None;
     loop {
@@ -399,7 +449,11 @@ fn main() -> ExitCode {
             pending = None;
         }
         let view = View::read(&args);
-        draw(&view.screen(&message, pending.map(|(k, _)| k)));
+        draw(&view.screen(
+            &message,
+            pending.map(|(k, _)| k),
+            hw_watchdog.load(std::sync::atomic::Ordering::Relaxed),
+        ));
         let Some(pressed) = key(Duration::from_secs(1)) else {
             continue;
         };

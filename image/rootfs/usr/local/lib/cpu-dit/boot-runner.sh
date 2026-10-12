@@ -99,6 +99,23 @@ setup_test_cgroups() {
     export DIT_TEST_CGROUP="$service/tests"
 }
 setup_test_cgroups
+
+# FC7 (docs/FAULT_CATCH_ROADMAP.md; a trial, off by default): boot with dit_hw_watchdog=1 (or
+# =<seconds>, at least 60) to arm the board's watchdog (sp5100_tco on AMD, iTCO_wdt on Intel).
+# The rescue console keeps it alive; a machine that freezes outright is then restarted by the
+# board, and the next boot's post-mortem records a hard hang.
+arm_hw_watchdog() {
+    local seconds
+    seconds="$(cmdline_value dit_hw_watchdog || true)"
+    [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds > 0 )) || return 0
+    (( seconds < 60 )) && seconds=180
+    modprobe sp5100_tco heartbeat="$seconds" 2>/dev/null \
+        || modprobe iTCO_wdt heartbeat="$seconds" 2>/dev/null || true
+    if [[ -c /dev/watchdog ]]; then
+        printf '%s\n' "$seconds" >/run/dit-hw-watchdog
+    fi
+}
+arm_hw_watchdog
 # The test screens own the console: only critical kernel messages (levels 0-2) print on it, as
 # loglevel=3 on the kernel command line means. Ubuntu's sysctl.d raises the level to 4 after
 # boot, which lets KERN_ERR lines (NVRM probes, I/O errors) overwrite the frames; the kernel
