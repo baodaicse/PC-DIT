@@ -25,6 +25,16 @@ Trạng thái: `implemented` ở source/host gate; image/hardware validation pen
 - Chưa bao phủ kernel hard lock, firmware hang hoặc mất nguồn: cần platform/BMC watchdog nếu yêu cầu recovery trong các trường hợp đó.
 - Gate kế tiếp: USB thực chạy PASS, `kill -9` worker, induced memory pressure/OOM (chỉ lab), stale heartbeat, reboot giữa run và kiểm marker trên result partition. Checklist: [RUNTIME_WATCHDOG.md](RUNTIME_WATCHDOG.md).
 
+### U2.2 — Bắt lỗi khi app treo hoặc phần cứng lỗi thật (FC0–FC8)
+
+Trạng thái: `proposed` (2026-10-12), chưa code. Chi tiết: [FAULT_CATCH_ROADMAP.md](FAULT_CATCH_ROADMAP.md).
+
+- Kết quả thực tế: 8 ô PLATFORM đang hiện là lớp SSD treo trên NTFS (lỗi DIT); khoảng 13 phiên chết giữa chừng (phần lớn app treo, người vận hành reset) không được ghi lại.
+- Lối thoát cho người vận hành: `nvidia-smi` có timeout, console cứu hộ ở VT2, SysRq.
+- Chặn nguyên nhân: chốt chặn bộ nhớ (PSI, cgroup cho các lớp test).
+- Không mất phiên: hộp đen ghi nối thêm và hậu kiểm ở lần boot sau (lý do reset AMD, pstore).
+- Ghi đúng nguyên nhân: watchdog xét I/O và CPU trước khi kết luận treo; PLATFORM tách theo nguyên nhân; lỗi hạ tầng test chỉ làm phiên INVALID.
+
 ## U3 — Phát triển module và phối hợp
 
 ### CPU–RAM availability và power-platform hardening

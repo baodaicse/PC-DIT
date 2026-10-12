@@ -27,3 +27,5 @@
 Watchdog không thể chạy khi kernel đã hard-lock, CPU reset hoặc mất điện. Nó cũng không thể đảm bảo marker được flush nếu USB/result partition mất cùng lúc. Trường hợp đó cần BMC/platform hardware watchdog hoặc power controller ngoài máy. Không suy luận lỗi phần cứng chỉ từ một `WORKER_FAILED`: cần xem `watchdog-final.json`, report module, kernel log và tái lập test.
 
 Không có heartbeat ban đầu (ví dụ còn ở picker/menu) sẽ không bị watchdog kill. Liveness contract chỉ arm sau heartbeat/activity đầu tiên để thao tác chọn test không bị nhận nhầm là treo.
+
+Hiệu quả trên kết quả thực tế và các lỗ hổng (W1–W6: kill nhầm khi I/O chậm, không có hạn chót khởi động, marker dở dang không được đọc lại, marker không bền trên USB FAT, chưa có hardware watchdog, mọi lần kill đều tính PLATFORM) được phân tích trong [FAULT_CATCH_ROADMAP.md](FAULT_CATCH_ROADMAP.md).
