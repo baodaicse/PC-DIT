@@ -63,6 +63,17 @@ impl FileBackend {
     }
 }
 
+/// Whether the filesystem holding `directory` fills with zeros everything between a file's
+/// written data and a write beyond it (`ntfs3` and exFAT keep a "valid data length"; FAT extends
+/// with zeros): a far first write then waits for gigabytes of zeros. The field's eight
+/// "PLATFORM" SSD stalls were this, on NTFS (`docs/FAULT_CATCH_ROADMAP.md`, FC6).
+#[must_use]
+pub fn zero_fills_ahead(directory: &Path) -> bool {
+    /// `ntfs3` ("ntfs"), the old `ntfs` driver, exFAT, FAT (`msdos` / `vfat`).
+    const MAGICS: [i64; 4] = [0x7366_746e, 0x5346_544e, 0x2011_bab0, 0x4d44];
+    nix::sys::statfs::statfs(directory).is_ok_and(|fs| MAGICS.contains(&fs.filesystem_type().0))
+}
+
 /// A data-preserving regular-file backend using direct I/O.
 ///
 /// It can only create a new file and therefore cannot overwrite an existing path. The caller is
@@ -90,7 +101,16 @@ impl DirectFileBackend {
         capacity_bytes: u64,
         max_host_write_bytes: u64,
     ) -> Result<Self, BackendError> {
-        let path = path.as_ref().to_path_buf();
+        Self::create(path.as_ref(), capacity_bytes, max_host_write_bytes, true)
+    }
+
+    fn create(
+        path: &Path,
+        capacity_bytes: u64,
+        max_host_write_bytes: u64,
+        extend: bool,
+    ) -> Result<Self, BackendError> {
+        let path = path.to_path_buf();
         if path.symlink_metadata().is_ok() {
             return Err(BackendError::Exists(path));
         }
@@ -114,7 +134,9 @@ impl DirectFileBackend {
         if !file.metadata()?.is_file() {
             return Err(BackendError::UnsafeTarget(path));
         }
-        file.set_len(capacity_bytes)?;
+        if extend {
+            file.set_len(capacity_bytes)?;
+        }
         // The new file's record reaches the disk before the load starts: a crash mid-test then
         // leaves a complete file entry behind, not a half-created one.
         file.sync_all()?;
@@ -126,6 +148,22 @@ impl DirectFileBackend {
             max_host_write_bytes,
             host_bytes_written: 0,
         })
+    }
+
+    /// [`Self::create_new`] for a filesystem that fills with zeros everything before a write
+    /// beyond the data already written ([`zero_fills_ahead`]): the file is not extended up front
+    /// and grows as the test writes it, which it must do in order from its start
+    /// (`docs/FAULT_CATCH_ROADMAP.md`, FC6).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_new`].
+    pub fn create_new_in_order(
+        path: impl AsRef<Path>,
+        capacity_bytes: u64,
+        max_host_write_bytes: u64,
+    ) -> Result<Self, BackendError> {
+        Self::create(path.as_ref(), capacity_bytes, max_host_write_bytes, false)
     }
 
     /// Opens a direct-I/O test file this suite wrote earlier (e.g. `dit-chain prefill`) for
@@ -380,6 +418,32 @@ mod tests {
         ));
         drop(backend);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_file_written_in_order_grows_as_it_is_written() {
+        let path = std::env::temp_dir().join(format!(
+            "dit-nvme-direct-in-order-test-{}.dit-test",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut backend =
+            DirectFileBackend::create_new_in_order(&path, 1024 * 1024, 1024 * 1024).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "not extended up front"
+        );
+        assert_eq!(backend.capacity_bytes(), 1024 * 1024);
+        backend.write_all_at(0, &[5; 8192]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+        let mut data = [0_u8; 4096];
+        backend.read_exact_at(4096, &mut data).unwrap();
+        assert_eq!(data, [5; 4096]);
+        drop(backend);
+        std::fs::remove_file(path).unwrap();
+        // A directory on ext4 or tmpfs does not zero-fill ahead of a write.
+        assert!(!zero_fills_ahead(&std::env::temp_dir()));
     }
 
     #[test]

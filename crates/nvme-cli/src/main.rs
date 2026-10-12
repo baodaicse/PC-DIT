@@ -685,8 +685,20 @@ fn run_preserving_command(
 
     let run_id = new_run_id();
     let test_file = directory.join(format!(".cpu-nvme-dit-{}.test", run_id.0));
-    let mut backend =
-        DirectFileBackend::create_new(&test_file, capacity_bytes, write_budget_bytes)?;
+    let in_order = nvme_backend_file::zero_fills_ahead(&directory);
+    let (capacity_bytes, target_operations) = if in_order {
+        in_order_plan(capacity_bytes, write_budget_bytes, &provisional)
+    } else {
+        (capacity_bytes, target_operations)
+    };
+    if capacity_bytes < 1024 * 1024 {
+        return Err("the write budget leaves less than 1 MiB to write in order".into());
+    }
+    let mut backend = if in_order {
+        DirectFileBackend::create_new_in_order(&test_file, capacity_bytes, write_budget_bytes)?
+    } else {
+        DirectFileBackend::create_new(&test_file, capacity_bytes, write_budget_bytes)?
+    };
     let opened_device = match backend.path().metadata() {
         Ok(metadata) => metadata.dev(),
         Err(error) => {
@@ -709,6 +721,7 @@ fn run_preserving_command(
     config.wall_clock_limit = Some(Duration::from_secs(duration_seconds));
     config.sustain_until_deadline = true;
     config.compute_workers = automatic_compute_workers(1);
+    config.sequential_first = in_order;
     let engine_result = run_with_events(&mut backend, &config, args.events.as_deref());
     drop(backend);
     let cleanup_result = std::fs::remove_file(&test_file);
@@ -1860,8 +1873,25 @@ fn run_preserving_multi_command(
                 ".cpu-nvme-dit-{}-{}.test",
                 run_id.0, selected.display_index
             ));
-            let backend =
-                DirectFileBackend::create_new(&test_file, capacity_bytes, write_budget_bytes)?;
+            // FC6: NTFS, exFAT and FAT zero-fill ahead of a far write: written in order first.
+            let in_order = nvme_backend_file::zero_fills_ahead(&directory);
+            let (capacity_bytes, target_operations) = if in_order {
+                in_order_plan(capacity_bytes, write_budget_bytes, &provisional)
+            } else {
+                (capacity_bytes, target_operations)
+            };
+            if capacity_bytes < 1024 * 1024 {
+                return Err("the write budget leaves less than 1 MiB to write in order".into());
+            }
+            let backend = if in_order {
+                DirectFileBackend::create_new_in_order(
+                    &test_file,
+                    capacity_bytes,
+                    write_budget_bytes,
+                )?
+            } else {
+                DirectFileBackend::create_new(&test_file, capacity_bytes, write_budget_bytes)?
+            };
             test_files.push(test_file);
             if backend.path().metadata()?.dev() != directory_device {
                 drop(backend);
@@ -1878,6 +1908,7 @@ fn run_preserving_multi_command(
                 device_seed,
             );
             let mut config = RunConfig::new(run_id.clone(), namespace.stable_id.clone(), coverage);
+            config.sequential_first = in_order;
             config.confirm_on_fail = args.confirm_on_fail;
             config.wall_clock_limit = Some(Duration::from_secs(duration_seconds));
             config.sustain_until_deadline = true;
@@ -1889,11 +1920,16 @@ fn run_preserving_multi_command(
                 model: namespace.model.clone(),
                 capacity: human_bytes(namespace.capacity_bytes),
                 detail: format!(
-                    "{} / {} / test {} MiB / write max {} MiB",
+                    "{} / {} / test {} MiB / write max {} MiB{}",
                     filesystem_device_node.display(),
                     namespace.driver,
-                    args.capacity_mib,
-                    args.write_budget_mib
+                    capacity_bytes / (1024 * 1024),
+                    args.write_budget_mib,
+                    if in_order {
+                        " / written in order first (NTFS/exFAT/FAT)"
+                    } else {
+                        ""
+                    }
                 ),
             });
             target_evidence.push(PreservingTargetEvidence {
@@ -2234,6 +2270,35 @@ fn attribution_name(preflight: Option<&CpuRamPreflightEvidence>) -> &'static str
     } else {
         "CPU_SSD_PATH_UNATTRIBUTED"
     }
+}
+
+/// FC6: on a filesystem that zero-fills ahead of a far write, the file is written in order from
+/// its start first. Its capacity is then at most the write budget, in whole largest batches; the
+/// operations are those ordered batches, then the plan's that still fit the budget.
+fn in_order_plan(capacity: u64, budget: u64, plan: &CoveragePlan) -> (u64, u64) {
+    let sizes: Vec<u64> = plan
+        .transfer_sizes
+        .iter()
+        .filter_map(|size| u64::try_from(*size).ok())
+        .collect();
+    let largest = sizes.iter().copied().max().unwrap_or(4096).max(4096);
+    let capacity = capacity.min(budget) / largest * largest;
+    let ordered = capacity / largest;
+    let mut remaining = budget - capacity;
+    let mut operations = ordered;
+    let count = u64::try_from(sizes.len()).unwrap_or(1).max(1);
+    while operations < plan.target_operations.max(ordered) {
+        let size = sizes
+            .get(usize::try_from(operations % count).unwrap_or(0))
+            .copied()
+            .unwrap_or(u64::MAX);
+        if size > remaining {
+            break;
+        }
+        remaining -= size;
+        operations += 1;
+    }
+    (capacity, operations)
 }
 
 fn operations_fitting_budget(plan: &CoveragePlan, budget: u64) -> u64 {

@@ -355,6 +355,28 @@ fn read_and_verify<B: StorageBackend>(
     Ok(true)
 }
 
+/// The operation at `index`: the plan's, except that a file that must be written in order (FC6)
+/// is first covered from its start, one largest batch after the other.
+pub(super) fn operation_at(config: &RunConfig, index: u64, capacity: u64) -> OperationSpec {
+    let mut operation = config.plan.operation(index, capacity);
+    if config.sequential_first {
+        let largest = config
+            .plan
+            .transfer_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(BLOCK_SIZE);
+        let blocks = (largest / BLOCK_SIZE) as u64;
+        let ordered = capacity / largest as u64;
+        if index < ordered {
+            operation.lba = index * blocks;
+            operation.transfer_size = largest;
+        }
+    }
+    operation
+}
+
 fn overlaps(a: &OperationSpec, b: &OperationSpec) -> bool {
     let a_start = a.lba * BLOCK_SIZE as u64;
     let b_start = b.lba * BLOCK_SIZE as u64;
@@ -440,7 +462,7 @@ pub(super) fn run<B: StorageBackend>(
     });
     counters.progress(config, started, "PREPARE", &mut emit);
 
-    let first = config.plan.operation(0, backend.capacity_bytes());
+    let first = operation_at(config, 0, backend.capacity_bytes());
     let first_ticket = prepare(&mut pool, &first, config)?;
     let mut pending = Some((first, first_ticket));
     let mut stored = Vec::<OperationSpec>::new();
@@ -491,9 +513,7 @@ pub(super) fn run<B: StorageBackend>(
         // Only CPU preparation is pipelined; disk regions remain owned by one I/O
         // coordinator until the current readback is verified. No overlapping writes.
         if operation.index + 1 < config.plan.target_operations && !expired(config, started) {
-            let next = config
-                .plan
-                .operation(operation.index + 1, backend.capacity_bytes());
+            let next = operation_at(config, operation.index + 1, backend.capacity_bytes());
             let next_ticket = prepare(&mut pool, &next, config)?;
             pending = Some((next, next_ticket));
         }

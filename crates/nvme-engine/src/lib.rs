@@ -151,6 +151,10 @@ pub struct RunConfig {
     /// A block that fails its check is checked again and re-read at once, and the record says
     /// which of the verifying CPU, the read path or the stored data was wrong (fault ledger F4).
     pub confirm_on_fail: bool,
+    /// The file must be written in order from its start before anywhere else (FC6): its
+    /// filesystem zero-fills ahead of a far write. The first operations then cover it one
+    /// largest batch after the other; the plan's places follow.
+    pub sequential_first: bool,
 }
 
 impl RunConfig {
@@ -167,6 +171,7 @@ impl RunConfig {
             compute_workers: 1,
             matrix_rounds: 4,
             confirm_on_fail: false,
+            sequential_first: false,
         }
     }
 }
@@ -364,6 +369,65 @@ mod tests {
         assert_eq!(sixty.seed_slots, 20);
         assert_eq!(sixty.transfer_sizes.len(), 20);
         assert!(sixty.transfer_sizes.contains(&(1024 * 1024)));
+    }
+
+    /// A backend that counts writes landing beyond everything written so far: on NTFS, exFAT
+    /// or FAT each of those makes the filesystem write zeros up to it first (FC6).
+    struct ZeroFillWatch {
+        inner: MemoryBackend,
+        valid_end: u64,
+        gaps: u64,
+    }
+
+    impl StorageBackend for ZeroFillWatch {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn capacity_bytes(&self) -> u64 {
+            self.inner.capacity_bytes()
+        }
+        fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+            if offset > self.valid_end {
+                self.gaps += 1;
+            }
+            self.valid_end = self.valid_end.max(offset + data.len() as u64);
+            self.inner.write_all_at(offset, data)
+        }
+        fn read_exact_at(&mut self, offset: u64, data: &mut [u8]) -> Result<(), BackendError> {
+            self.inner.read_exact_at(offset, data)
+        }
+        fn flush(&mut self) -> Result<(), BackendError> {
+            self.inner.flush()
+        }
+        fn host_bytes_written(&self) -> u64 {
+            self.inner.host_bytes_written()
+        }
+    }
+
+    #[test]
+    fn a_file_written_in_order_first_never_leaves_a_gap_to_zero_fill() {
+        let capacity = 8 * 1024 * 1024;
+        let watch = || ZeroFillWatch {
+            inner: MemoryBackend::new("memory:test", capacity),
+            valid_end: 0,
+            gaps: 0,
+        };
+        let mut random = watch();
+        let report = run(&mut random, &config(40), |_| {}).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert!(random.gaps > 0, "the plan's places jump ahead");
+        let mut ordered = watch();
+        let mut in_order = config(40);
+        in_order.sequential_first = true;
+        let report = run(&mut ordered, &in_order, |_| {}).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert_eq!(
+            ordered.gaps, 0,
+            "every write starts where the written data ends, or before"
+        );
+        // 8 MiB in 1 MiB batches, then the plan's places, all inside what was written.
+        assert_eq!(ordered.valid_end, capacity as u64);
+        assert_eq!(report.completed_operations, 40);
     }
 
     #[test]
