@@ -14,7 +14,8 @@ Bối cảnh: màn kết quả chỉ ghi `PLATFORM 1` mà không cho biết lỗ
 
 Mục tiêu:
 
-1. **Không mất phiên nào.** Phiên bị dừng giữa chừng, vì lý do gì, vẫn có thông báo ở lần boot sau và một dòng CSV.
+1. **Không mất phiên nào.** Phiên bị dừng giữa chừng vẫn có result và một dòng CSV: ngay trong phiên (hộp đen), hoặc
+   ở lần boot sau nếu cả máy chết.
 2. **Tách lỗi hạ tầng test khỏi lỗi phần cứng.** DIT treo, filesystem chặn, kế hoạch bộ nhớ quá chặt chỉ làm phiên
    INVALID. Chỉ đếm PLATFORM khi có bằng chứng phần cứng (mất nguồn, ngắt nhiệt, panic, MCE, GPU rớt bus...).
 3. **Người vận hành luôn có lối thoát có ghi nhận** khi app treo, thay vì chỉ có nút nguồn.
@@ -205,6 +206,8 @@ Console cứu hộ:
   - **[L]** lưu gói chẩn đoán lên USB: log kernel, PSI, danh sách tiến trình, trạng thái watchdog.
   - **[R]** sync, umount phân vùng kết quả, khởi động lại sạch.
 - Alt+F1 để quay lại app.
+- Đây là chỗ duy nhất có hành động can thiệp ngoài app, và chỉ khi người vận hành bấm phím. Hộp đen (FC3) không can
+  thiệp. [S] dùng cơ chế claim của FC3 nên không sinh hai result cho một phiên.
 
 SysRq (phương án cuối):
 
@@ -227,28 +230,130 @@ RAM, [K] → RAM được giải phóng, UI chạy lại.
 - Kiểm (QEMU RAM nhỏ): tiến trình chiếm RAM trong cgroup test → chốt chặn kích hoạt, UI vẫn đáp ứng, phiên được ghi
   `memory_guard`.
 
-### FC3 — Hộp đen và hậu kiểm ở lần boot sau
+### FC3 — Hộp đen: trọng tài độc lập, tự ra result ngay trong phiên
 
-Hộp đen:
+Mục tiêu: app bị kill, treo, SSD không trả lời, lớp bị OOM kill... đều có result **ngay trong phiên đó**, không phải
+chờ lần boot sau. Chỉ khi cả máy chết (mất nguồn, kernel treo cứng, panic) mới cần lần boot sau (FC3b).
 
-- Mỗi phiên một nhật ký **chỉ ghi nối thêm** trên `DIT-RESULTS` (ví dụ `blackbox/<run-id>.jsonl`), `fsync` sau mỗi
-  dòng. Ghi khoảng mỗi 10 s và mỗi khi đổi pha hoặc trạng thái lớp: thời điểm, pha, tiến độ từng lớp, RAM trống, PSI,
-  nhiệt và công suất CPU/GPU, bộ đếm throttle. Khoảng 100 KB cho 1 giờ.
+Quyết định (2026-10-12):
+
+- Hộp đen **chỉ quan sát và ghi, không can thiệp app**: không kill, không dừng lớp, không giải phóng RAM. Hành động
+  can thiệp chỉ đến từ app (chốt chặn bộ nhớ FC2) hoặc từ người vận hành (console cứu hộ FC1).
+- Thời gian chờ: app chết 10 s; app treo 60 s rồi thêm 30 s; lớp treo 180 s; app có 60 s để tự ghi nhận một sự cố.
+- Khi hộp đen ghi result, nó **tự chuyển sang màn kết quả**.
+
+#### FC3a — Hộp đen trong phiên
+
+Tiến trình:
+
+- Service riêng `dit-blackbox.service`, khởi động lúc boot trước app, cgroup riêng ngoài `cpu-dit.service`. App bị
+  kill, OOM hay treo không kéo theo hộp đen; nếu chính hộp đen chết, systemd khởi động lại nó.
+- Chạy được khi máy nghẹt RAM: `mlockall`, cấp phát sẵn, `MemoryMin`, `OOMScoreAdjust=-1000`, không gọi chương trình
+  ngoài (chỉ đọc `/proc`, `/sys`, `/dev/kmsg`), file trên USB mở sẵn. Vì hộp đen không giải cứu, nó phải tự sống qua
+  tình trạng nghẹt RAM cho tới hết thời gian chờ.
+
+App báo trạng thái (chỉ ghi vào tmpfs, không chờ phản hồi, không tự ghi lên USB):
+
+- Lúc bắt đầu phiên: run id, pid, loại test, danh sách lớp và cgroup từng lớp, ví dụ
+  `/run/dit-suite/<run-id>/session.json`.
+- Mỗi giây: heartbeat của luồng chính, pha, tiến độ và trạng thái từng lớp (kể cả lớp đã kết thúc và vì sao), số FAIL
+  theo ô tính đến lúc đó.
+- Lúc kết thúc: trạng thái đóng phiên.
+
+Nhật ký trên USB:
+
+- Hộp đen là **bên duy nhất ghi nhật ký** lên `DIT-RESULTS`: mỗi phiên một file **chỉ ghi nối thêm**
+  `blackbox/<run-id>.jsonl`, `fsync` sau mỗi dòng.
+- Một dòng khoảng mỗi 10 s và mỗi khi đổi pha, đổi trạng thái lớp hoặc có sự kiện: thời điểm, pha, tiến độ từng lớp,
+  số FAIL theo ô, RAM trống, PSI, nhiệt và công suất CPU/GPU, bộ đếm throttle, sự kiện kernel. Khoảng 100 KB cho
+  1 giờ.
 - Không bao giờ ghi đè, nên bền khi mất điện; bên đọc bỏ qua dòng cuối bị cắt dở. Thay cho việc ghi lại marker mỗi
   giây (W4); marker chỉ còn ghi lúc bắt đầu và kết thúc.
 
-Hậu kiểm ở lần boot sau (trong boot runner, sau khi mount phân vùng kết quả, trước menu):
+Tín hiệu hộp đen tự đọc, không qua app:
 
-- Tìm các phiên có nhật ký chưa đóng. Với mỗi phiên: viết report INCOMPLETE (pha cuối, tiến độ, số liệu cuối cùng) và
-  thêm một dòng CSV.
+| Tín hiệu | Bắt được |
+|---|---|
+| pidfd của app | app thoát hoặc bị kill, biết ngay |
+| heartbeat luồng chính của app | app treo |
+| tiến độ lớp, `/proc/<pid>/io`, thời gian CPU, trạng thái D | treo thật hay I/O chậm |
+| `memory.events`, `cgroup.events` của từng lớp | OOM kill, lớp chết |
+| PSI trigger trên `/proc/pressure/memory` | nghẹt RAM (kernel đánh thức, không cần poll) |
+| `/dev/kmsg` (chỉ dòng của kernel) | NVMe timeout/reset, lỗi I/O, Xid, MCE, segfault, `blocked for more than 120 seconds`, soft lockup |
+| `/sys/class/nvme/*/state` | controller SSD `live`, `resetting`, `dead` |
+
+Khi nào hộp đen tự ghi result:
+
+- **Chỉ khi app không còn làm được việc của nó**: app chết, app treo, hoặc app còn sống nhưng không ghi nhận một sự
+  cố trong 60 s (ví dụ lớp SSD kẹt ở trạng thái D, watchdog không kết thúc được).
+- Khi app còn sống và tự ghi nhận sự cố (lớp kết thúc, có trong trạng thái app), hộp đen chỉ ghi bằng chứng và phân
+  loại vào nhật ký; result vẫn do app viết lúc phiên kết thúc và dùng phân loại đó.
+
+| Tình huống | Phát hiện | Kết luận (ghi vào nhật ký) | Hộp đen tự ghi result khi |
+|---|---|---|---|
+| App bị kill hoặc crash | pidfd | INVALID `app_killed`; bị OOM kill: INVALID `oom` | sau 10 s vẫn chưa có result |
+| App treo, còn sống | heartbeat app đứng 60 s | PSI cho thấy nghẹt RAM: INVALID `memory_livelock`; không: INVALID `app_hang` | app vẫn đứng thêm 30 s (tổng 90 s) |
+| SSD không trả lời | lớp không tiến độ 180 s, I/O không tăng, tiến trình ở trạng thái D | log kernel có timeout, reset, lỗi I/O hoặc controller `dead`: FAIL theo luật `ssd/io` (`? SSD\|SSD-path`); không có log: INVALID `layer_stall`; I/O vẫn chạy chậm: chỉ cảnh báo `slow_io` | app không ghi nhận lớp kết thúc trong 60 s sau đó |
+| Lớp bị OOM kill | `memory.events` của lớp | INVALID `oom`, kèm lớp và số liệu RAM | app không ghi nhận trong 60 s |
+| Lớp crash (segfault, bus error) | watchdog, log kernel | PLATFORM `worker_crash` | app không ghi nhận trong 60 s |
+| GPU rớt bus | Xid 79 | `? PCIe-GPU\|PLATFORM` | app không ghi nhận trong 60 s |
+| Cả máy chết | không phát hiện được | | FC3b, ở lần boot sau |
+
+Một phiên chỉ có một result:
+
+- App luôn được ghi trước; thời gian chờ của hộp đen luôn dài hơn của app và watchdog.
+- Bên nào ghi result trước thì tạo file claim độc quyền (`O_EXCL`) trong thư mục phiên trên USB; bên đến sau không ghi
+  đè và không thêm dòng CSV thứ hai. App tỉnh lại thấy claim thì chỉ báo "result đã được hộp đen ghi". Console cứu hộ
+  (FC1) dùng cùng cơ chế này.
+
+Result của hộp đen:
+
+- Cùng định dạng với app: report JSON (`written_by: blackbox`), dòng CSV cùng header, màn kết quả vẽ bằng cùng
+  renderer của `dit-ui-core`.
+- FAIL đã thấy trước sự cố vẫn được tính (lấy từ số FAIL theo ô trong trạng thái app cuối cùng).
+- Thêm dòng nguyên nhân (CAUSE) và tình trạng cuối (LAST STATE).
+- Vì không can thiệp, các lớp còn chạy lúc hộp đen ghi result vẫn chạy tiếp; result ghi tên các lớp đó. Report của
+  chúng nếu xong sau vẫn nằm trong thư mục phiên nhưng không đổi result đã ghi. Muốn dừng thì người vận hành dùng
+  console cứu hộ (FC1) hoặc khởi động lại.
+
+Hiển thị:
+
+- Khi ghi result, hộp đen tự chuyển sang VT riêng (ví dụ tty3) và vẽ màn kết quả; Alt+F1 quay lại app. Chuyển VT do
+  kernel xử lý nên vẫn làm được khi app treo.
+- Nếu màn hình không vẽ được (driver GPU kẹt giữ console), result vẫn nằm trên USB.
+
+```
+RESULT        FAIL  (written by the black box: the app stopped answering)
+CAUSE         SSD1 not responding 180 s; kernel: nvme0 I/O timeout, controller reset
+LAST STATE    COMBINED OVERLAP max, 14:32 in; RAM free 3.1 GiB; CPU 82 C; GPU1 71 C
+STILL RUNNING CPU-RAM, GPU1
+FAIL BY PART  CPU 0 | RAM 0 | PCIe-GPU1 0 | GPU1 0 | VRAM1 0 | ? SSD1|SSD-path1 1 | PLATFORM 0
+```
+
+Kiểm (QEMU):
+
+- `kill -9` app → result `app_killed` trong khoảng 10 s, màn kết quả hiện ra.
+- `SIGSTOP` app → result `app_hang` sau 90 s.
+- Tiến trình chiếm RAM tới nghẹt → result `memory_livelock` sau 90 s; hộp đen vẫn đáp ứng.
+- `dmsetup suspend` thiết bị test (I/O treo thật, tiến trình ở trạng thái D) → `layer_stall`; `dm-flakey` (lỗi I/O
+  thật trong log kernel) → FAIL `ssd/io`.
+- App ghi result kịp trước thời gian chờ → hộp đen không ghi; app tỉnh lại sau khi hộp đen đã ghi → không có dòng CSV
+  thứ hai.
+- Unit test cho dòng cuối bị cắt dở.
+
+#### FC3b — Hậu kiểm ở lần boot sau (chỉ khi cả máy chết)
+
+Trong boot runner, sau khi mount phân vùng kết quả, trước menu:
+
+- Tìm các phiên có nhật ký chưa đóng và chưa có result (hộp đen chết cùng máy). Với mỗi phiên: viết report INCOMPLETE
+  (pha cuối, tiến độ, số liệu cuối cùng) và thêm một dòng CSV. Phiên đã có result của hộp đen thì bỏ qua.
 - Thu bằng chứng từ chính lần boot này:
   - AMD: dòng "Previous system reset reason" trong log kernel.
   - pstore: mount `/sys/fs/pstore`, nạp `efi_pstore`, chép bản ghi panic/MCE vào report rồi xóa khỏi NVRAM.
 - Hiện thông báo trước menu, thay dòng `WATCHDOG RECOVERY` hiện nay, ví dụ:
   `Phiên trước dừng giữa chừng: COMBINED OVERLAP max, 20 s sau khi mọi lớp cùng chạy; RAM trống cuối 0,9 GiB; reset bằng nút nguồn`.
 - Phân loại theo bảng ở FC5. Lần boot sau trên Intel không có lý do reset: INCOMPLETE, không tính FAIL.
-- Kiểm (QEMU): reset máy ảo giữa overlap (`system_reset` qua monitor) → lần boot sau có thông báo, report và dòng CSV;
-  unit test cho dòng cuối bị cắt dở.
+- Kiểm (QEMU): reset máy ảo giữa overlap (`system_reset` qua monitor) → lần boot sau có thông báo, report và dòng CSV.
 
 ### FC4 — Watchdog: dấu hiệu sống thật, hạn chót khởi động, bằng chứng khi kill
 
@@ -259,7 +364,7 @@ Hậu kiểm ở lần boot sau (trong boot runner, sau khi mount phân vùng k�
 - Hạn chót cho heartbeat đầu tiên khoảng 5 phút (W2), quá hạn ghi `STARTUP_STALLED`. Không áp dụng cho lúc người vận
   hành đang chọn test ở picker.
 - `watchdog-final.json` ghi bằng chứng của cửa sổ cuối: biến thiên I/O, CPU, trạng thái D, lỗi I/O trong log kernel.
-- Tiến trình điều phối COMBINED ghi heartbeat của mình vào hộp đen; console cứu hộ hiện nó.
+- Tiến trình điều phối COMBINED ghi heartbeat luồng chính vào trạng thái phiên (FC3a); hộp đen canh nó.
 - Kiểm: SIGSTOP một worker (không I/O, không CPU) → treo thật; worker trên NTFS loop hoặc thiết bị bị làm chậm → không
   kill, có cảnh báo.
 
@@ -324,9 +429,12 @@ Hiển thị:
 | Lỗi giả lập | Cách tạo | Bước kiểm |
 |---|---|---|
 | driver NVIDIA kẹt | `nvidia-smi` giả ngủ mãi trong `PATH` | FC0 |
-| app treo | SIGSTOP tiến trình điều phối hoặc UI | FC1, FC4 |
-| cạn RAM | tiến trình cấp phát dư trong QEMU RAM nhỏ | FC1 [K], FC2 |
-| mất nguồn hoặc reset giữa test | `system_reset` qua QEMU monitor | FC3, FC5 |
+| app bị kill | `kill -9` tiến trình điều phối | FC3a |
+| app treo | SIGSTOP tiến trình điều phối hoặc UI | FC1, FC3a, FC4 |
+| cạn RAM | tiến trình cấp phát dư trong QEMU RAM nhỏ | FC1 [K], FC2, FC3a |
+| SSD không trả lời | `dmsetup suspend` thiết bị test | FC3a, FC4 |
+| lỗi I/O thật trong log kernel | `dm-flakey` | FC3a, FC5 |
+| mất nguồn hoặc reset giữa test | `system_reset` qua QEMU monitor | FC3b, FC5 |
 | marker hoặc nhật ký cắt dở | cắt ngắn file ở giữa dòng | FC3 (unit test) |
 | I/O chậm | NTFS loop hoặc thiết bị bị làm chậm | FC4, FC6 |
 | treo thật không I/O | SIGSTOP worker | FC4, FC5 |
@@ -358,7 +466,8 @@ Dữ liệu thực tế không nằm trong git (khoảng 670 MB); bản 4 và 5 
 | FC0 `nvidia-smi` timeout | đề xuất |
 | FC1 console cứu hộ + SysRq | đề xuất |
 | FC2 chốt chặn bộ nhớ | đề xuất |
-| FC3 hộp đen + hậu kiểm | đề xuất |
+| FC3a hộp đen tự ra result trong phiên | đề xuất; đã chốt quan sát và ghi, thời gian chờ, tự chuyển màn kết quả (2026-10-12) |
+| FC3b hậu kiểm ở lần boot sau | đề xuất |
 | FC4 watchdog | đề xuất |
 | FC5 phân loại PLATFORM | đề xuất |
 | FC6 NTFS | đề xuất |

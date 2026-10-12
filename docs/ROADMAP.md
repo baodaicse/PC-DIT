@@ -32,7 +32,7 @@ Trạng thái: `proposed` (2026-10-12), chưa code. Chi tiết: [FAULT_CATCH_ROA
 - Kết quả thực tế: 8 ô PLATFORM đang hiện là lớp SSD treo trên NTFS (lỗi DIT); khoảng 13 phiên chết giữa chừng (phần lớn app treo, người vận hành reset) không được ghi lại.
 - Lối thoát cho người vận hành: `nvidia-smi` có timeout, console cứu hộ ở VT2, SysRq.
 - Chặn nguyên nhân: chốt chặn bộ nhớ (PSI, cgroup cho các lớp test).
-- Không mất phiên: hộp đen ghi nối thêm và hậu kiểm ở lần boot sau (lý do reset AMD, pstore).
+- Không mất phiên: hộp đen là service độc lập, chỉ quan sát và ghi; khi app chết, treo hoặc không ghi nhận sự cố, nó tự ra result ngay trong phiên và chuyển sang màn kết quả. Chỉ khi cả máy chết mới hậu kiểm ở lần boot sau (lý do reset AMD, pstore).
 - Ghi đúng nguyên nhân: watchdog xét I/O và CPU trước khi kết luận treo; PLATFORM tách theo nguyên nhân; lỗi hạ tầng test chỉ làm phiên INVALID.
 
 ## U3 — Phát triển module và phối hợp
