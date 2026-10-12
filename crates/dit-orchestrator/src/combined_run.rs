@@ -21,6 +21,9 @@ use dit_orchestrator::fault_ledger::{Component, CsvMeta, FaultEvent, Ledger, Led
 use dit_orchestrator::fault_signatures::{self, PhaseExposure};
 use dit_orchestrator::fault_sources;
 use dit_orchestrator::hw_events::{self, HwMonitor};
+use dit_orchestrator::session::{
+    self, Claim, LayerStatus, SessionInfo, SessionStatus, SessionWriter,
+};
 use dit_ui_core::{InPlaceRenderer, TerminalSize};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -354,6 +357,9 @@ struct Session<'a> {
     phase_started: Instant,
     ledger: Ledger,
     monitor: HwMonitor,
+    /// The live session for the black box and the rescue console (FC1, `FC3a`).
+    writer: Option<SessionWriter>,
+    last_beat: Option<Instant>,
 }
 
 /// Mark of a result from the Fault Attribution boot entry (`fail-summary.csv` test column).
@@ -630,7 +636,22 @@ fn run_session(
         phase_started: Instant::now(),
         ledger: Ledger::default(),
         monitor,
+        writer: None,
+        last_beat: None,
     };
+    session.writer = SessionWriter::open(
+        Path::new(session::ROOT),
+        &SessionInfo {
+            schema_version: session::SCHEMA_VERSION,
+            run_id: session.run_id.clone(),
+            csv: session.csv_meta(),
+            app_pid: std::process::id(),
+            started_unix_ms: session::unix_ms(),
+            results_root: menu.results_root.clone(),
+            pending_cells: Vec::new(),
+        },
+    )
+    .ok();
     for index in 0..session.phases.len() {
         if session.abort.is_some() || INTERRUPTED.load(Ordering::SeqCst) {
             break;
@@ -643,7 +664,22 @@ fn run_session(
     let ranked = session.rank_signatures();
     let (verdict, report_path) = session.write_report()?;
     let stored = session.persist();
-    let csv = session.append_fail_summary(verdict, &report_path);
+    // One result per session: the black box or the rescue console may have written it already.
+    let csv = match session::claim(
+        &menu.results_root,
+        Path::new(session::ROOT),
+        &session.run_id,
+        "app",
+    ) {
+        Claim::Won => session.append_fail_summary(verdict, &report_path),
+        Claim::Taken(by) => {
+            format!("Fail summary not written: the {by} already wrote this session's result")
+        }
+    };
+    let mut closing = session.status(&[]);
+    if let Some(writer) = session.writer.as_mut() {
+        writer.close(&mut closing, verdict);
+    }
     let failures: u64 = session.totals.values().map(|t| t.failures).sum();
     let summary = format!(
         "COMBINED {} {} completed with {verdict}; failures counted {failures}; depth reached {}.\n{}\n{}\n{}\n{}\n{ranked}Report: {}\n{stored}\n{csv}\n{cleanup}{release}",
@@ -1143,6 +1179,7 @@ impl Session<'_> {
                 index += 1;
             }
         }
+        self.beat(running);
         if self
             .last_sample
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
@@ -1408,17 +1445,12 @@ impl Session<'_> {
         (1, ssd)
     }
 
-    /// One row of `fail-summary.csv` on the results volume (in the session directory without it).
-    fn append_fail_summary(&self, verdict: &str, report: &Path) -> String {
-        let root = &self.menu.results_root;
-        let path = if root.is_dir() {
-            root.join("fail-summary.csv")
-        } else {
-            self.dir.join("fail-summary.csv")
-        };
+    /// The CSV row's description of this session; time, verdict and report are set when the row
+    /// is written.
+    fn csv_meta(&self) -> CsvMeta {
         let system = &self.telemetry.system;
-        let meta = CsvMeta {
-            time: super::local_timestamp(),
+        CsvMeta {
+            time: String::new(),
             image_id: super::image_id(),
             test: format!(
                 "COMBINED {} {}{}",
@@ -1443,6 +1475,21 @@ impl Session<'_> {
                     .collect::<Vec<_>>()
                     .join("; ")
             }),
+            verdict: String::new(),
+            report: String::new(),
+        }
+    }
+
+    /// One row of `fail-summary.csv` on the results volume (in the session directory without it).
+    fn append_fail_summary(&self, verdict: &str, report: &Path) -> String {
+        let root = &self.menu.results_root;
+        let path = if root.is_dir() {
+            root.join("fail-summary.csv")
+        } else {
+            self.dir.join("fail-summary.csv")
+        };
+        let meta = CsvMeta {
+            time: super::local_timestamp(),
             verdict: verdict.to_owned(),
             report: format!(
                 "runs/{}/combined/{}",
@@ -1451,11 +1498,84 @@ impl Session<'_> {
                     .file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
             ),
+            ..self.csv_meta()
         };
         match dit_orchestrator::fault_ledger::append_csv(&path, &self.ledger, &meta) {
             Ok(()) => format!("Fail summary row added to {}", path.display()),
             Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
         }
+    }
+
+    /// The session as the black box and the rescue console read it.
+    fn status(&self, running: &[Running]) -> SessionStatus {
+        let stopping = INTERRUPTED.load(Ordering::SeqCst) || self.abort.is_some();
+        SessionStatus {
+            heartbeat_unix_ms: 0,
+            state: if stopping { "STOPPING" } else { "RUNNING" }.to_owned(),
+            phase: self.phase_title(),
+            elapsed_seconds: self.started.elapsed().as_secs(),
+            layers: running
+                .iter()
+                .map(|layer| LayerStatus {
+                    name: layers::slug(layer.layer).to_owned(),
+                    watchdog_pid: Some(layer.child.id()),
+                    run_dir: layer.dir.clone(),
+                    progress_paths: Vec::new(),
+                    cgroup: None,
+                    state: if layer.drained { "STOPPING" } else { "RUNNING" }.to_owned(),
+                    ended: false,
+                })
+                .collect(),
+            failures: self.totals.values().map(|t| t.failures).sum::<u64>()
+                + running.iter().map(Running::failures).sum::<u64>(),
+            counts: self.ledger.csv_counts(),
+            dashboard_file: Some(self.dir.join("dashboard-live.json")),
+            verdict: None,
+        }
+    }
+
+    /// Once a second: the session status, the screen file, and a stop asked from the rescue
+    /// console (it ends the session like Ctrl+C).
+    fn beat(&mut self, running: &[Running]) {
+        if self.writer.is_none()
+            || self
+                .last_beat
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_beat = Some(Instant::now());
+        dit_ui_core::save_last_frame(&self.dir.join("dashboard-live.json"));
+        let mut status = self.status(running);
+        if let Some(writer) = self.writer.as_mut() {
+            writer.beat_now(&mut status);
+            if writer.rescue_stop() && !INTERRUPTED.load(Ordering::SeqCst) {
+                INTERRUPTED.store(true, Ordering::SeqCst);
+                self.abort.get_or_insert_with(|| {
+                    "stopped by the operator from the rescue console".to_owned()
+                });
+            }
+        }
+    }
+
+    fn phase_title(&self) -> String {
+        self.phases
+            .get(self.current)
+            .copied()
+            .map_or_else(String::new, |phase| {
+                format!(
+                    "PHASE {}/{} {} ({} / {})",
+                    self.current + 1,
+                    self.phases.len(),
+                    phase.kind.label(),
+                    format_duration(self.phase_started.elapsed().as_secs()),
+                    if phase.seconds == 0 {
+                        "until done".to_owned()
+                    } else {
+                        format_duration(phase.seconds)
+                    }
+                )
+            })
     }
 
     fn phases_row(&self) -> String {
@@ -1630,20 +1750,7 @@ impl Session<'_> {
             intensity: self.settings.intensity,
             gpu_temp_limit: self.settings.gpu_temp_limit,
             state: if stopping { "STOPPING" } else { "RUNNING" }.to_owned(),
-            phase_title: phase.map_or_else(String::new, |phase| {
-                format!(
-                    "PHASE {}/{} {} ({} / {})",
-                    self.current + 1,
-                    self.phases.len(),
-                    phase.kind.label(),
-                    format_duration(self.phase_started.elapsed().as_secs()),
-                    if phase.seconds == 0 {
-                        "until done".to_owned()
-                    } else {
-                        format_duration(phase.seconds)
-                    }
-                )
-            }),
+            phase_title: self.phase_title(),
             phase_process: phase.map_or_else(String::new, |phase| {
                 let names: Vec<&str> = phase
                     .kind

@@ -326,9 +326,25 @@ fn title_row(width: usize) -> String {
 /// The last dashboard drawn on a terminal, kept for [`save_final_frame`].
 static LAST: std::sync::Mutex<Option<UnifiedDashboard>> = std::sync::Mutex::new(None);
 
+/// When [`remember`] last wrote the screen to `DIT_UI_FINAL_FRAME`.
+static LAST_SAVED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 fn remember(dashboard: &UnifiedDashboard) {
     if let Ok(mut last) = LAST.lock() {
         *last = Some(dashboard.clone());
+    }
+    // The black box draws a session's result on its last screen when the test cannot
+    // (`docs/FAULT_CATCH_ROADMAP.md`, `FC3a`): the file follows the screen every few seconds, not
+    // only when the live view ends.
+    let due = LAST_SAVED.lock().is_ok_and(|mut saved| {
+        let due = saved.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2));
+        if due {
+            *saved = Some(std::time::Instant::now());
+        }
+        due
+    });
+    if due {
+        save_final_frame();
     }
 }
 
@@ -350,6 +366,18 @@ pub fn save_final_frame() {
     let temporary = path.with_extension("tmp");
     if serde_json::to_vec(&dashboard).is_ok_and(|bytes| std::fs::write(&temporary, bytes).is_ok()) {
         let _ = std::fs::rename(&temporary, &path);
+    }
+}
+
+/// Writes the last dashboard drawn to `path` (whole, then renamed): a process that draws its
+/// screen itself (the combined run) keeps its session's screen file this way.
+pub fn save_last_frame(path: &std::path::Path) {
+    let Some(dashboard) = LAST.lock().ok().and_then(|last| last.clone()) else {
+        return;
+    };
+    let temporary = path.with_extension("tmp");
+    if serde_json::to_vec(&dashboard).is_ok_and(|bytes| std::fs::write(&temporary, bytes).is_ok()) {
+        let _ = std::fs::rename(&temporary, path);
     }
 }
 

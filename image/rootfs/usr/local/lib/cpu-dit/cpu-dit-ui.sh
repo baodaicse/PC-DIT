@@ -1112,7 +1112,7 @@ run_result() {
         if [[ "${module:-cpu-ram}" == cpu-ram && -n "$reports" && -s "$reports/system-report.json" ]]; then
             ledger_args=(ledger --report "$reports/system-report.json"
                 --results-root "$WATCHDOG_RESULTS_ROOT" --run-dir "$reports"
-                --run-id "${reports##*/}" --verdict "$verdict")
+                --run-id "${reports##*/}" --verdict "$verdict" --session "$run_id")
             grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && ledger_args+=(--attribution)
             while IFS= read -r line; do
                 case "$line" in
@@ -1120,6 +1120,16 @@ run_result() {
                     'Fail summary'*) csv_rows+=("CSV      $line") ;;
                 esac
             done < <("$SUITE" "${ledger_args[@]}" 2>/dev/null)
+        fi
+        # The session ends here (docs/FAULT_CATCH_ROADMAP.md, FC3a): a run without a report still
+        # gets its CSV row, and the black box stops waiting for this result.
+        if [[ "${module:-cpu-ram}" == cpu-ram && -n "${run_id:-}" ]]; then
+            local -a end_args=(session-end --run-id "$run_id" --verdict "$verdict"
+                --results-root "$WATCHDOG_RESULTS_ROOT" --run-dir "${reports:-$UI_RUN_DIR}")
+            grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && end_args+=(--attribution)
+            while IFS= read -r line; do
+                [[ "$line" == 'Fail summary'* ]] && csv_rows+=("CSV      $line")
+            done < <("$SUITE" "${end_args[@]}" 2>/dev/null)
         fi
         # The order every test uses: verdict, ledger, report, CSV.
         rows=(--row "RESULT: $verdict    $text")
@@ -1204,6 +1214,12 @@ run_profile() {
                 --full-safe-percent "$FULL_SAFE_PERCENT" --engine-version "$ENGINE_VERSION"
                 --report-abi "$REPORT_ABI")
             (( thermal_limit_enabled == 1 )) && view_args+=(--temp-limit-celsius "$THERMAL_LIMIT_C")
+            # The view beats this run's session for the black box while it draws (FC3a).
+            if [[ "$module" == cpu-ram ]]; then
+                view_args+=(--session-run-id "$run_id" --watchdog-dir "$watchdog_dir"
+                    --results-root "$WATCHDOG_RESULTS_ROOT")
+                grep -qw 'dit_attribution=1' /proc/cmdline 2>/dev/null && view_args+=(--attribution)
+            fi
             view_status=0
             DIT_UI_FINAL_FRAME="$final_frame" "$SUITE" "${view_args[@]}" || view_status=$?
             if (( view_status != 0 && view_status != 130 )); then

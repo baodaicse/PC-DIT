@@ -1,9 +1,12 @@
 //! Fault ledger of a single-module run (GPU-VRAM, CPU-SSD or CPU-RAM from the menu): the report
 //! counted on component cells, two lines for the completion screen and one `fail-summary.csv`
 //! row on the results volume, like a combined session.
-use dit_orchestrator::fault_ledger::{Component, CsvMeta, Ledger, append_csv};
+use dit_orchestrator::fault_ledger::{
+    Component, CsvCounts, CsvMeta, Ledger, append_csv, append_csv_row, csv_row,
+};
 use dit_orchestrator::fault_signatures;
 use dit_orchestrator::fault_sources;
+use dit_orchestrator::session::Claim;
 use dit_ui_core::HostSampler;
 use serde_json::Value;
 use std::path::Path;
@@ -17,7 +20,8 @@ pub enum SingleModule {
 }
 
 impl SingleModule {
-    const fn directory(self) -> &'static str {
+    /// Its run directory's name, and its layer's name in a session.
+    pub const fn directory(self) -> &'static str {
         match self {
             Self::Gpu => "gpu-vram",
             Self::Ssd => "cpu-nvme",
@@ -132,8 +136,68 @@ fn module_findings(
     }
 }
 
-/// Counts the report's failures on their cells and appends the CSV row. The returned text goes
-/// under the module's completion message; an unreadable report gives an empty string.
+/// The CSV row's description of a single-module run on this machine; time, verdict, report and
+/// the GPU and SSD names are set when the row is written.
+#[must_use]
+pub fn csv_meta(module: SingleModule, attribution: bool) -> CsvMeta {
+    let system = HostSampler::detect().system_info();
+    CsvMeta {
+        image_id: super::image_id(),
+        test: module.test_label(attribution),
+        board: system.board,
+        cpu: system.cpu,
+        memory: format!("{} MiB", system.memory_total_bytes / (1024 * 1024)),
+        ..CsvMeta::default()
+    }
+}
+
+/// Cells a failure of `module` is counted on before its report places it (the session status).
+#[must_use]
+pub const fn pending_cells(module: SingleModule) -> &'static [&'static str] {
+    match module {
+        SingleModule::Gpu => &["PCIe-GPU1", "GPU1", "VRAM1"],
+        SingleModule::Ssd => &["SSD1", "SSD1-path"],
+        SingleModule::CpuRam => &["CPU", "RAM"],
+    }
+}
+
+fn csv_path(results_root: &Path, run_dir: &Path) -> std::path::PathBuf {
+    if results_root.is_dir() {
+        results_root.join("fail-summary.csv")
+    } else {
+        run_dir.join("fail-summary.csv")
+    }
+}
+
+/// The CSV row of a run that ended without a report (stopped, crashed, killed): nothing counted,
+/// so a session still has its row. `claim` says whether this run writes it.
+pub fn row_without_report(
+    module: SingleModule,
+    results_root: &Path,
+    run_dir: &Path,
+    verdict: &str,
+    attribution: bool,
+    claim: &Claim,
+) -> String {
+    if let Claim::Taken(by) = claim {
+        return format!("Fail summary not written: the {by} already wrote this session's result");
+    }
+    let meta = CsvMeta {
+        time: super::local_timestamp(),
+        verdict: verdict.to_owned(),
+        ..csv_meta(module, attribution)
+    };
+    let path = csv_path(results_root, run_dir);
+    match append_csv_row(&path, &csv_row(&meta, &CsvCounts::default())) {
+        Ok(()) => format!("Fail summary row added to {}", path.display()),
+        Err(error) => format!("Fail summary not written ({error}): {}", path.display()),
+    }
+}
+
+/// Counts the report's failures on their cells and appends the CSV row when `claim` says this
+/// run writes the session's result. The returned text goes under the module's completion
+/// message; an unreadable report gives an empty string.
+#[allow(clippy::too_many_arguments)]
 pub fn summarize(
     module: SingleModule,
     report_path: &Path,
@@ -142,6 +206,7 @@ pub fn summarize(
     run_id: &str,
     verdict: &str,
     attribution: bool,
+    claim: &Claim,
 ) -> String {
     let Some(report) = std::fs::read(report_path)
         .ok()
@@ -160,27 +225,23 @@ pub fn summarize(
     }
     // Step F6 on what the report gives: addresses, bits and hardware counts (no timing).
     fault_signatures::rank(&mut ledger, &fault_signatures::Context::default());
-    let system = HostSampler::detect().system_info();
     let meta = CsvMeta {
         time: super::local_timestamp(),
-        image_id: super::image_id(),
-        test: module.test_label(attribution),
-        board: system.board,
-        cpu: system.cpu,
-        memory: format!("{} MiB", system.memory_total_bytes / (1024 * 1024)),
         gpus,
         ssds,
         verdict: verdict.to_owned(),
         report: module.report_path(run_id),
+        ..csv_meta(module, attribution)
     };
-    let csv_path = if results_root.is_dir() {
-        results_root.join("fail-summary.csv")
-    } else {
-        run_dir.join("fail-summary.csv")
-    };
-    let csv = match append_csv(&csv_path, &ledger, &meta) {
-        Ok(()) => format!("Fail summary row added to {}", csv_path.display()),
-        Err(error) => format!("Fail summary not written ({error}): {}", csv_path.display()),
+    let csv_path = csv_path(results_root, run_dir);
+    let csv = match claim {
+        Claim::Taken(by) => {
+            format!("Fail summary not written: the {by} already wrote this session's result")
+        }
+        Claim::Won => match append_csv(&csv_path, &ledger, &meta) {
+            Ok(()) => format!("Fail summary row added to {}", csv_path.display()),
+            Err(error) => format!("Fail summary not written ({error}): {}", csv_path.display()),
+        },
     };
     format!(
         "{}\n{}\n{}\n{csv}",
@@ -208,6 +269,7 @@ mod tests {
             "suite-gpu-1",
             "FAIL",
             true,
+            &Claim::Won,
         );
         // The rules leave retention failures on `PCIe-GPU1|VRAM1`; the five failures sit on two
         // byte offsets only (0 and 5701632), so the ranking (F6) moves them to VRAM1 as suspected.

@@ -49,6 +49,18 @@ pub struct CpuRamViewArgs {
     engine_version: String,
     #[arg(long, default_value = "9")]
     report_abi: String,
+    /// The UI session the run belongs to (`docs/FAULT_CATCH_ROADMAP.md`, `FC3a`): while it draws,
+    /// the view beats the session for the UI script that ends it.
+    #[arg(long)]
+    session_run_id: Option<String>,
+    /// The run's watchdog directory (its `watchdog-status.json`).
+    #[arg(long)]
+    watchdog_dir: Option<PathBuf>,
+    #[arg(long, default_value = "/mnt/cpu-dit-results")]
+    results_root: PathBuf,
+    /// Booted with the Fault Attribution entry (the CSV test column says it).
+    #[arg(long)]
+    attribution: bool,
 }
 
 /// What the runner's log says so far. The failure count never goes back: the diagnostic rerun
@@ -522,9 +534,35 @@ pub fn command(args: &CpuRamViewArgs) -> io::Result<()> {
     let (mut temperature, mut power) = (None, None);
     let mut throttle = ThrottleLive::default();
     let mut throttle_start = None;
+    let module = super::fault_single::SingleModule::CpuRam;
+    let mut session = args
+        .session_run_id
+        .as_deref()
+        .filter(|_| args.mode == ViewMode::CpuRam)
+        .map(|run_id| {
+            let run_dir = args.watchdog_dir.clone().unwrap_or_default();
+            let frame = std::env::var_os(dit_ui_core::FINAL_FRAME_ENV)
+                .map_or_else(|| run_dir.join("dashboard-final.json"), PathBuf::from);
+            super::single_session::SingleSession::open(
+                run_id,
+                module,
+                args.attribution, // The UI script writes the result: it is the session's app.
+                std::os::unix::process::parent_id(),
+                &args.results_root,
+                &run_dir,
+                &frame,
+            )
+        });
     loop {
         let alive = running(args.pid);
         progress.follow(&args.log);
+        if let Some(session) = session.as_mut() {
+            session.beat(
+                args.pid,
+                progress.fields.get("phase").cloned(),
+                Some(progress.failures_peak),
+            );
+        }
         if last_sensor.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
             let snapshot = sensors.sample();
             #[allow(clippy::cast_precision_loss)]
@@ -595,6 +633,10 @@ mod tests {
             full_safe_percent: 95,
             engine_version: "0.1.0".into(),
             report_abi: "9".into(),
+            session_run_id: None,
+            watchdog_dir: None,
+            results_root: PathBuf::from("/nonexistent"),
+            attribution: false,
         }
     }
 

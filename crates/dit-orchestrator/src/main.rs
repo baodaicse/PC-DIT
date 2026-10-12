@@ -18,6 +18,7 @@ mod combined_run;
 mod combined_view;
 mod cpu_ram_view;
 mod fault_single;
+mod single_session;
 
 /// Set by Ctrl+C while the menu runs. Single modules ignore it (their own watchdog handles the
 /// stop); the combined run reads it to drain every layer and end the session.
@@ -57,6 +58,25 @@ enum Command {
     /// Clears the screen and draws an option screen in the shared look (menus of the CPU-RAM
     /// and power UI script).
     OptionScreen(OptionScreenArgs),
+    /// Ends a CPU-RAM UI session: writes its CSV row when no result was written for it yet (a
+    /// run without a report), then marks it closed (`docs/FAULT_CATCH_ROADMAP.md`, `FC3a`).
+    SessionEnd(SessionEndArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SessionEndArgs {
+    /// The session (the CPU-RAM UI's run ID).
+    #[arg(long)]
+    run_id: String,
+    #[arg(long)]
+    verdict: String,
+    #[arg(long, default_value = "/mnt/cpu-dit-results")]
+    results_root: PathBuf,
+    /// Where the CSV goes when the results volume is not mounted.
+    #[arg(long)]
+    run_dir: PathBuf,
+    #[arg(long)]
+    attribution: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -86,6 +106,9 @@ struct LedgerArgs {
     /// The run was booted with the Fault Attribution entry.
     #[arg(long)]
     attribution: bool,
+    /// The UI session the run belongs to: its result is claimed before the CSV row is written.
+    #[arg(long)]
+    session: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -195,6 +218,17 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Ledger(args) => {
+            let claim =
+                args.session
+                    .as_deref()
+                    .map_or(dit_orchestrator::session::Claim::Won, |run_id| {
+                        dit_orchestrator::session::claim(
+                            &args.results_root,
+                            Path::new(dit_orchestrator::session::ROOT),
+                            run_id,
+                            "app",
+                        )
+                    });
             println!(
                 "{}",
                 fault_single::summarize(
@@ -205,8 +239,31 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     &args.run_id,
                     &args.verdict,
                     args.attribution,
+                    &claim,
                 )
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::SessionEnd(args) => {
+            let root = Path::new(dit_orchestrator::session::ROOT);
+            if dit_orchestrator::session::claimed_by(&args.results_root, root, &args.run_id)
+                .is_none()
+            {
+                let claim =
+                    dit_orchestrator::session::claim(&args.results_root, root, &args.run_id, "app");
+                println!(
+                    "{}",
+                    fault_single::row_without_report(
+                        fault_single::SingleModule::CpuRam,
+                        &args.results_root,
+                        &args.run_dir,
+                        &args.verdict,
+                        args.attribution,
+                        &claim,
+                    )
+                );
+            }
+            dit_orchestrator::session::close(root, &args.run_id, &args.verdict);
             Ok(ExitCode::SUCCESS)
         }
         Command::FinalFrame(args) => {
@@ -353,6 +410,7 @@ fn power_ui_command(args: &MenuArgs) -> ProcessCommand {
     command
 }
 
+#[allow(clippy::too_many_lines)]
 fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
     require_file(&args.nvme_binary, "CPU-SSD binary")?;
     require_file(&args.watchdog_binary, "DIT watchdog")?;
@@ -392,7 +450,18 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
     for device in &args.protected_devices {
         command.arg("--protected-device").arg(device);
     }
-    let nvme_status = command.status()?;
+    let module = fault_single::SingleModule::Ssd;
+    let mut session = single_session::SingleSession::open(
+        &suite_run_id,
+        module,
+        args.attribution_checks,
+        std::process::id(),
+        &args.results_root,
+        &suite_dir,
+        &suite_dir.join(FINAL_FRAME_FILE),
+    );
+    let nvme_status = single_session::run_watched(&mut command, &mut session)?;
+    let claim = session.claim();
     let nvme_report = suite_dir.join("report.json");
     let mut verdict = "INVALID";
     let completion = if nvme_report.is_file() {
@@ -410,20 +479,35 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
             "CPU-SSD completed with {}.\n{}",
             verdict_name(report.aggregate_verdict),
             fault_single::summarize(
-                fault_single::SingleModule::Ssd,
+                module,
                 &nvme_report,
                 &args.results_root,
                 &suite_dir,
                 &suite_run_id,
                 verdict_name(report.aggregate_verdict),
                 args.attribution_checks,
+                &claim,
             )
         )
-    } else if !nvme_status.success() {
-        "CPU-SSD was aborted or failed before a final report was written.".to_owned()
     } else {
-        "CPU-SSD stopped without a final report.".to_owned()
+        let headline = if nvme_status.success() {
+            "CPU-SSD stopped without a final report."
+        } else {
+            "CPU-SSD was aborted or failed before a final report was written."
+        };
+        format!(
+            "{headline}\n{}",
+            fault_single::row_without_report(
+                module,
+                &args.results_root,
+                &suite_dir,
+                verdict,
+                args.attribution_checks,
+                &claim,
+            )
+        )
     };
+    session.close(verdict);
     let storage =
         match persist_run_artifacts(&suite_dir, &args.results_root, &suite_run_id, "cpu-nvme") {
             Ok(Some(path)) => format!("Final report bundle copied once to: {}", path.display()),
@@ -664,25 +748,37 @@ fn launch_gpu(
     let suite_dir = runtime_gpu_dir(&suite_run_id);
     create_dir_all(&suite_dir)?;
     let heartbeat = suite_dir.join("watchdog-heartbeat.json");
-    let status = watchdog_command(
+    let mut command = watchdog_command(
         args,
         "gpu-vram",
         &suite_run_id,
         &suite_dir,
         Some(&heartbeat),
         std::iter::empty::<PathBuf>(),
-    )
-    .env(
-        dit_ui_core::FINAL_FRAME_ENV,
-        suite_dir.join(FINAL_FRAME_FILE),
-    )
-    .arg(&args.gpu_binary)
-    .args(gpu_run_arguments(
-        profile, *settings, &suite_dir, &heartbeat,
-    ))
-    // Step F3: GPU failures carry where they went wrong (boot option `dit_attribution=1`).
-    .args(args.attribution_checks.then_some("--boundary-checks"))
-    .status()?;
+    );
+    command
+        .env(
+            dit_ui_core::FINAL_FRAME_ENV,
+            suite_dir.join(FINAL_FRAME_FILE),
+        )
+        .arg(&args.gpu_binary)
+        .args(gpu_run_arguments(
+            profile, *settings, &suite_dir, &heartbeat,
+        ))
+        // Step F3: GPU failures carry where they went wrong (boot option `dit_attribution=1`).
+        .args(args.attribution_checks.then_some("--boundary-checks"));
+    let module = fault_single::SingleModule::Gpu;
+    let mut session = single_session::SingleSession::open(
+        &suite_run_id,
+        module,
+        args.attribution_checks,
+        std::process::id(),
+        &args.results_root,
+        &suite_dir,
+        &suite_dir.join(FINAL_FRAME_FILE),
+    );
+    let status = single_session::run_watched(&mut command, &mut session)?;
+    let claim = session.claim();
     let report_path = suite_dir.join("report.json");
     let mut verdict = "INVALID";
     let completion = if report_path.is_file() {
@@ -695,20 +791,35 @@ fn launch_gpu(
         }
         message.push('\n');
         message.push_str(&fault_single::summarize(
-            fault_single::SingleModule::Gpu,
+            module,
             &report_path,
             &args.results_root,
             &suite_dir,
             &suite_run_id,
             verdict_name(report.verdict),
             args.attribution_checks,
+            &claim,
         ));
         message
-    } else if status.success() {
-        "GPU-VRAM stopped without a final report.".to_owned()
     } else {
-        "GPU-VRAM was aborted or failed before a final report was written.".to_owned()
+        let headline = if status.success() {
+            "GPU-VRAM stopped without a final report."
+        } else {
+            "GPU-VRAM was aborted or failed before a final report was written."
+        };
+        format!(
+            "{headline}\n{}",
+            fault_single::row_without_report(
+                module,
+                &args.results_root,
+                &suite_dir,
+                verdict,
+                args.attribution_checks,
+                &claim,
+            )
+        )
     };
+    session.close(verdict);
     let storage =
         match persist_run_artifacts(&suite_dir, &args.results_root, &suite_run_id, "gpu-vram") {
             Ok(Some(path)) => format!("Final report bundle copied once to: {}", path.display()),

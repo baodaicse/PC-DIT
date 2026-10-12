@@ -5,6 +5,7 @@ pub mod fault_ledger;
 pub mod fault_signatures;
 pub mod fault_sources;
 pub mod hw_events;
+pub mod session;
 
 use dit_contracts::{SCHEMA_VERSION, Verdict};
 use serde::{Deserialize, Serialize};

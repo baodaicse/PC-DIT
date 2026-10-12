@@ -628,25 +628,10 @@ impl Ledger {
         }
     }
 
-    /// One `fail-summary.csv` row (columns in [`CSV_HEADER`]).
+    /// What this ledger puts in a `fail-summary.csv` row (columns in [`CSV_HEADER`]).
     #[must_use]
-    pub fn csv_row(&self, meta: &CsvMeta) -> String {
+    pub fn csv_counts(&self) -> CsvCounts {
         let report = self.report();
-        let mut fields: Vec<String> = vec![
-            meta.time.clone(),
-            meta.image_id.clone(),
-            meta.test.clone(),
-            meta.board.clone(),
-            meta.cpu.clone(),
-            meta.memory.clone(),
-            meta.gpus.clone(),
-            meta.ssds.clone(),
-            meta.verdict.clone(),
-        ];
-        fields.extend(COLUMNS.iter().map(|c| self.column_total(c).to_string()));
-        fields.push(report.unresolved_total.to_string());
-        fields.push(report.confirmed_total.to_string());
-        fields.push(report.suspected_total.to_string());
         let mut cells = String::new();
         for cell in &report.cells {
             let _ = write!(
@@ -661,10 +646,14 @@ impl Ledger {
         for (group, count) in &report.unresolved {
             let _ = write!(cells, "?{group}={count};");
         }
-        fields.push(cells.trim_end_matches(';').to_owned());
-        // Throttling joins the hardware events column (the header stays the same).
-        fields.push(
-            report
+        CsvCounts {
+            columns: COLUMNS.iter().map(|c| self.column_total(c)).collect(),
+            unresolved: report.unresolved_total,
+            confirmed: report.confirmed_total,
+            suspected: report.suspected_total,
+            cells: cells.trim_end_matches(';').to_owned(),
+            // Throttling joins the hardware events column (the header stays the same).
+            hardware: report
                 .hardware_events
                 .iter()
                 .map(|h| format!("{} {} +{}", h.cell, h.kind, h.delta))
@@ -675,14 +664,67 @@ impl Ledger {
                 }))
                 .collect::<Vec<_>>()
                 .join("; "),
-        );
-        fields.push(meta.report.clone());
-        fields
-            .iter()
-            .map(|field| csv_field(field))
-            .collect::<Vec<_>>()
-            .join(",")
+        }
     }
+
+    /// One `fail-summary.csv` row (columns in [`CSV_HEADER`]).
+    #[must_use]
+    pub fn csv_row(&self, meta: &CsvMeta) -> String {
+        csv_row(meta, &self.csv_counts())
+    }
+}
+
+/// The counted part of a `fail-summary.csv` row. The app keeps it current in its session status
+/// (`docs/FAULT_CATCH_ROADMAP.md`, `FC3a`), so the black box or the rescue console can write the
+/// row with what was counted when the app itself no longer can.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CsvCounts {
+    /// Totals of the cell columns, in header order (cpu .. platform).
+    pub columns: Vec<u64>,
+    pub unresolved: u64,
+    pub confirmed: u64,
+    pub suspected: u64,
+    /// `CELL=n(cX/sY);...;?A|B=n`.
+    pub cells: String,
+    pub hardware: String,
+}
+
+impl CsvCounts {
+    /// Every failure counted.
+    #[must_use]
+    pub fn failures(&self) -> u64 {
+        self.columns.iter().sum::<u64>() + self.unresolved
+    }
+}
+
+/// One `fail-summary.csv` row from its description and its counts.
+#[must_use]
+pub fn csv_row(meta: &CsvMeta, counts: &CsvCounts) -> String {
+    let mut fields: Vec<String> = vec![
+        meta.time.clone(),
+        meta.image_id.clone(),
+        meta.test.clone(),
+        meta.board.clone(),
+        meta.cpu.clone(),
+        meta.memory.clone(),
+        meta.gpus.clone(),
+        meta.ssds.clone(),
+        meta.verdict.clone(),
+    ];
+    fields.extend(
+        (0..COLUMNS.len()).map(|i| counts.columns.get(i).copied().unwrap_or(0).to_string()),
+    );
+    fields.push(counts.unresolved.to_string());
+    fields.push(counts.confirmed.to_string());
+    fields.push(counts.suspected.to_string());
+    fields.push(counts.cells.clone());
+    fields.push(counts.hardware.clone());
+    fields.push(meta.report.clone());
+    fields
+        .iter()
+        .map(|field| csv_field(field))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Header of `fail-summary.csv`.
@@ -691,7 +733,7 @@ cpu_fail,ram_fail,pcie_gpu_fail,gpu_fail,vram_fail,ssd_fail,ssd_path_fail,platfo
 unresolved_fail,confirmed,suspected,cells,hardware_events,report";
 
 /// What a CSV row says about the run besides the counts.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct CsvMeta {
     pub time: String,
     pub image_id: String,
@@ -717,6 +759,14 @@ fn csv_field(text: &str) -> String {
 /// # Errors
 /// File creation or write failures.
 pub fn append_csv(path: &Path, ledger: &Ledger, meta: &CsvMeta) -> std::io::Result<()> {
+    append_csv_row(path, &ledger.csv_row(meta))
+}
+
+/// Appends one formatted row ([`csv_row`]) to `path`, writing the header first when the file
+/// is new.
+/// # Errors
+/// File creation or write failures.
+pub fn append_csv_row(path: &Path, row: &str) -> std::io::Result<()> {
     let new = !path.exists();
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -725,7 +775,7 @@ pub fn append_csv(path: &Path, ledger: &Ledger, meta: &CsvMeta) -> std::io::Resu
     if new {
         writeln!(file, "{CSV_HEADER}")?;
     }
-    writeln!(file, "{}", ledger.csv_row(meta))?;
+    writeln!(file, "{row}")?;
     file.sync_all()
 }
 
