@@ -815,6 +815,7 @@ impl Session<'_> {
             &dir,
             launch.heartbeat.as_deref(),
             launch.activity,
+            true,
         );
         command
             .arg(&launch.program)

@@ -1173,7 +1173,8 @@ run_profile() {
         watchdog_marker=(--recovery-marker "$WATCHDOG_RESULTS_ROOT/watchdog/$run_id-$module.json")
     fi
     # FC2: CPU-RAM holds most of the memory; the watchdog stops it before the machine stalls.
-    [[ "$module" == cpu-ram ]] && watchdog_marker+=(--memory-guard)
+    # FC4: it starts without a picker, so it must show a sign of life within 5 minutes.
+    [[ "$module" == cpu-ram ]] && watchdog_marker+=(--memory-guard --startup-deadline-seconds 300)
     if [[ -x "$WATCHDOG" ]]; then
         active_run_uses_watchdog=1
         setsid env CPU_DIT_UI_CHILD=1 CPU_DIT_RETURN_TO_UI=1 \
@@ -1270,6 +1271,7 @@ run_profile() {
             0) run_result 'PASS' 'All required correctness and coverage gates passed.' "$c_green" ;;
             2) run_result 'FAIL' 'A correctness, telemetry or execution gate failed.' "$c_red" ;;
             3) run_result 'INVALID' 'Source, profile or environment is invalid.' "$c_yellow" ;;
+            123) run_result 'INVALID' 'The test never showed a sign of life; the watchdog ended it (see watchdog-final.json).' "$c_yellow" ;;
             124) run_result 'INVALID' 'The test stopped answering; the watchdog ended it (see watchdog-final.json).' "$c_yellow" ;;
             125) run_result 'INVALID' 'Memory guard: the test was stopped before the machine ran out of memory.' "$c_yellow" ;;
             126) run_result 'INVALID' 'The kernel ended the test for memory (OOM); see watchdog-final.json.' "$c_yellow" ;;

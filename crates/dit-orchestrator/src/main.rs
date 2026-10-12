@@ -451,6 +451,7 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
         &suite_dir,
         None,
         [heartbeat],
+        false,
     );
     command.env(
         dit_ui_core::FINAL_FRAME_ENV,
@@ -781,6 +782,7 @@ fn launch_gpu(
         &suite_dir,
         Some(&heartbeat),
         std::iter::empty::<PathBuf>(),
+        false,
     );
     command
         .env(
@@ -950,6 +952,7 @@ fn watchdog_command<I>(
     suite_dir: &Path,
     heartbeat: Option<&Path>,
     activity_paths: I,
+    unattended: bool,
 ) -> ProcessCommand
 where
     I: IntoIterator<Item = PathBuf>,
@@ -974,6 +977,10 @@ where
     // FC2: the CPU-RAM layer holds the arena; it is stopped first when memory runs out.
     if module == "cpu-ram" {
         command.arg("--memory-guard");
+    }
+    // FC4: a run without a picker (a combined layer) must show a sign of life in 5 minutes.
+    if unattended {
+        command.arg("--startup-deadline-seconds").arg("300");
     }
     if let Some(path) = heartbeat {
         command.arg("--heartbeat").arg(path);

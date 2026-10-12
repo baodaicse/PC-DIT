@@ -77,6 +77,15 @@ struct SuperviseArgs {
     memory_guard_min_available_mib: u64,
     #[arg(long, default_value_t = 5)]
     memory_guard_seconds: u64,
+    /// A worker with no progress whose processes still do I/O (the SSD test: CPU work in the
+    /// kernel too) is slow, not stuck: it is ended only after this long with no progress at all
+    /// (`docs/FAULT_CATCH_ROADMAP.md`, FC4).
+    #[arg(long, default_value_t = 1800)]
+    slow_io_limit_seconds: u64,
+    /// A worker that shows no progress at all this long after it started is ended
+    /// (`STARTUP_STALLED`, FC4). Absent for a test that may wait for the operator at a picker.
+    #[arg(long)]
+    startup_deadline_seconds: Option<u64>,
     /// Worker executable and arguments. Use `--` before this portion.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     worker: Vec<OsString>,
@@ -95,6 +104,10 @@ enum WatchdogState {
     StalledKilled,
     /// Stopped by the memory guard before the machine ran out of memory (FC2).
     MemoryGuard,
+    /// No progress, but its processes still do I/O: slow, not stuck (FC4).
+    SlowIo,
+    /// No sign of life within the startup deadline (FC4).
+    StartupStalled,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +133,123 @@ struct WatchdogRecord {
     /// The worker's own memory cgroup (FC2), when it runs in one.
     #[serde(skip_serializing_if = "Option::is_none")]
     cgroup: Option<String>,
+    /// Seconds since the last progress (heartbeat / activity), once it has been seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_age_seconds: Option<u64>,
+    /// What the worker's processes did lately (FC4): the evidence of a stall.
+    liveness: LivenessEvidence,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct LivenessEvidence {
+    processes: usize,
+    /// Processes waiting in the kernel (state D), usually on I/O.
+    waiting_in_kernel: usize,
+    io_bytes: u64,
+    cpu_ticks: u64,
+    /// Seconds since its processes last did I/O (or, for the SSD test, used CPU).
+    quiet_seconds: Option<u64>,
+    /// Kernel lines about I/O since the worker started (`NVMe` timeouts, I/O errors, hung tasks).
+    kernel_io: Vec<String>,
+}
+
+/// How a worker's run ended: the state, its exit status (none when it would not end) and why.
+type Ending = (WatchdogState, Option<std::process::ExitStatus>, String);
+
+/// What the worker's processes did lately (FC4): a worker with no progress that still does I/O
+/// is slow, not stuck.
+struct Liveness {
+    /// The worker's process group (`setsid` makes it lead its own).
+    group: u32,
+    /// CPU time counts as movement too (the SSD test: the kernel works in its name).
+    cpu_counts: bool,
+    /// Counters at the last sample (`None` before the first).
+    counters: Option<(u64, u64)>,
+    /// When its processes last did I/O (or used CPU, where that counts); `None` before any.
+    moved_at: Option<SystemTime>,
+    kernel: dit_system::procs::KernelLog,
+    seen: LivenessEvidence,
+}
+
+impl Liveness {
+    fn new(group: u32, cpu_counts: bool) -> Self {
+        let mut kernel = dit_system::procs::KernelLog::open(Path::new("/dev/kmsg"));
+        // What the kernel said before the worker started is not about it.
+        let _ = kernel.read_new();
+        Self {
+            group,
+            cpu_counts,
+            counters: None,
+            moved_at: None,
+            kernel,
+            seen: LivenessEvidence::default(),
+        }
+    }
+
+    fn sample(&mut self) {
+        let all = dit_system::procs::processes(Path::new("/proc"));
+        let members: Vec<&dit_system::procs::Process> =
+            all.iter().filter(|p| p.pgrp == self.group).collect();
+        let io: u64 = members.iter().filter_map(|p| p.io_bytes).sum();
+        let cpu: u64 = members.iter().map(|p| p.cpu_ticks).sum();
+        if let Some((last_io, last_cpu)) = self.counters
+            && (io != last_io || (self.cpu_counts && cpu != last_cpu))
+        {
+            self.moved_at = Some(SystemTime::now());
+        }
+        self.counters = Some((io, cpu));
+        for line in self.kernel.read_new() {
+            use dit_system::kernel_events::KernelEvent as E;
+            if let Some(
+                event @ (E::NvmeTimeout { .. }
+                | E::NvmeDead { .. }
+                | E::IoError { .. }
+                | E::HungTask { .. }),
+            ) = dit_system::kernel_events::classify(&line)
+                && self.seen.kernel_io.len() < 20
+            {
+                self.seen.kernel_io.push(event.describe());
+            }
+        }
+        self.seen.processes = members.len();
+        self.seen.waiting_in_kernel = members.iter().filter(|p| p.state == 'D').count();
+        self.seen.io_bytes = io;
+        self.seen.cpu_ticks = cpu;
+        self.seen.quiet_seconds = self
+            .moved_at
+            .and_then(|at| at.elapsed().ok())
+            .map(|d| d.as_secs());
+    }
+
+    /// Whether its processes did I/O (or used CPU, where that counts) in the last 30 s.
+    fn moving(&self) -> bool {
+        self.moved_at
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|quiet| quiet < Duration::from_secs(30))
+    }
+
+    /// What counts as movement for this worker.
+    const fn movement(&self) -> &'static str {
+        if self.cpu_counts { "I/O or CPU" } else { "I/O" }
+    }
+
+    /// The evidence as a sentence for the record.
+    fn said(&self) -> String {
+        let kernel = if self.seen.kernel_io.is_empty() {
+            "no kernel I/O error".to_owned()
+        } else {
+            format!("kernel: {}", self.seen.kernel_io.join("; "))
+        };
+        format!(
+            "{} of {} processes waiting in the kernel, {}, {kernel}",
+            self.seen.waiting_in_kernel,
+            self.seen.processes,
+            self.seen.quiet_seconds.map_or_else(
+                || format!("no {} seen", self.movement()),
+                |s| format!("no {} for {s} s", self.movement())
+            )
+        )
+    }
 }
 
 struct Supervisor<'a> {
@@ -133,6 +263,9 @@ struct Supervisor<'a> {
     operator_stop_requested: Arc<AtomicBool>,
     cgroup: Option<PathBuf>,
     guard: Option<MemoryGuard>,
+    liveness: Liveness,
+    started: SystemTime,
+    last_slow_record: Option<SystemTime>,
 }
 
 /// FC2: watches memory while the worker runs and says when to stop it.
@@ -239,7 +372,11 @@ fn exit_code(
         WatchdogState::OomKilled => 126,
         WatchdogState::StalledKilled => 124,
         WatchdogState::MemoryGuard => 125,
-        WatchdogState::Starting | WatchdogState::Running | WatchdogState::Stalled => 2,
+        WatchdogState::StartupStalled => 123,
+        WatchdogState::Starting
+        | WatchdogState::Running
+        | WatchdogState::Stalled
+        | WatchdogState::SlowIo => 2,
     }
 }
 
@@ -281,6 +418,7 @@ fn supervise(args: &SuperviseArgs) -> Result<ExitCode, Box<dyn std::error::Error
     let cgroup_events_before = cgroup_events_path
         .as_deref()
         .map_or_else(BTreeMap::new, read_memory_events);
+    let child_id = child.id();
     let mut supervisor = Supervisor {
         args,
         child,
@@ -297,6 +435,9 @@ fn supervise(args: &SuperviseArgs) -> Result<ExitCode, Box<dyn std::error::Error
             seconds: args.memory_guard_seconds.max(1),
             strikes: 0,
         }),
+        liveness: Liveness::new(child_id, args.module.ends_with("nvme")),
+        started: SystemTime::now(),
+        last_slow_record: None,
     };
     supervisor.write_record(WatchdogState::Starting, None, "worker spawned")?;
     supervisor.write_record(WatchdogState::Running, None, "worker supervision active")?;
@@ -324,18 +465,13 @@ impl Supervisor<'_> {
     {
         loop {
             if self.operator_stop_requested.load(Ordering::SeqCst) {
-                terminate_process_group(self.child.id(), "TERM")?;
-                thread::sleep(Duration::from_secs(2));
-                if self.child.try_wait()?.is_none() {
-                    terminate_process_group(self.child.id(), "KILL")?;
-                }
-                let status = self.child.wait()?;
-                return Ok((
-                    WatchdogState::WorkerSignaled,
-                    Some(status),
+                let status = self.end_worker(true)?;
+                let detail = if status.is_some() {
                     "operator requested stop; watchdog terminated the worker process group"
-                        .to_owned(),
-                ));
+                } else {
+                    "operator requested stop; the worker did not end after SIGKILL (stuck in the kernel)"
+                };
+                return Ok((WatchdogState::WorkerSignaled, status, detail.to_owned()));
             }
             if let Some(status) = self.child.try_wait()? {
                 let state =
@@ -352,18 +488,8 @@ impl Supervisor<'_> {
                     "DIT WATCHDOG WARNING: {} run {}: {detail}",
                     self.args.module, self.args.run_id
                 );
-                terminate_process_group(self.child.id(), "TERM")?;
-                for _ in 0..10 {
-                    if self.child.try_wait()?.is_some() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(500));
-                }
-                if self.child.try_wait()?.is_none() {
-                    terminate_process_group(self.child.id(), "KILL")?;
-                }
-                let status = self.child.wait()?;
-                return Ok((WatchdogState::MemoryGuard, Some(status), detail));
+                let status = self.end_worker(true)?;
+                return Ok((WatchdogState::MemoryGuard, status, detail));
             }
 
             if let Some(activity) = latest_activity(self.args)
@@ -380,40 +506,158 @@ impl Supervisor<'_> {
                 )?;
             }
 
-            // A never-created heartbeat must not kill an interactive worker before it
-            // has entered its workload. Once any evidence is seen, it becomes a hard
-            // liveness contract for the rest of the run.
-            if let Some(last_activity) = self.last_activity
-                && last_activity.elapsed().unwrap_or_default()
-                    >= Duration::from_secs(self.args.stale_after_seconds)
-            {
-                let newly_stalled = self.stale_started.is_none();
-                let first_stale = self.stale_started.get_or_insert_with(SystemTime::now);
-                let elapsed = first_stale.elapsed().unwrap_or_default();
-                if newly_stalled {
-                    eprintln!(
-                        "DIT WATCHDOG WARNING: {} run {} has stale heartbeat/activity; grace countdown started.",
-                        self.args.module, self.args.run_id
-                    );
-                }
-                self.write_record(
-                    WatchdogState::Stalled,
-                    None,
-                    "worker heartbeat/activity is stale; grace period is active",
-                )?;
-                if elapsed >= Duration::from_secs(self.args.kill_after_seconds) {
-                    terminate_process_group(self.child.id(), "KILL")?;
-                    let status = self.child.wait()?;
-                    return Ok((
-                        WatchdogState::StalledKilled,
-                        Some(status),
-                        "worker was forcibly ended after stale heartbeat/activity evidence"
-                            .to_owned(),
-                    ));
-                }
+            self.liveness.sample();
+            if let Some(ending) = self.check_progress()? {
+                return Ok(ending);
             }
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Ends the worker's process group (TERM first when `gently`, then KILL) and reaps it. A
+    /// worker that does not end even then (stuck in the kernel on a device) is not waited for:
+    /// `None`, and the record says so.
+    fn end_worker(&mut self, gently: bool) -> io::Result<Option<std::process::ExitStatus>> {
+        let wait =
+            |child: &mut Child, seconds: u64| -> io::Result<Option<std::process::ExitStatus>> {
+                for _ in 0..seconds * 4 {
+                    if let Some(status) = child.try_wait()? {
+                        return Ok(Some(status));
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+                Ok(None)
+            };
+        if gently {
+            terminate_process_group(self.child.id(), "TERM")?;
+            if let Some(status) = wait(&mut self.child, 5)? {
+                return Ok(Some(status));
+            }
+        }
+        terminate_process_group(self.child.id(), "KILL")?;
+        wait(&mut self.child, 10)
+    }
+
+    /// FC4: no progress for the stale limit (or no sign of life at all by the startup
+    /// deadline). A worker whose processes still do I/O is slow, not stuck: it gets until the
+    /// slow I/O limit. One that does nothing at all is stalled: the grace period, then the end.
+    #[allow(clippy::too_many_lines)]
+    fn check_progress(&mut self) -> Result<Option<Ending>, Box<dyn std::error::Error>> {
+        let stale = Duration::from_secs(self.args.stale_after_seconds);
+        let slow_limit = Duration::from_secs(self.args.slow_io_limit_seconds);
+        let quiet = match self.last_activity {
+            Some(at) => at.elapsed().unwrap_or_default(),
+            // Before the first sign of life only an unattended run has a deadline; an
+            // interactive worker may wait for the operator at a picker.
+            None => match self.args.startup_deadline_seconds {
+                Some(deadline)
+                    if self.started.elapsed().unwrap_or_default()
+                        >= Duration::from_secs(deadline) =>
+                {
+                    let waited = self.started.elapsed().unwrap_or_default();
+                    if self.liveness.moving() && waited < slow_limit {
+                        return Ok(None);
+                    }
+                    let status = self.end_worker(true)?;
+                    let stuck = if status.is_none() {
+                        "; it did not end even after SIGKILL (stuck in the kernel)"
+                    } else {
+                        ""
+                    };
+                    return Ok(Some((
+                        WatchdogState::StartupStalled,
+                        status,
+                        format!(
+                            "no sign of life {} s after the start ({}){stuck}",
+                            waited.as_secs(),
+                            self.liveness.said()
+                        ),
+                    )));
+                }
+                _ => return Ok(None),
+            },
+        };
+        // The app shows "no progress" from 60 s: the status says how long, every few seconds.
+        let periodically = self
+            .last_slow_record
+            .is_none_or(|at| at.elapsed().unwrap_or_default() >= Duration::from_secs(5));
+        if quiet < stale {
+            if quiet >= Duration::from_secs(30) && periodically {
+                self.last_slow_record = Some(SystemTime::now());
+                self.write_record(
+                    WatchdogState::Running,
+                    None,
+                    &format!("no progress for {} s", quiet.as_secs()),
+                )?;
+            }
+            return Ok(None);
+        }
+        if self.liveness.moving() {
+            // Slow, not stuck: the grace countdown does not run while it still moves.
+            self.stale_started = None;
+            if quiet >= slow_limit {
+                let status = self.end_worker(true)?;
+                return Ok(Some((
+                    WatchdogState::StalledKilled,
+                    status,
+                    format!(
+                        "no progress for {} s although its processes kept doing I/O (slow I/O limit {} s): {}",
+                        quiet.as_secs(),
+                        slow_limit.as_secs(),
+                        self.liveness.said()
+                    ),
+                )));
+            }
+            if periodically {
+                self.last_slow_record = Some(SystemTime::now());
+                self.write_record(
+                    WatchdogState::SlowIo,
+                    None,
+                    &format!(
+                        "no progress for {} s, but its processes still do I/O: slow, not stuck",
+                        quiet.as_secs()
+                    ),
+                )?;
+            }
+            return Ok(None);
+        }
+        let newly_stalled = self.stale_started.is_none();
+        let first_stale = *self.stale_started.get_or_insert_with(SystemTime::now);
+        if newly_stalled {
+            eprintln!(
+                "DIT WATCHDOG WARNING: {} run {} has stale heartbeat/activity; grace countdown started.",
+                self.args.module, self.args.run_id
+            );
+        }
+        self.write_record(
+            WatchdogState::Stalled,
+            None,
+            &format!(
+                "no progress for {} s and nothing moves ({}); grace period is active",
+                quiet.as_secs(),
+                self.liveness.said()
+            ),
+        )?;
+        if first_stale.elapsed().unwrap_or_default()
+            >= Duration::from_secs(self.args.kill_after_seconds)
+        {
+            let said = self.liveness.said();
+            let status = self.end_worker(false)?;
+            let stuck = if status.is_none() {
+                "; it did not end after SIGKILL (stuck in the kernel)"
+            } else {
+                ""
+            };
+            return Ok(Some((
+                WatchdogState::StalledKilled,
+                status,
+                format!(
+                    "worker was forcibly ended: no progress for {} s and nothing moved ({said}){stuck}",
+                    quiet.as_secs()
+                ),
+            )));
+        }
+        Ok(None)
     }
 
     fn write_record(
@@ -455,20 +699,30 @@ impl Supervisor<'_> {
             exit_signal: status.and_then(|value| value.signal()),
             detail: detail.to_owned(),
             cgroup: self.cgroup.as_ref().map(|dir| dir.display().to_string()),
+            progress_age_seconds: self
+                .last_activity
+                .and_then(|at| at.elapsed().ok())
+                .map(|age| age.as_secs()),
+            liveness: self.liveness.seen.clone(),
         };
         write_json_atomic(&self.args.run_dir.join("watchdog-status.json"), &record)?;
-        if state != WatchdogState::Starting
-            && state != WatchdogState::Running
-            && state != WatchdogState::Stalled
-        {
+        if !matches!(
+            state,
+            WatchdogState::Starting
+                | WatchdogState::Running
+                | WatchdogState::Stalled
+                | WatchdogState::SlowIo
+        ) {
             write_json_atomic(&self.args.run_dir.join("watchdog-final.json"), &record)?;
         }
         // The durable marker is written when the run starts and when it ends, not at every sign
         // of life: rewriting a file on a FAT stick every second left empty markers after a power
         // loss. The black box's append-only journal follows the run in between (FC3a).
         if let Some(marker) = &self.args.recovery_marker
-            && state != WatchdogState::Running
-            && state != WatchdogState::Stalled
+            && !matches!(
+                state,
+                WatchdogState::Running | WatchdogState::Stalled | WatchdogState::SlowIo
+            )
         {
             write_json_atomic(marker, &record)?;
         }
@@ -503,7 +757,10 @@ fn availability_status(state: WatchdogState) -> dit_system::availability::Availa
     match state {
         WatchdogState::Starting | WatchdogState::Running => A::Running,
         WatchdogState::Passed => A::Completed,
-        WatchdogState::Stalled | WatchdogState::StalledKilled => A::Stalled,
+        WatchdogState::Stalled
+        | WatchdogState::StalledKilled
+        | WatchdogState::SlowIo
+        | WatchdogState::StartupStalled => A::Stalled,
         WatchdogState::WorkerSignaled | WatchdogState::MemoryGuard => A::Interrupted,
         WatchdogState::WorkerFailed | WatchdogState::OomKilled => A::WorkerFailed,
     }
@@ -626,6 +883,8 @@ fn state_label(state: WatchdogState) -> &'static str {
         WatchdogState::OomKilled => "OOM_KILLED",
         WatchdogState::StalledKilled => "STALLED_KILLED",
         WatchdogState::MemoryGuard => "MEMORY_GUARD",
+        WatchdogState::SlowIo => "SLOW_IO",
+        WatchdogState::StartupStalled => "STARTUP_STALLED",
     }
 }
 

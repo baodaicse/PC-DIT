@@ -11,7 +11,7 @@ dit-contracts = { path = "../dit-contracts" }
 dit-core = { path = "../dit-core" }
 hex.workspace = true
 memmap2.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -59,7 +59,7 @@ grep -Fq 'mount -t pstore pstore /sys/fs/pstore' "$RUNNER"
 # FC2: tests run in their own memory cgroups under a delegated service cgroup.
 grep -Fxq 'Delegate=yes' "$SERVICE"
 grep -Fq 'export DIT_TEST_CGROUP="$service/tests"' "$RUNNER"
-grep -Fq '[[ "$module" == cpu-ram ]] && watchdog_marker+=(--memory-guard)' "$UI"
+grep -Fq '[[ "$module" == cpu-ram ]] && watchdog_marker+=(--memory-guard --startup-deadline-seconds 300)' "$UI"
 grep -Fq 'udevadm settle --timeout=5' "$DRIVER_PROBE"
 grep -Fq 'timeout --foreground --signal=TERM --kill-after=1s 5s' "$DRIVER_PROBE"
 grep -Fq 'systemd-detect-virt --quiet' "$RUNNER"

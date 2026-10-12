@@ -21,12 +21,15 @@
 | `OOM_KILLED` | cgroup memory controller ghi nhận OOM kill trong run. |
 | `STALLED_KILLED` | Đã có heartbeat/activity, sau đó hết cập nhật qua stale + grace window. |
 | `MEMORY_GUARD` | Chốt chặn bộ nhớ (`--memory-guard`, lớp CPU-RAM) dừng worker trước khi máy nghẹt RAM: áp lực bộ nhớ full ≥ 20 % (avg10) hoặc còn dưới 256 MiB trống trong 5 giây liên tiếp. Phiên INVALID `memory_guard`, không phải lỗi phần cứng. |
+| `SLOW_IO` | Không có tiến độ quá ngưỡng stale nhưng tiến trình của worker vẫn làm I/O (lớp SSD: cả thời gian CPU, vì kernel làm việc thay nó, ví dụ lấp số 0 trên NTFS): chậm, không phải treo; chỉ kết thúc khi quá `--slow-io-limit-seconds` (mặc định 1800 s). |
+| `STARTUP_STALLED` | Không có dấu hiệu sống nào trong `--startup-deadline-seconds` (300 s cho lớp COMBINED và CPU-RAM, các lần chạy không có màn chọn). |
 | `STARTING` / `RUNNING` / `STALLED` trên partition bền ở boot kế | Mất nguồn, reset, kernel panic hoặc supervisor không kịp đóng record; **không phải PASS**. Hậu kiểm lúc boot (`dit-blackbox post-mortem`, FC3b) ghi result của phiên từ nhật ký hộp đen rồi đổi marker sang `CLOSED_AT_BOOT`. |
 
 ## Cgroup và mã thoát (FC2)
 
 - Trong image, `cpu-dit.service` có `Delegate=yes`; boot runner tách cgroup của service thành `app/` (control center, watchdog; `memory.min` 256 MiB) và `tests/` (`memory.max` = RAM tổng − 1 GiB). Watchdog tạo cho mỗi worker một cgroup riêng dưới `tests/` (`DIT_TEST_CGROUP` hoặc `--cgroup-parent`), nên test vượt RAM bị kernel kết thúc thay vì làm cả máy đứng, và bộ đếm `oom_kill` là của riêng worker đó. Không có cgroup v2 được ủy quyền thì worker chạy như trước.
-- Mã thoát của watchdog: mã của chính worker khi nó tự thoát (0 PASS, 2 FAIL, 3 INVALID với các engine); 124 treo bị kill; 125 chốt chặn bộ nhớ; 126 OOM; 130 người vận hành dừng; 128 + n khi worker chết vì signal n (139 SIGSEGV, 135 SIGBUS, 132 SIGILL). Trước đây mọi kết thúc không PASS đều là 2, nên UI CPU-RAM hiện nhầm thành FAIL.
+- FC4: trước khi kết luận treo, watchdog xem nhóm tiến trình của worker (bộ đếm `/proc/<pid>/io`, thời gian CPU với lớp SSD, số tiến trình ở trạng thái D) và log kernel về I/O từ lúc worker chạy. Bằng chứng nằm trong `watchdog-final.json` (`liveness`, `progress_age_seconds`). Từ 30 s không tiến độ, `watchdog-status.json` được ghi lại mỗi 5 s để app hiện cảnh báo. Worker không chết sau SIGKILL (kẹt trong kernel) không còn làm watchdog treo theo: chờ 10 s rồi vẫn ghi bản ghi cuối, kèm ghi chú.
+- Mã thoát của watchdog: mã của chính worker khi nó tự thoát (0 PASS, 2 FAIL, 3 INVALID với các engine); 123 không có dấu hiệu sống; 124 treo bị kill; 125 chốt chặn bộ nhớ; 126 OOM; 130 người vận hành dừng; 128 + n khi worker chết vì signal n (139 SIGSEGV, 135 SIGBUS, 132 SIGILL). Trước đây mọi kết thúc không PASS đều là 2, nên UI CPU-RAM hiện nhầm thành FAIL.
 
 ## Giới hạn cố ý
 
