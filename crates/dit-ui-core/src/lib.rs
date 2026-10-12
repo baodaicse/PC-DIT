@@ -1210,13 +1210,14 @@ mod tests {
         }
         let plain = state.render(size, false);
         if unicode_terminal() {
-            // Same geometry: the same characters per line, the frame drawn with box characters.
+            // Same geometry: the same characters per line, the frame drawn with box characters
+            // and the big verdict's pixels with full blocks.
             let lines: Vec<String> = plain.lines().map(str::to_owned).collect();
             let boxed: Vec<String> = boxify(&lines)
                 .into_iter()
                 .map(|row| row.into_iter().collect())
                 .collect();
-            assert_eq!(stripped, boxed.join("\n"));
+            assert_eq!(stripped.replace('\u{2588}', "#"), boxed.join("\n"));
             for (a, b) in stripped.lines().zip(plain.lines()) {
                 assert_eq!(a.chars().count(), b.chars().count());
             }

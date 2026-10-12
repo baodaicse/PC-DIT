@@ -90,32 +90,207 @@ pub fn render_unified_dashboard(
             render_compact(dashboard, width, spaced)
         }
     };
-    // Blank rows between groups when the screen has room for them; packed otherwise.
-    let mut lines = layout(true);
-    if lines.len() > height {
-        lines = layout(false);
-    }
+    // The verdict in big letters at the bottom of the TESTING panel, to be read from across the
+    // room: as big as the spare rows allow, the blank rows between groups given up for it first.
+    let banner = banner_word(dashboard).map(|word| (word, failed_parts(dashboard)));
+    let inner = width.saturating_sub(4);
+    let chosen = banner.as_ref().and_then(|(word, parts)| {
+        [(3, true), (2, true), (2, false), (1, true), (1, false)]
+            .into_iter()
+            .find_map(|(scale, spaced)| {
+                let art = big_word(word, scale)?;
+                let lines = layout(spaced);
+                let block = 1 + art.len() + parts.len();
+                (art[0].len() <= inner && lines.len() + block <= height).then_some((lines, art))
+            })
+    });
+    // The big verdict's rows (art and parts, after a blank row) and colour; they sit right above
+    // the footer and the closing border.
+    let mut banner_rows = None;
+    let mut lines = if let (Some((mut lines, art)), Some((word, parts))) = (chosen, &banner) {
+        let footer_at = lines.len() - 2;
+        let block: Vec<String> = std::iter::once(String::new())
+            .chain(art)
+            .chain(parts.iter().cloned())
+            .map(|row| full_row(&centred(&row, inner), width))
+            .collect();
+        banner_rows = Some((block.len() - 1, verdict_color(word)));
+        lines.splice(footer_at..footer_at, block);
+        lines
+    } else {
+        // Blank rows between groups when the screen has room for them; packed otherwise.
+        let lines = layout(true);
+        if lines.len() > height {
+            layout(false)
+        } else {
+            lines
+        }
+    };
     if lines.len() > height {
         lines.truncate(height.saturating_sub(2));
         lines.push(full_row(&dashboard.footer, width));
         lines.push(border("", width));
     } else {
+        // Spare rows go above the big verdict, which stays on the panel's last rows.
+        let below = banner_rows.map_or(0, |(rows, _)| rows + 1);
         while lines.len() < height {
-            let insert_at = lines.len().saturating_sub(2);
+            let insert_at = lines.len().saturating_sub(2 + below);
             lines.insert(insert_at, full_row("", width));
         }
     }
     debug_assert!(lines.len() <= height);
+    let banner_rows = banner_rows.map(|(rows, color)| (lines.len() - 2 - rows, rows, color));
     if color {
         paint(
             &lines,
             dashboard.failures,
             &dashboard.footer,
             unicode_terminal(),
+            banner_rows,
         )
     } else {
         lines.join("\n")
     }
+}
+
+/// Five-row glyphs of the verdict words, `#` a pixel.
+fn glyph(letter: char) -> Option<[&'static str; 5]> {
+    Some(match letter {
+        'P' => ["####.", "#...#", "####.", "#....", "#...."],
+        'A' => [".###.", "#...#", "#####", "#...#", "#...#"],
+        'S' => [".####", "#....", ".###.", "....#", "####."],
+        'F' => ["#####", "#....", "####.", "#....", "#...."],
+        'I' => ["###", ".#.", ".#.", ".#.", "###"],
+        'L' => ["#...", "#...", "#...", "#...", "####"],
+        'N' => ["#...#", "##..#", "#.#.#", "#..##", "#...#"],
+        'V' => ["#...#", "#...#", "#...#", ".#.#.", "..#.."],
+        'D' => ["####.", "#...#", "#...#", "#...#", "####."],
+        _ => return None,
+    })
+}
+
+/// `word` in big letters: each pixel `scale` rows high and twice as many columns wide (a console
+/// cell is about twice as high as it is wide), one pixel between letters.
+fn big_word(word: &str, scale: usize) -> Option<Vec<String>> {
+    let glyphs = word.chars().map(glyph).collect::<Option<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    for row in 0..5 {
+        let pixels = glyphs
+            .iter()
+            .map(|glyph| glyph[row])
+            .collect::<Vec<_>>()
+            .join(".");
+        let wide: String = pixels
+            .chars()
+            .flat_map(|pixel| std::iter::repeat_n(if pixel == '#' { '#' } else { ' ' }, 2 * scale))
+            .collect();
+        rows.extend(std::iter::repeat_n(wide, scale));
+    }
+    Some(rows)
+}
+
+/// The word the screen shows in big letters: the verdict once a result is on the screen (its
+/// `RESULT: <VERDICT>` row; none for a verdict without glyphs), else FAIL from the first failure
+/// counted and PASS before it.
+fn banner_word(dashboard: &UnifiedDashboard) -> Option<&'static str> {
+    if let Some(row) = dashboard
+        .running_rows
+        .iter()
+        .find(|row| row.starts_with("RESULT: "))
+    {
+        let verdict = row["RESULT: ".len()..].split_whitespace().next()?;
+        return ["PASS", "FAIL", "INVALID"]
+            .into_iter()
+            .find(|word| verdict.eq_ignore_ascii_case(word));
+    }
+    Some(if dashboard.failures > 0 {
+        "FAIL"
+    } else {
+        "PASS"
+    })
+}
+
+fn verdict_color(word: &str) -> &'static str {
+    match word {
+        "PASS" => GREEN,
+        "FAIL" => RED,
+        _ => YELLOW,
+    }
+}
+
+/// On a result screen, one row per part of `FAIL BY PART` with failures, followed by the device
+/// the hardware panel names for it: `RAM 1 (1 susp)  -  64 GiB total`.
+fn failed_parts(dashboard: &UnifiedDashboard) -> Vec<String> {
+    if !dashboard
+        .running_rows
+        .iter()
+        .any(|row| row.starts_with("RESULT: "))
+    {
+        return Vec::new();
+    }
+    let Some(row) = dashboard
+        .running_rows
+        .iter()
+        .find_map(|row| row.strip_prefix("FAIL BY PART"))
+    else {
+        return Vec::new();
+    };
+    row.split(" | ")
+        .map(str::trim)
+        .filter(|part| {
+            part.split_whitespace()
+                .find_map(|token| token.parse::<u64>().ok())
+                .is_some_and(|count| count > 0)
+        })
+        .map(|part| match device_of(part, &dashboard.hardware_rows) {
+            Some(device) => format!("{part}  -  {device}"),
+            None => part.to_owned(),
+        })
+        .collect()
+}
+
+/// The device a `FAIL BY PART` cell is on, from the hardware rows (`CPU:`, `RAM:`, `GPU 2:` or a
+/// single `GPU:`, `SSD 1:`). An unresolved group (`? PCIe-GPU1|GPU1|VRAM1`) is on its first
+/// part's device; PLATFORM is on none.
+fn device_of(part: &str, hardware_rows: &[String]) -> Option<String> {
+    let name = part
+        .split_whitespace()
+        .find(|token| *token != "?")?
+        .split('|')
+        .next()?;
+    let name = name.strip_prefix("PCIe-").unwrap_or(name);
+    let number = |prefix: &str| -> Option<String> {
+        let digits: String = name
+            .strip_prefix(prefix)?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!digits.is_empty()).then_some(digits)
+    };
+    let labels = if name == "CPU" || name == "RAM" {
+        vec![format!("{name}:")]
+    } else if let Some(n) = number("GPU").or_else(|| number("VRAM")) {
+        let mut labels = vec![format!("GPU {n}:")];
+        if n == "1" {
+            labels.push("GPU:".to_owned());
+        }
+        labels
+    } else {
+        vec![format!("SSD {}:", number("SSD")?)]
+    };
+    hardware_rows.iter().find_map(|row| {
+        labels
+            .iter()
+            .find_map(|label| row.strip_prefix(label.as_str()))
+            .map(|device| device.trim().to_owned())
+            .filter(|device| !device.is_empty())
+    })
+}
+
+/// `text` centred in `width` columns (left-aligned when it does not fit).
+fn centred(text: &str, width: usize) -> String {
+    let pad = width.saturating_sub(text.chars().count()) / 2;
+    format!("{}{text}", " ".repeat(pad))
 }
 
 /// Meter rows of the live panel: each meter and its detail, a blank row between meters when
@@ -678,7 +853,7 @@ pub fn boxify(lines: &[String]) -> Vec<Vec<char>> {
 #[must_use]
 pub fn decorate(frame: &str) -> String {
     let lines: Vec<String> = frame.lines().map(str::to_owned).collect();
-    paint(&lines, 0, "", unicode_terminal())
+    paint(&lines, 0, "", unicode_terminal(), None)
 }
 
 /// A device's own load (CPU, RAM, GPU, VRAM): its bar turns orange from 70 % and red from 90 %.
@@ -734,7 +909,16 @@ fn title_line(index: usize, line: &str) -> bool {
     index <= 2 && (line.contains("DATA INTEGRITY TEST ENGINE") || line.contains(" // "))
 }
 
-fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String {
+/// `banner`: the big verdict's rows (first row, row count) and colour: its pixels are solid
+/// blocks, its text (the failed parts) in the same colour.
+#[allow(clippy::too_many_lines)]
+fn paint(
+    lines: &[String],
+    failures: u64,
+    footer: &str,
+    unicode: bool,
+    banner: Option<(usize, usize, &'static str)>,
+) -> String {
     let linux = linux_console();
     let footer_key: String = footer.chars().take(24).collect();
     let shown: Vec<Vec<char>> = if unicode {
@@ -756,41 +940,46 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
                 || line.contains("RESULT: ");
             let is_footer = !footer_key.is_empty() && line.contains(&footer_key);
             let overrides = part_colors(line);
+            let banner_color = banner
+                .filter(|&(first, rows, _)| row >= first && row < first + rows)
+                .map(|(_, _, color)| color);
             // A line is red for its own count, not for the run's: one layer's FAIL does not
             // turn the others red. A bare verdict word still follows the run's total.
-            let text_color =
-                if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer)) {
-                    RED
-                } else if line.contains("[NO ROOM]") {
-                    // A setup option the hardware has no room for (an SSD write level).
-                    RED
-                } else if line.contains("[FITS]") {
-                    GREEN
-                } else if line.contains("[CHECKED AT START]") {
-                    YELLOW
-                } else if line.contains("RESULT: ") {
-                    // The verdict is its badge; the rest of the row stays plain.
-                    "\x1b[37m"
-                } else if line.contains("REPORT ABI") {
-                    // The engine line names the temperature limit; it is a heading, not a warning.
-                    CYAN
-                } else if line.contains("PASS") {
-                    GREEN
-                } else if line.contains("INVALID")
-                    || line.contains("ABORTED")
-                    || line.contains("TEMP LIMIT")
-                    || line.contains("! THROTTLE")
-                {
-                    YELLOW
-                } else if line.contains("ENGINE")
-                    || line.contains("SYSTEM HARDWARE")
-                    || line.contains("LIVE UTILIZATION")
-                    || line.contains("TESTING / PROCESS")
-                {
-                    CYAN
-                } else {
-                    "\x1b[37m"
-                };
+            let text_color = if let Some(color) = banner_color {
+                color
+            } else if !by_part && (counter_above_zero || (bare_fail && failures > 0 && !is_footer))
+            {
+                RED
+            } else if line.contains("[NO ROOM]") {
+                // A setup option the hardware has no room for (an SSD write level).
+                RED
+            } else if line.contains("[FITS]") {
+                GREEN
+            } else if line.contains("[CHECKED AT START]") {
+                YELLOW
+            } else if line.contains("RESULT: ") {
+                // The verdict is its badge; the rest of the row stays plain.
+                "\x1b[37m"
+            } else if line.contains("REPORT ABI") {
+                // The engine line names the temperature limit; it is a heading, not a warning.
+                CYAN
+            } else if line.contains("PASS") {
+                GREEN
+            } else if line.contains("INVALID")
+                || line.contains("ABORTED")
+                || line.contains("TEMP LIMIT")
+                || line.contains("! THROTTLE")
+            {
+                YELLOW
+            } else if line.contains("ENGINE")
+                || line.contains("SYSTEM HARDWARE")
+                || line.contains("LIVE UTILIZATION")
+                || line.contains("TESTING / PROCESS")
+            {
+                CYAN
+            } else {
+                "\x1b[37m"
+            };
             let mut result = String::new();
             let mut previous_color = "";
             let chars: Vec<char> = line.chars().collect();
@@ -835,7 +1024,12 @@ fn paint(lines: &[String], failures: u64, footer: &str, unicode: bool) -> String
                     result.push_str(current);
                     previous_color = current;
                 }
-                result.push(shown.get(index).copied().unwrap_or(character));
+                result.push(if banner_color.is_some() && character == '#' && unicode {
+                    // A pixel of the big verdict: a full block.
+                    '\u{2588}'
+                } else {
+                    shown.get(index).copied().unwrap_or(character)
+                });
             }
             result.push_str(RESET);
             result
@@ -951,6 +1145,162 @@ mod tests {
         assert!(line("FAIL TOTAL").contains(RED));
     }
 
+    /// The content of a framed row, without the frame.
+    fn inside(line: &str) -> &str {
+        line.trim_start_matches('|')
+            .trim_end_matches('|')
+            .trim_end()
+    }
+
+    /// PASS until a failure is counted, then FAIL: in big letters on the TESTING panel's last
+    /// rows, right above the footer, centred, as big as the spare rows allow.
+    #[test]
+    fn big_verdict_sits_at_the_bottom_of_the_testing_panel() {
+        let size = TerminalSize {
+            cols: 160,
+            rows: 50,
+        };
+        for (failures, word, color) in [(0, "PASS", GREEN), (1, "FAIL", RED)] {
+            let mut dashboard = model();
+            dashboard.failures = failures;
+            let frame = render_unified_dashboard(&dashboard, size, false);
+            let lines: Vec<&str> = frame.lines().collect();
+            let art = big_word(word, 3).expect("glyphs");
+            let footer = lines.len() - 2;
+            assert!(lines[footer].contains("TEMP LIMIT OFF"));
+            for (offset, row) in art.iter().enumerate() {
+                let line = lines[footer - art.len() + offset];
+                assert_eq!(inside(line).trim(), row.trim(), "{word} row {offset}");
+            }
+            // Centred as a block: as much room on its left as on its right.
+            let block = &lines[footer - art.len()..footer];
+            let room = |side: fn(&str) -> &str| {
+                block
+                    .iter()
+                    .map(|line| {
+                        let content = &line[1..line.len() - 1];
+                        content.len() - side(content).len()
+                    })
+                    .min()
+                    .unwrap_or(0)
+            };
+            let (left, right) = (room(str::trim_start), room(str::trim_end));
+            assert!(left.abs_diff(right) <= 1, "{left} / {right}");
+            let painted = render_unified_dashboard(&dashboard, size, true);
+            let pixel = if unicode_terminal() { "\u{2588}" } else { "#" };
+            assert!(
+                painted
+                    .lines()
+                    .nth(footer - 1)
+                    .is_some_and(|line| line.contains(&format!("{color} ")) && line.contains(pixel)),
+                "{word} in its colour"
+            );
+        }
+        // A smaller screen gets smaller letters.
+        let small = TerminalSize { cols: 90, rows: 34 };
+        let frame = render_unified_dashboard(&model(), small, false);
+        let art = big_word("PASS", 1).expect("glyphs");
+        let lines: Vec<&str> = frame.lines().collect();
+        assert_eq!(inside(lines[lines.len() - 3]).trim(), art[4].trim());
+    }
+
+    /// No spare rows for the letters: the screen is drawn as before, the badge of the state row
+    /// still says it.
+    #[test]
+    fn no_big_verdict_without_room() {
+        let mut dashboard = model();
+        dashboard.running_rows = (0..12).map(|i| format!("ROW {i}")).collect();
+        let size = TerminalSize { cols: 90, rows: 24 };
+        let frame = render_unified_dashboard(&dashboard, size, false);
+        assert!(frame.lines().count() < 24);
+        let art = |line: &str| {
+            let content = inside(line).trim();
+            !content.is_empty() && content.chars().all(|c| c == '#' || c == ' ')
+        };
+        assert!(!frame.lines().any(art), "{frame}");
+    }
+
+    /// A result screen: the verdict in big letters, then each part that failed with the device
+    /// the hardware panel names for it; parts without failures are not listed.
+    #[test]
+    fn result_lists_the_failed_parts_under_the_big_verdict() {
+        let mut dashboard = model();
+        dashboard.hardware_rows = vec![
+            "CPU:     AMD Ryzen 9 9950X".to_owned(),
+            "RAM:     64 GiB total".to_owned(),
+            "GPU 1:   NVIDIA GeForce RTX 5080 [0000:01:00.0]".to_owned(),
+            "SSD 1:   Samsung SSD 990 PRO 1TB".to_owned(),
+        ];
+        dashboard.failures = 4;
+        let rows = [
+            "RESULT: FAIL    COMBINED DEEP".to_owned(),
+            "FAIL BY PART  CPU 0 | RAM 1 (1 susp) | ? PCIe-GPU1|GPU1|VRAM1 2 | SSD1-path 1 | PLATFORM 1"
+                .to_owned(),
+        ];
+        let size = TerminalSize {
+            cols: 160,
+            rows: 50,
+        };
+        let frame = render_result_frame(&dashboard, &rows, "Enter: menu", size, false);
+        let lines: Vec<&str> = frame.lines().collect();
+        let footer = lines.len() - 2;
+        let listed: Vec<&str> = lines[footer - 4..footer]
+            .iter()
+            .map(|line| inside(line).trim())
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "RAM 1 (1 susp)  -  64 GiB total",
+                "? PCIe-GPU1|GPU1|VRAM1 2  -  NVIDIA GeForce RTX 5080 [0000:01:00.0]",
+                "SSD1-path 1  -  Samsung SSD 990 PRO 1TB",
+                "PLATFORM 1",
+            ]
+        );
+        let art = big_word("FAIL", 3).expect("glyphs");
+        assert_eq!(inside(lines[footer - 5]).trim(), art[14].trim());
+        let painted = render_result_frame(&dashboard, &rows, "Enter: menu", size, true);
+        assert!(
+            painted
+                .lines()
+                .nth(footer - 4)
+                .is_some_and(|line| line.contains(&format!("{RED} "))),
+            "the failed parts are red"
+        );
+        // An INVALID result: the word in yellow, no part listed.
+        let rows = ["RESULT: INVALID    stopped by the operator".to_owned()];
+        let frame = render_result_frame(&model(), &rows, "Enter: menu", size, false);
+        let art = big_word("INVALID", 2).expect("glyphs");
+        let lines: Vec<&str> = frame.lines().collect();
+        assert_eq!(inside(lines[lines.len() - 3]).trim(), art[9].trim());
+    }
+
+    #[test]
+    fn failed_parts_are_found_on_their_devices() {
+        let rows = vec![
+            "GPU:     NVIDIA GeForce GTX 1050 Ti".to_owned(),
+            "SSD 2:   Lexar NM610 PRO".to_owned(),
+        ];
+        assert_eq!(
+            device_of("VRAM1 3 (3 susp)", &rows).as_deref(),
+            Some("NVIDIA GeForce GTX 1050 Ti")
+        );
+        assert_eq!(
+            device_of("PCIe-GPU1 1", &rows).as_deref(),
+            Some("NVIDIA GeForce GTX 1050 Ti")
+        );
+        assert_eq!(
+            device_of("SSD2-path 1", &rows).as_deref(),
+            Some("Lexar NM610 PRO")
+        );
+        assert_eq!(
+            device_of("? SSD2|SSD2-path 1", &rows).as_deref(),
+            Some("Lexar NM610 PRO")
+        );
+        assert_eq!(device_of("GPU2 1", &rows), None);
+        assert_eq!(device_of("PLATFORM 1", &rows), None);
+    }
+
     fn model() -> UnifiedDashboard {
         UnifiedDashboard {
             engine: "TEST-1".to_owned(),
@@ -1061,7 +1411,13 @@ mod tests {
     /// reset, so a bar's fill and the text after the bar keep their normal intensity.
     #[test]
     fn colours_after_grey_start_from_a_reset() {
-        let painted = paint(&["| CPU USAGE [#####-----] 50% |".to_owned()], 0, "", false);
+        let painted = paint(
+            &["| CPU USAGE [#####-----] 50% |".to_owned()],
+            0,
+            "",
+            false,
+            None,
+        );
         assert!(painted.contains(GRAY));
         for (at, _) in painted.match_indices(GRAY) {
             let after = &painted[at + GRAY.len()..];
@@ -1075,7 +1431,7 @@ mod tests {
     #[test]
     fn setup_options_are_coloured_by_their_fit() {
         let colour = |text: &str| {
-            let painted = paint(&[format!("| {text} |")], 0, "", false);
+            let painted = paint(&[format!("| {text} |")], 0, "", false, None);
             [GREEN, RED, YELLOW]
                 .into_iter()
                 .find(|code| painted.contains(&format!("{code} S) Standard")))
@@ -1096,7 +1452,7 @@ mod tests {
     #[test]
     fn throttle_parts_are_coloured_per_device() {
         let line = "| THROTTLE      CPU 0 | GPU1 3 (42 s) | SSD1 N/A |".to_owned();
-        let painted = paint(&[line], 0, "", false);
+        let painted = paint(&[line], 0, "", false, None);
         assert!(
             painted.contains(&format!("{YELLOW}GPU1 3 (42 s)")),
             "{painted:?}"
@@ -1109,7 +1465,7 @@ mod tests {
     #[test]
     fn a_throttle_alert_opens_with_a_badge() {
         let line = "| ! THROTTLE CPU +1 at 00:12:31 - it slowed itself down |".to_owned();
-        let painted = paint(&[line], 0, "", false);
+        let painted = paint(&[line], 0, "", false, None);
         assert!(
             painted.contains(&format!("{BADGE_WARN}! THROTTLE")),
             "{painted:?}"
