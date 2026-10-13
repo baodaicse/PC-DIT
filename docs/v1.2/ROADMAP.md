@@ -179,8 +179,24 @@ Deep: Baseline → [A] → Chain → Chạy chồng → [B] → Nghỉ → Đọ
 | i9-14900K, Ultra 9 285K | 8 P + 4 cụm E = 12 | 20 s | 40 s |
 | Ryzen 9 9950X | 16 | 15 s | 30 s |
 
-**Test CPU riêng (chờ xác nhận).** Chỉ có A. Đề xuất: chỉ ở mức Full, đặt đầu phiên (máy mát),
-ngân sách khoảng 20% thời lượng, theo cùng cách chia ở trên.
+**Menu [1] CPU + RAM (đã chốt 2026-10-13).**
+
+- **Full (30 phút):** A đặt đầu phiên (máy mát), ngân sách khoảng 20%, tức 6 phút. Phần RAM còn
+  24 phút. Sau C1 phần RAM nhanh gấp khoảng 10 lần, nên số vòng kiểm RAM vẫn cao hơn nhiều so với
+  30 phút hiện nay.
+- **Safe (120 s):** không xoay.
+
+| CPU (Full) | Số bước | A mỗi bước |
+|---|---|---|
+| Ryzen 5 7500F | 6 | 60 s |
+| i5-14400F | 7 | 51 s |
+| i9-14900K, Ultra 9 285K | 12 | 30 s |
+| Ryzen 9 9950X | 16 | 22 s |
+
+**Menu [4] CPU AVAIL / POWER: power-sweep giữ nguyên (đã chốt 2026-10-13).** Power-sweep đã chạy
+từng CPU một, nhưng mục đích khác: burst 100 ms xen nghỉ 500 ms để thử sụt áp khi tải nhảy đột
+ngột, không giữ lõi ở xung đỉnh, không ghi xung thực tế. Nó bắt một loại lỗi khác nên giữ nguyên.
+Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay thế nó.
 
 **Bằng chứng và ghi lỗi.**
 
@@ -219,8 +235,9 @@ ngân sách khoảng 20% thời lượng, theo cùng cách chia ở trên.
 | C2 | Tự đo đầu phiên, chia theo loại lõi | chờ xác nhận |
 | C4 | Tự chọn mặc định, `dit_isa=` ẩn cho kỹ thuật viên | chờ xác nhận |
 | C6 combined | Deep: A+B, ngân sách cố định khoảng 20% (12 phút) lấy từ pha chạy chồng; Bounded: không xoay; Soak: mỗi chu kỳ một lượt A+B; E-core xoay theo cụm | đã chốt (2026-10-13) |
-| C6 boost | Bước không đạt boost ghi NOTE, không tính FAIL | chờ xác nhận |
-| C6 test CPU riêng | Chỉ A; mức Full; đầu phiên; khoảng 20% thời lượng | chờ xác nhận |
+| C6 boost | Bước không đạt gần xung tối đa ghi NOTE "không đạt boost", không tính FAIL | đã chốt (2026-10-13) |
+| C6 menu [1] CPU + RAM | Full: A đầu phiên, khoảng 6 phút trong 30 phút; Safe: không xoay | đã chốt (2026-10-13) |
+| C6 menu [4] | Power-sweep giữ nguyên | đã chốt (2026-10-13) |
 | V0b | Version trong report và CSV | chờ xác nhận |
 
 ## Thứ tự triển khai
