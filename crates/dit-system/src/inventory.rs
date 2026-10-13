@@ -25,6 +25,29 @@ pub struct CpuThread {
     pub core_id: i32,
     pub numa_node: Option<u32>,
     pub allowed: bool,
+    /// Performance or efficient core of a hybrid CPU (Intel P/E cores), uniform otherwise (and in
+    /// reports written before v1.2.008).
+    #[serde(default)]
+    pub core_kind: CoreKind,
+    /// 0 for the first hardware thread of its physical core, 1 for its SMT sibling.
+    #[serde(default)]
+    pub smt_rank: usize,
+    /// The L3 cache this thread shares (`cache/index3/id`): one per CCD/CCX on AMD.
+    #[serde(default)]
+    pub l3_id: Option<u32>,
+}
+
+/// The kind of core a hardware thread runs on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreKind {
+    /// Every core of the CPU is of the same kind.
+    #[default]
+    Uniform,
+    /// A performance core of a hybrid CPU (Intel P-core, `/sys/devices/cpu_core`).
+    Performance,
+    /// An efficient core of a hybrid CPU (Intel E-core, `/sys/devices/cpu_atom`).
+    Efficient,
 }
 
 #[allow(clippy::struct_excessive_bools)] // Capability bits are independent evidence fields.
@@ -129,6 +152,7 @@ fn collect_cpu(numa_nodes: &[NumaNode]) -> Result<CpuInventory, SystemDitError> 
     let model_name = first_cpuinfo_value(&cpuinfo, "model name").unwrap_or_default();
     let online = parse_cpu_list(&read_trimmed("/sys/devices/system/cpu/online")?);
     let allowed = parse_allowed_cpus().unwrap_or_else(|| online.clone());
+    let hybrid = HybridCores::read();
     let mut physical_cores = BTreeSet::new();
     let mut threads = Vec::new();
     for cpu_id in online.iter().copied() {
@@ -146,12 +170,22 @@ fn collect_cpu(numa_nodes: &[NumaNode]) -> Result<CpuInventory, SystemDitError> 
             .iter()
             .find(|node| node.cpu_ids.contains(&cpu_id))
             .map(|node| node.node_id);
+        let siblings = read_trimmed(format!("{topology_root}/thread_siblings_list"))
+            .map_or_else(|_| vec![cpu_id], |text| parse_cpu_list(&text));
+        let l3_id = read_trimmed(format!(
+            "/sys/devices/system/cpu/cpu{cpu_id}/cache/index3/id"
+        ))
+        .ok()
+        .and_then(|value| value.parse().ok());
         threads.push(CpuThread {
             cpu_id,
             package_id,
             core_id,
             numa_node,
             allowed: allowed.contains(&cpu_id),
+            core_kind: hybrid.kind(cpu_id),
+            smt_rank: smt_rank(cpu_id, &siblings),
+            l3_id,
         });
     }
 
@@ -168,6 +202,42 @@ fn collect_cpu(numa_nodes: &[NumaNode]) -> Result<CpuInventory, SystemDitError> 
         sse4_2: detect_x86_feature("sse4.2"),
         threads,
     })
+}
+
+/// Linux lists the cores of a hybrid Intel CPU under two PMUs: `cpu_core` (P-cores) and
+/// `cpu_atom` (E-cores). Neither exists on a CPU whose cores are all alike.
+struct HybridCores {
+    performance: Vec<usize>,
+    efficient: Vec<usize>,
+}
+
+impl HybridCores {
+    fn read() -> Self {
+        let list = |path: &str| {
+            fs::read_to_string(path).map_or_else(|_| Vec::new(), |text| parse_cpu_list(&text))
+        };
+        Self {
+            performance: list("/sys/devices/cpu_core/cpus"),
+            efficient: list("/sys/devices/cpu_atom/cpus"),
+        }
+    }
+
+    fn kind(&self, cpu_id: usize) -> CoreKind {
+        if self.performance.is_empty() || self.efficient.is_empty() {
+            CoreKind::Uniform
+        } else if self.efficient.contains(&cpu_id) {
+            CoreKind::Efficient
+        } else if self.performance.contains(&cpu_id) {
+            CoreKind::Performance
+        } else {
+            CoreKind::Uniform
+        }
+    }
+}
+
+/// The position of `cpu_id` among the hardware threads of its core (`thread_siblings_list`).
+fn smt_rank(cpu_id: usize, siblings: &[usize]) -> usize {
+    siblings.iter().filter(|&&sibling| sibling < cpu_id).count()
 }
 
 fn collect_numa_nodes() -> Vec<NumaNode> {
@@ -299,7 +369,28 @@ const fn detect_x86_feature(_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cpu_list, parse_meminfo_bytes};
+    use super::{CoreKind, HybridCores, parse_cpu_list, parse_meminfo_bytes, smt_rank};
+
+    #[test]
+    fn core_kinds_and_smt_ranks_follow_sysfs() {
+        // i9-14900K: eight P-cores with two threads each (0-15), sixteen E-cores (16-31).
+        let hybrid = HybridCores {
+            performance: parse_cpu_list("0-15"),
+            efficient: parse_cpu_list("16-31"),
+        };
+        assert_eq!(hybrid.kind(3), CoreKind::Performance);
+        assert_eq!(hybrid.kind(24), CoreKind::Efficient);
+        let uniform = HybridCores {
+            performance: Vec::new(),
+            efficient: Vec::new(),
+        };
+        assert_eq!(uniform.kind(3), CoreKind::Uniform);
+        // Siblings next to each other (Intel) or a core count apart (AMD).
+        assert_eq!(smt_rank(0, &[0, 1]), 0);
+        assert_eq!(smt_rank(1, &[0, 1]), 1);
+        assert_eq!(smt_rank(24, &[8, 24]), 1);
+        assert_eq!(smt_rank(20, &[20]), 0);
+    }
 
     #[test]
     fn parses_cpu_ranges() {

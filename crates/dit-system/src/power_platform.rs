@@ -1104,6 +1104,9 @@ mod tests {
                 core_id: 1,
                 numa_node: None,
                 allowed: true,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
             crate::CpuThread {
                 cpu_id: 7,
@@ -1111,6 +1114,9 @@ mod tests {
                 core_id: 1,
                 numa_node: None,
                 allowed: true,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
             crate::CpuThread {
                 cpu_id: 9,
@@ -1118,6 +1124,9 @@ mod tests {
                 core_id: 1,
                 numa_node: None,
                 allowed: true,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
             crate::CpuThread {
                 cpu_id: 12,
@@ -1125,6 +1134,9 @@ mod tests {
                 core_id: 1,
                 numa_node: None,
                 allowed: false,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
         ];
         let steps = campaign_steps(&[3, 7, 9], &topology);
@@ -1385,6 +1397,9 @@ mod tests {
                 core_id: 1,
                 numa_node: None,
                 allowed: true,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
             crate::CpuThread {
                 cpu_id: 7,
@@ -1392,6 +1407,9 @@ mod tests {
                 core_id: 1,
                 numa_node: None,
                 allowed: true,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
             crate::CpuThread {
                 cpu_id: 9,
@@ -1399,6 +1417,9 @@ mod tests {
                 core_id: 2,
                 numa_node: None,
                 allowed: true,
+                core_kind: crate::CoreKind::Uniform,
+                smt_rank: 0,
+                l3_id: None,
             },
         ];
         assert_eq!(

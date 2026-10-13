@@ -41,6 +41,11 @@ pub struct SystemConfigEvidence {
     /// reports written before v1.2.006, which hashed every round.
     #[serde(default = "every_round")]
     pub content_hash_every_rounds: u32,
+    /// How workers were placed on CPUs (`CPU-DIT-PLACEMENT-v1`: compute on whole performance
+    /// cores, RAM on the rest); empty before v1.2.008: RAM on the first CPUs by number, compute
+    /// on the next ones.
+    #[serde(default)]
+    pub worker_placement: String,
 }
 
 pub(crate) const fn one_chain() -> usize {

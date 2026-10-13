@@ -46,7 +46,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | V0 | Version v1.2.xxx tự động và hiển thị trên UI | `done` (v1.2.000) |
 | V0b | Ghi version vào report và `fail-summary.csv` | `done` (v1.2.004) |
 | C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `done` (v1.2.006) |
-| C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `planned` |
+| C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `in_progress` (C2a đặt theo loại lõi: v1.2.008) |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `done` (v1.2.007) |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `planned` |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
@@ -159,6 +159,20 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
   trên E-core hay không.
 - Kết quả mong muốn: RAM chạy gần đầy bus, đồng thời lõi CPU chịu tải FMA/AVX nặng. Đây là tình
   huống làm lộ lỗi IMC và XMP/EXPO khi dòng điện của lõi cao.
+
+**C2a — đặt worker theo loại lõi (`done`, v1.2.008):**
+
+- Nghi vấn đã kiểm trên dữ liệu thật trong `Result/`: worker tính toán lấy các CPU cuối cùng theo
+  số thứ tự, nên trên **i9-14900K/KF** (P-core 0–15, E-core 16–31) cả 8 worker tính toán chạy trên
+  E-core (CPU 24–31); trên **i5-14400F** cả 4 cũng vậy (CPU 12–15); 12700KF có 4/5 trên E-core.
+- Inventory nay ghi cho từng luồng: `core_kind` (`performance`/`efficient` theo
+  `/sys/devices/cpu_core` và `cpu_atom`, `uniform` khi CPU không hybrid), `smt_rank` (0: luồng
+  chính của lõi, 1: luồng SMT thứ hai) và `l3_id` (CCD/CCX trên AMD).
+- Quy tắc `CPU-DIT-PLACEMENT-v1` (`config.worker_placement`): worker tính toán lấy luồng chính của
+  P-core (mọi lõi trên CPU không hybrid), rải lần lượt qua các cụm L3; rồi E-core; rồi luồng SMT
+  thứ hai. Worker RAM lấy từ đầu kia. Ví dụ 14900K: tính toán trên 8 P-core (CPU 0, 2, … 14),
+  RAM trên 8 luồng SMT thứ hai của P-core và 16 E-core. 9950X: tính toán xen kẽ hai CCD.
+- `compute-oracle-run` cũng chọn luồng theo thứ tự này. Menu [4] power-sweep giữ nguyên.
 
 ### C3 — Kernel nhiều chuỗi, ramp theo tầng (`done`, v1.2.007)
 

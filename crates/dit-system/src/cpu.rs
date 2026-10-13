@@ -13,7 +13,7 @@ use nix::{
 use sha2::{Digest, Sha256};
 use wide::u64x4;
 
-use crate::{CpuInventory, SystemDitError};
+use crate::{CpuInventory, SystemDitError, inventory::CoreKind};
 
 const REDUCTION_INITIAL: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
@@ -44,21 +44,103 @@ pub(crate) struct CoherencyResult {
     pub affinity_failures: u64,
 }
 
-pub(crate) fn select_worker_cpus(
+/// Name of the worker placement rule ([`place_workers`]), recorded in reports.
+pub(crate) const PLACEMENT_ID: &str = "CPU-DIT-PLACEMENT-v1";
+
+/// RAM and compute workers' hardware threads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub(crate) ram: Vec<usize>,
+    pub(crate) compute: Vec<usize>,
+}
+
+/// The order threads take compute work in: the first thread of every performance core (every
+/// core of a CPU whose cores are alike), taking the L3 groups (CCDs, CCXs) in turn; then
+/// efficient cores; then the second SMT threads. The heavy FMA kernel needs a whole core's FMA
+/// units, which an E-core or a sibling thread cannot give it; RAM workers mostly wait on memory
+/// and take threads from the other end. Before v1.2 the CPU numbering decided: on an i9-14900K
+/// (P-cores 0-15, E-cores 16-31) every compute worker ran on an E-core.
+pub(crate) fn compute_order(inventory: &CpuInventory) -> Vec<usize> {
+    let class = |kind: CoreKind, smt_rank: usize| match (kind, smt_rank > 0) {
+        (CoreKind::Performance | CoreKind::Uniform, false) => 0,
+        (CoreKind::Efficient, false) => 1,
+        (CoreKind::Performance | CoreKind::Uniform, true) => 2,
+        (CoreKind::Efficient, true) => 3,
+    };
+    let mut order = Vec::new();
+    for wanted in 0..4 {
+        // One list per L3 group, taken in turn.
+        let mut groups: std::collections::BTreeMap<Option<u32>, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for thread in &inventory.threads {
+            if inventory.allowed_cpu_ids.contains(&thread.cpu_id)
+                && class(thread.core_kind, thread.smt_rank) == wanted
+            {
+                groups.entry(thread.l3_id).or_default().push(thread.cpu_id);
+            }
+        }
+        let mut groups: Vec<std::collections::VecDeque<usize>> = groups
+            .into_values()
+            .map(|mut cpus| {
+                cpus.sort_unstable();
+                cpus.into()
+            })
+            .collect();
+        while groups.iter().any(|group| !group.is_empty()) {
+            for group in &mut groups {
+                if let Some(cpu) = group.pop_front() {
+                    order.push(cpu);
+                }
+            }
+        }
+    }
+    // Allowed threads the topology did not list keep their place at the end.
+    for &cpu in &inventory.allowed_cpu_ids {
+        if !order.contains(&cpu) {
+            order.push(cpu);
+        }
+    }
+    order
+}
+
+/// `compute` threads from the front of [`compute_order`], then `ram` threads (0: every other
+/// allowed thread) from its back.
+///
+/// # Errors
+///
+/// No allowed CPU, or compute workers requested and none left.
+pub(crate) fn place_workers(
     inventory: &CpuInventory,
-    requested: usize,
-) -> Result<Vec<usize>, SystemDitError> {
+    ram: usize,
+    compute: usize,
+) -> Result<Placement, SystemDitError> {
     if inventory.allowed_cpu_ids.is_empty() {
         return Err(SystemDitError::InvalidConfig(
             "no CPUs are available in the current cpuset".to_owned(),
         ));
     }
-    let count = if requested == 0 {
-        inventory.allowed_cpu_ids.len()
+    let order = compute_order(inventory);
+    let compute_cpus: Vec<usize> = order.iter().copied().take(compute).collect();
+    let rest: Vec<usize> = order
+        .iter()
+        .rev()
+        .copied()
+        .filter(|cpu| !compute_cpus.contains(cpu))
+        .collect();
+    let ram_cpus: Vec<usize> = if ram == 0 {
+        rest
     } else {
-        requested.min(inventory.allowed_cpu_ids.len())
+        rest.into_iter().take(ram).collect()
     };
-    Ok(inventory.allowed_cpu_ids[..count].to_vec())
+    if ram_cpus.is_empty() {
+        return Err(SystemDitError::InvalidConfig(
+            "no CPU is left for the RAM workers".to_owned(),
+        ));
+    }
+    Ok(Placement {
+        ram: ram_cpus,
+        compute: compute_cpus,
+    })
 }
 
 pub(crate) fn pin_current_thread(cpu_id: usize) -> Result<(), String> {
@@ -226,9 +308,109 @@ pub(crate) fn coherency_test(
 #[cfg(test)]
 mod tests {
     use super::{
-        REDUCTION_ADD, REDUCTION_INITIAL, ReductionPair, integer_known_answer_test,
-        scalar_reduction, sha256_known_answer_test, simd_reduction,
+        REDUCTION_ADD, REDUCTION_INITIAL, ReductionPair, compute_order, integer_known_answer_test,
+        place_workers, scalar_reduction, sha256_known_answer_test, simd_reduction,
     };
+    use crate::{CpuInventory, CpuThread, inventory::CoreKind};
+
+    /// `(cpu, core kind, SMT rank, L3 group)` for every thread.
+    fn cpu(threads: &[(usize, CoreKind, usize, u32)]) -> CpuInventory {
+        CpuInventory {
+            architecture: "x86_64".to_owned(),
+            vendor_id: String::new(),
+            model_name: String::new(),
+            logical_cpu_count: threads.len(),
+            allowed_cpu_ids: threads.iter().map(|thread| thread.0).collect(),
+            physical_core_count: 0,
+            avx2: true,
+            aes: true,
+            fma: true,
+            sse4_2: true,
+            threads: threads
+                .iter()
+                .map(|&(cpu_id, core_kind, smt_rank, l3)| CpuThread {
+                    cpu_id,
+                    package_id: 0,
+                    core_id: 0,
+                    numa_node: Some(0),
+                    allowed: true,
+                    core_kind,
+                    smt_rank,
+                    l3_id: Some(l3),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn compute_goes_to_whole_performance_cores_and_ram_to_the_rest() {
+        // i9-14900K: P-cores with siblings next to each other (0-15), E-cores 16-31.
+        let i9: Vec<_> = (0..32)
+            .map(|id| {
+                if id < 16 {
+                    (id, CoreKind::Performance, id % 2, 0)
+                } else {
+                    (id, CoreKind::Efficient, 0, 0)
+                }
+            })
+            .collect();
+        let placement = place_workers(&cpu(&i9), 24, 8).expect("placement");
+        assert_eq!(placement.compute, [0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(placement.ram.len(), 24);
+        assert!(
+            placement
+                .ram
+                .iter()
+                .all(|cpu| !placement.compute.contains(cpu))
+        );
+        // Before v1.2: RAM on 0-23 and compute on 24-31, all E-cores.
+
+        // Ryzen 9 9950X: two CCDs (L3 0: cores 0-7, L3 1: cores 8-15), siblings 16 apart.
+        let ryzen: Vec<_> = (0..32)
+            .map(|id| {
+                (
+                    id,
+                    CoreKind::Uniform,
+                    usize::from(id >= 16),
+                    u32::from(id % 16 >= 8),
+                )
+            })
+            .collect();
+        let order = compute_order(&cpu(&ryzen));
+        assert_eq!(
+            &order[..4],
+            &[0, 8, 1, 9],
+            "first threads, the CCDs in turn"
+        );
+        assert!(order[..16].iter().all(|&cpu| cpu < 16));
+        let placement = place_workers(&cpu(&ryzen), 0, 8).expect("placement");
+        assert_eq!(placement.compute, [0, 8, 1, 9, 2, 10, 3, 11]);
+        assert_eq!(placement.ram.len(), 24);
+
+        // Core Ultra 9 285K: eight P-cores, sixteen E-cores, no SMT.
+        let arrow: Vec<_> = (0..24)
+            .map(|id| {
+                let kind = if id < 8 {
+                    CoreKind::Performance
+                } else {
+                    CoreKind::Efficient
+                };
+                (id, kind, 0, 0)
+            })
+            .collect();
+        let placement = place_workers(&cpu(&arrow), 18, 6).expect("placement");
+        assert_eq!(placement.compute, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(&placement.ram[..16], &(8..24).rev().collect::<Vec<_>>()[..]);
+
+        // RAM only: every thread.
+        assert_eq!(
+            place_workers(&cpu(&arrow), 0, 0)
+                .expect("placement")
+                .ram
+                .len(),
+            24
+        );
+    }
 
     /// The reductions as they were written before v1.2 (one pass over the whole input): the
     /// block-wise ones must give the same values.

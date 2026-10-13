@@ -23,7 +23,7 @@ use wide::f64x4;
 
 use crate::{
     SystemDitError,
-    cpu::{pin_current_thread, select_worker_cpus},
+    cpu::{compute_order, pin_current_thread},
     inventory::SystemInventory,
     safety::RunControl,
 };
@@ -598,7 +598,20 @@ pub fn run_compute_oracle(
     }
 
     let inventory = SystemInventory::collect()?;
-    let worker_cpus = select_worker_cpus(&inventory.cpu, config.requested_workers)?;
+    // Every worker computes: they take the threads that suit compute best, whole performance
+    // cores first (`cpu::compute_order`); zero requested takes every allowed thread.
+    let order = compute_order(&inventory.cpu);
+    let count = if config.requested_workers == 0 {
+        order.len()
+    } else {
+        config.requested_workers
+    };
+    let worker_cpus: Vec<usize> = order.into_iter().take(count).collect();
+    if worker_cpus.is_empty() {
+        return Err(SystemDitError::InvalidConfig(
+            "no CPUs are available in the current cpuset".to_owned(),
+        ));
+    }
     if let Some(worker_id) = config.fault_injection_worker
         && worker_id >= worker_cpus.len()
     {

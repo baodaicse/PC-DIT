@@ -22,9 +22,8 @@ use crate::{
     LockPolicy, MemoryTarget, SystemDitError, SystemInventory,
     compute_oracle::{self, WorkerOutcome as ComputeOracleWorkerOutcome},
     cpu::{
-        CoherencyResult, ReductionPair, coherency_test, fp_fma_known_answer_test,
-        integer_known_answer_test, pin_current_thread, select_worker_cpus,
-        sha256_known_answer_test,
+        CoherencyResult, PLACEMENT_ID, ReductionPair, coherency_test, fp_fma_known_answer_test,
+        integer_known_answer_test, pin_current_thread, place_workers, sha256_known_answer_test,
     },
     memory::{MemoryArena, plan_and_allocate},
     report::{
@@ -346,7 +345,12 @@ fn run_system_once(
         &counters,
     );
     let inventory = SystemInventory::collect()?;
-    let all_worker_cpus = select_worker_cpus(&inventory.cpu, config.requested_workers)?;
+    let placement = place_workers(
+        &inventory.cpu,
+        config.requested_workers,
+        config.compute_oracle_workers,
+    )?;
+    let all_worker_cpus = placement.ram;
     let monitor = SafetyMonitor::start(
         config.safety_policy.clone(),
         config.safety_fault_injection.clone(),
@@ -413,22 +417,10 @@ fn run_system_once(
         )));
     }
     let worker_cpus = all_worker_cpus[..worker_count].to_vec();
-    let compute_oracle_worker_cpus: Vec<usize> = if config.compute_oracle_workers > 0 {
-        inventory
-            .cpu
-            .allowed_cpu_ids
-            .iter()
-            .copied()
-            .filter(|cpu_id| !worker_cpus.contains(cpu_id))
-            .take(config.compute_oracle_workers)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let compute_oracle_worker_cpus = placement.compute;
     if config.compute_oracle_workers > 0 && compute_oracle_worker_cpus.is_empty() {
         return Err(SystemDitError::InvalidConfig(
-            "compute_oracle_workers requested but no spare logical CPU is available beyond RAM workers"
-                .to_owned(),
+            "compute_oracle_workers requested but no logical CPU is available for them".to_owned(),
         ));
     }
     if let Some(worker_id) = config.fault_injection_compute_oracle_worker
@@ -918,8 +910,10 @@ fn run_system_once(
     Ok(SystemRunReport {
         // v11: dit_version. v12: round digests hashed every CONTENT_HASH_EVERY_ROUNDS rounds
         // (round_digests[].content_hashed, config.content_hash_every_rounds). v13: compute
-        // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains).
-        schema_version: 13,
+        // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains). v14: workers
+        // placed by core kind (config.worker_placement; inventory threads' core_kind, smt_rank,
+        // l3_id).
+        schema_version: 14,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
@@ -1845,6 +1839,7 @@ fn config_evidence(config: &SystemRunConfig, seed_commitment: &str) -> SystemCon
         lock_policy: config.lock_policy.as_str().to_owned(),
         coherency_iterations_per_worker: config.coherency_iterations_per_worker,
         content_hash_every_rounds: CONTENT_HASH_EVERY_ROUNDS,
+        worker_placement: PLACEMENT_ID.to_owned(),
     }
 }
 

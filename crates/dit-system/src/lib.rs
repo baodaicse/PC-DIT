@@ -30,7 +30,9 @@ pub use gpu::{
     SlowdownCounter, collect_gpu_inventory, collect_gpu_telemetry, format_gpu_summary,
     nvidia_silent_seconds, nvidia_smi_program,
 };
-pub use inventory::{CpuInventory, CpuThread, MemoryInventory, NumaNode, SystemInventory};
+pub use inventory::{
+    CoreKind, CpuInventory, CpuThread, MemoryInventory, NumaNode, SystemInventory,
+};
 pub use memory::{LockPolicy, MemoryTarget};
 pub use report::{
     ArenaEvidence, CpuEvidence, DiagnosticEvidence, ExecutionEvidence, MemoryPlanEvidence,
