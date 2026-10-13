@@ -50,7 +50,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `planned` |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `proposed` |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
-| C6 | Xoay từng lõi (A: test CPU riêng; B: combined, xoay khi GPU chạy hết tải) | `proposed` |
+| C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `planned` |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -129,27 +129,85 @@ sang file mới khi header khác.
 | Ép từng tầng cache (L1/L2/L3) | cache, ring, fabric | đọc–sửa–ghi trên tập dữ liệu vừa từng tầng, so với đáp án |
 | AES-NI CTR + SHA-NI hàng loạt | đơn vị crypto | tính lại độc lập trên buffer cỡ L2 |
 
-### C6 — Xoay từng lõi (`proposed`)
+### C6 — Xoay từng lõi (`planned`)
 
-- **Lý do:** xung cao nhất (ví dụ 6,0 GHz trên 14900K, 5,7 GHz trên 9950X) chỉ xuất hiện khi 1–2
-  lõi hoạt động. Khi test toàn lõi, mỗi lõi chạy khoảng 5,0–5,5 GHz, còn dư biên ổn định, nên lõi
-  bị suy giảm (Raptor Lake gen 13/14) hoặc Curve Optimizer chỉnh quá tay vẫn PASS. Lỗi chỉ lộ ra khi
-  chơi game hoặc chạy tải nhẹ một luồng.
-- **Cách làm:** chỉ một lõi chạy kernel có kiểm kết quả, các lõi khác nghỉ để lõi đó boost tối đa.
-  Sau 20–30 s chuyển sang lõi tiếp theo, cho đến hết mọi lõi. Lặp lại với kernel nhẹ (boost cao
-  nhất) và kernel AVX. Mỗi lần chuyển lõi cũng là một phép thử sụt áp khi tải tăng đột ngột.
-- **A — test CPU riêng:** xoay thuần, RAM và mọi thứ khác nghỉ.
-- **B — combined:** xoay lõi trong lúc GPU/VRAM vẫn chạy hết tải; RAM và SSD nghỉ (SSD dùng CPU
-  cho checksum). Đây là tình huống "chơi game" mà combined hiện chưa có.
-  - Điều kiện: luồng CPU của GPU layer phải ghim tránh lõi đang test và luồng SMT anh em, và phải
-    dùng ít CPU. Cần đo khi làm.
-- **Không chạy chồng với pha mọi layer cùng chạy:** khi đó các lõi khác đang bận, lõi đang test
-  không boost được và pha xoay mất ý nghĩa.
-- **Bằng chứng:** report ghi xung thực tế của lõi ở từng bước. Bước không đạt gần xung tối đa được
-  đánh dấu NOTE "không đạt boost", không tính FAIL.
-- **Thời lượng:** chỉ ở mức dài, đặt cuối phiên (máy đã nóng), chiếm khoảng 20–25% thời lượng.
-  Ví dụ 14900K có 24 lõi × 25 s × 2 kernel ≈ 20 phút; 9950X ≈ 13 phút.
-- **Ghi lỗi:** kết quả sai tính FAIL ô CPU; số hiệu lõi chỉ nằm trong log chi tiết.
+**Lý do.** Xung cao nhất (ví dụ 6,0 GHz trên 14900K, 5,7 GHz trên 9950X) chỉ xuất hiện khi 1–2
+lõi hoạt động. Khi test toàn lõi, mỗi lõi chạy khoảng 5,0–5,5 GHz, còn dư biên ổn định, nên lõi bị
+suy giảm (Raptor Lake gen 13/14) hoặc Curve Optimizer chỉnh quá tay vẫn PASS. Lỗi chỉ lộ ra khi chơi
+game hoặc chạy tải nhẹ một luồng. Test toàn lõi về nguyên lý không bắt được loại lỗi này.
+
+**Cách xoay (chung cho A và B).**
+
+- Mỗi bước chỉ một lõi chạy kernel có kiểm kết quả; lõi SMT anh em và các lõi khác nghỉ, để lõi
+  đó boost tối đa. Hết bước thì sang lõi kế tiếp, cho đến hết mọi lõi.
+- Kernel nhẹ (boost cao nhất) và kernel AVX (dòng điện lớn). Mỗi lần chuyển lõi cũng là một phép
+  thử sụt áp khi tải tăng đột ngột.
+- **Intel hybrid:** P-core xoay từng lõi; E-core xoay **theo cụm 4 lõi** (cả cụm dùng chung xung
+  nhịp). Ví dụ 14900K và Ultra 9 285K: 8 P + 4 cụm E = 12 bước, thay vì 24.
+
+**Hai kiểu.**
+
+| | A — xoay thuần | B — xoay khi GPU chạy hết tải |
+|---|---|---|
+| Chạy cùng lúc | không có gì | GPU/VRAM test chạy hết tải |
+| RAM, SSD | nghỉ | nghỉ (chiếm lõi CPU, làm mất boost) |
+| Xung đạt được | cao nhất (máy mát) | có thể thấp hơn một chút (máy nóng) |
+| Bắt được | lỗi riêng của lõi ở xung đỉnh | lỗi đó cộng với nguồn/VRM dao động dưới tải GPU, nhiệt cả thùng máy |
+| Giống tình huống | app một luồng, mở app, biên dịch | chơi game: GPU 100% và vài lõi boost |
+
+**Lịch trong combined (đã chốt 2026-10-13).**
+
+```
+Deep: Baseline → [A] → Chain → Chạy chồng → [B] → Nghỉ → Đọc lại
+```
+
+- **Deep:** A và B dùng chung ngân sách cố định khoảng 20% (12 phút), **lấy từ pha chạy chồng**
+  (40 → 28 phút). Tổng thời lượng không đổi. A đặt sớm, lúc máy còn mát, để đạt xung đỉnh. B đặt
+  sau pha chạy chồng, lúc máy đã nóng.
+- **Ngân sách chia đều cho số bước:** A lấy 1/3, B lấy 2/3 (B chạy 2 kernel). Tối thiểu A ≥ 10 s
+  và B ≥ 20 s mỗi bước để xung và nhiệt kịp ổn định. Máy quá nhiều lõi so với ngân sách thì ưu tiên
+  các lõi firmware xếp boost cao nhất, và report ghi rõ lõi nào chưa được xoay.
+- **Bounded:** không xoay. Pha chạy chồng chỉ có 5 phút.
+- **Soak:** mỗi chu kỳ một lượt A+B (khoảng 10 phút, lấy từ pha chạy chồng 50 phút của chu kỳ).
+  Lỗi xoay được thử lặp lại ở nhiều trạng thái nhiệt.
+
+| CPU (Deep) | Số bước | A mỗi bước | B mỗi bước |
+|---|---|---|---|
+| Ryzen 5 7500F | 6 | 40 s | 80 s |
+| i5-14400F | 6 P + 1 cụm E = 7 | 34 s | 68 s |
+| i7-12700KF | 8 P + 1 cụm E = 9 | 26 s | 53 s |
+| i9-14900K, Ultra 9 285K | 8 P + 4 cụm E = 12 | 20 s | 40 s |
+| Ryzen 9 9950X | 16 | 15 s | 30 s |
+
+**Test CPU riêng (chờ xác nhận).** Chỉ có A. Đề xuất: chỉ ở mức Full, đặt đầu phiên (máy mát),
+ngân sách khoảng 20% thời lượng, theo cùng cách chia ở trên.
+
+**Bằng chứng và ghi lỗi.**
+
+- Report ghi xung thực tế của lõi ở từng bước, đọc qua cpufreq (MSR bị khóa khi Secure Boot bật).
+  Bước dưới khoảng 95% xung tối đa của lõi đó được ghi NOTE "không đạt boost", không tính FAIL.
+- Kết quả sai tính FAIL ô CPU, kể cả trong B. Report ghi rõ lỗi xảy ra ở pha A hay B; số hiệu lõi
+  chỉ nằm trong log chi tiết.
+
+**Độ phức tạp và rủi ro.**
+
+| Phần | Mức |
+|---|---|
+| Nhận dạng lõi (lõi vật lý, cặp SMT, P/E, cụm E, xung tối đa); dùng chung với C2 | trung bình |
+| Bộ xoay: ghim, chạy kernel của C3/C5, chuyển bước theo ngân sách | trung bình |
+| Bằng chứng boost qua cpufreq | trung bình |
+| Pha A trong combined | thấp |
+| **Pha B:** lớp GPU chạy cùng bộ xoay, luồng kiểm GPU giới hạn 1–2 và ghim xa lõi đang test | **cao** |
+| Ghi lỗi (mã NOTE mới), UI (lõi đang xoay, xung thực tế/tối đa, tiến độ) | thấp–trung bình |
+
+- **Rủi ro chính của B:** ở Balanced, lớp GPU dùng khá nhiều luồng CPU để kiểm kết quả GPU (máy 32
+  luồng: 7 luồng). Trong B chỉ còn 1–2 luồng. Nếu khâu kiểm chậm hơn GPU thì GPU phải chờ và không
+  còn chạy hết tải. Phải đo trước; nếu đúng vậy, lớp GPU cần một chế độ cho B (GPU chạy liên tục,
+  khâu kiểm theo sau) mà vẫn kiểm đủ mọi kết quả.
+- QEMU chỉ kiểm được logic (lịch, xoay, ghi kết quả). CPU ảo không boost, nên hiệu quả thật chỉ đo
+  được trên máy thật.
+- Thước đo hiệu quả sau khi triển khai: số FAIL chỉ xuất hiện ở pha xoay trong khi mọi pha khác
+  PASS, đếm trên kết quả thực tế.
 
 ## Quyết định
 
@@ -160,7 +218,9 @@ sang file mới khi header khác.
 | Version | v1.2.xxx, xxx tự tăng theo commit, hiện trên UI | đã chốt (2026-10-13) |
 | C2 | Tự đo đầu phiên, chia theo loại lõi | chờ xác nhận |
 | C4 | Tự chọn mặc định, `dit_isa=` ẩn cho kỹ thuật viên | chờ xác nhận |
-| C6 | A cho test CPU riêng, B cho combined; chỉ mức dài, cuối phiên, 20–25%; không đạt boost ghi NOTE | chờ xác nhận |
+| C6 combined | Deep: A+B, ngân sách cố định khoảng 20% (12 phút) lấy từ pha chạy chồng; Bounded: không xoay; Soak: mỗi chu kỳ một lượt A+B; E-core xoay theo cụm | đã chốt (2026-10-13) |
+| C6 boost | Bước không đạt boost ghi NOTE, không tính FAIL | chờ xác nhận |
+| C6 test CPU riêng | Chỉ A; mức Full; đầu phiên; khoảng 20% thời lượng | chờ xác nhận |
 | V0b | Version trong report và CSV | chờ xác nhận |
 
 ## Thứ tự triển khai
@@ -169,7 +229,7 @@ sang file mới khi header khác.
 2. C3 + C2: kernel nhiều chuỗi và cách chia worker mới.
 3. C4: binary v3/v4 và cơ chế tự chọn.
 4. C5: các kernel mới.
-5. C6: xoay từng lõi, A trước rồi B.
+5. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.
