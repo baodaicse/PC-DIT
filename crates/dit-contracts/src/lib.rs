@@ -8,6 +8,13 @@ pub mod fault;
 pub use fault::{FaultRecord, FaultTail, FaultWriter};
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The DIT-01 version this build was made from (`1.2.007`, `1.2.008-dev`; rule in `VERSION`,
+/// computed by `tools/dit-version.sh` at build time). Shown on every screen and written into
+/// every report, so a result says which software produced it; a report without it predates
+/// v1.2 (v1.1).
+pub const DIT_VERSION: &str = env!("DIT_VERSION");
+
 pub const NVME_MODULE_ID: &str = "dit.cpu-nvme";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -190,6 +197,9 @@ pub struct FailureRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceReport {
     pub schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    #[serde(default)]
+    pub dit_version: String,
     pub run_id: RunId,
     pub module_id: String,
     pub device_id: DeviceId,

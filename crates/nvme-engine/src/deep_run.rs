@@ -642,6 +642,7 @@ pub(super) fn run<B: StorageBackend>(
     let elapsed_seconds = started.elapsed().as_secs_f64().max(f64::EPSILON);
     Ok(DeviceReport {
         schema_version: SCHEMA_VERSION,
+        dit_version: dit_contracts::DIT_VERSION.to_owned(),
         run_id: config.run_id.clone(),
         module_id: dit_contracts::NVME_MODULE_ID.into(),
         device_id: config.device_id.clone(),

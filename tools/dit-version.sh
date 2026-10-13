@@ -1,7 +1,7 @@
 #!/bin/bash
 # Prints the DIT-01 version of this checkout without the leading "v": <SERIES>.<n>, n with three
 # digits, "-dev" when the working tree has uncommitted changes (rule in VERSION). The one source
-# of the number: the Rust screens (crates/dit-ui-core/build.rs), the image, its boot menu and
+# of the number: the Rust binaries (crates/dit-contracts/build.rs), the image, its boot menu and
 # manifest all take it from here.
 set -euo pipefail
 

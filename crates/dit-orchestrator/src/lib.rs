@@ -182,6 +182,9 @@ pub struct ModuleResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuiteReport {
     pub schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    #[serde(default)]
+    pub dit_version: String,
     pub suite_run_id: String,
     pub aggregate_verdict: Verdict,
     pub modules: Vec<ModuleResult>,
@@ -198,6 +201,7 @@ impl SuiteReport {
         let aggregate_verdict = aggregate_module_verdicts(&modules);
         Self {
             schema_version: SCHEMA_VERSION,
+            dit_version: dit_contracts::DIT_VERSION.to_owned(),
             suite_run_id,
             aggregate_verdict,
             modules,

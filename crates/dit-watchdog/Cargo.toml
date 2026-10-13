@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dit-contracts = { path = "../dit-contracts" }
 dit-system = { path = "../dit-system" }
 clap.workspace = true
 serde.workspace = true

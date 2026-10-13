@@ -291,6 +291,8 @@ struct CpuRamPreflight {
 #[derive(Clone, Debug, Serialize)]
 struct BoundedRunReport {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     plan: BoundedWritePlan,
     attribution: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,6 +305,8 @@ struct BoundedRunReport {
 #[derive(Clone, Debug, Serialize)]
 struct PreservingRunReport {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     mode: &'static str,
     attribution: &'static str,
     namespace_stable_id: DeviceId,
@@ -336,6 +340,8 @@ struct PreservingTargetEvidence {
 #[derive(Clone, Debug, Serialize)]
 struct MultiPreservingRunReport {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     mode: &'static str,
     attribution: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -740,6 +746,7 @@ fn run_preserving_command(
         .find(|device| device.stable_id == namespace.stable_id);
     let report = PreservingRunReport {
         schema_version: dit_contracts::SCHEMA_VERSION,
+        dit_version: dit_contracts::DIT_VERSION,
         mode: "DATA_PRESERVING_FILE",
         attribution: attribution_name(preflight.as_ref()),
         namespace_stable_id: namespace.stable_id.clone(),
@@ -2021,6 +2028,7 @@ fn run_preserving_multi_command(
         .collect::<BTreeSet<_>>();
     let report = MultiPreservingRunReport {
         schema_version: dit_contracts::SCHEMA_VERSION,
+        dit_version: dit_contracts::DIT_VERSION,
         mode: "DATA_PRESERVING_FILE_MULTI",
         attribution: attribution_name(preflight.as_ref()),
         cpu_ram_preflight: preflight,
@@ -2212,6 +2220,7 @@ fn run_bounded_command(args: &RunBoundedArgs) -> Result<ExitCode, Box<dyn std::e
         .find(|device| device.stable_id == plan.namespace_stable_id);
     let report = BoundedRunReport {
         schema_version: dit_contracts::SCHEMA_VERSION,
+        dit_version: dit_contracts::DIT_VERSION,
         plan,
         attribution: attribution_name(preflight.as_ref()),
         cpu_ram_preflight: preflight,

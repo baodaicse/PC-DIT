@@ -269,6 +269,9 @@ pub struct ComputeOracleMismatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeOracleReport {
     pub schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    #[serde(default)]
+    pub dit_version: String,
     pub test_id: String,
     pub status: ComputeOracleStatus,
     pub availability: crate::availability::AvailabilityEvidence,
@@ -583,7 +586,9 @@ pub fn run_compute_oracle(
     Ok(ComputeOracleReport {
         // v3: records the resolved dense_fma_iterations_per_burst (DIT-
         // DURATION-COMPLEXITY-RAMP-v1) alongside the v2 per-burst mismatch fix.
-        schema_version: 4,
+        // v5: dit_version.
+        schema_version: 5,
+        dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability: crate::availability::AvailabilityEvidence::new(
             if coverage_met {
                 crate::availability::AvailabilityStatus::Completed

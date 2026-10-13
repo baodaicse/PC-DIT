@@ -40,6 +40,8 @@ struct DeviceReportView {
 #[derive(Debug, Serialize)]
 struct MultiGpuReport {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     module_id: String,
     run_id: String,
     verdict: Verdict,
@@ -537,6 +539,7 @@ fn run_multi(
     }
     let report = MultiGpuReport {
         schema_version: SCHEMA_VERSION,
+        dit_version: dit_contracts::DIT_VERSION,
         module_id: MODULE_ID.to_owned(),
         run_id,
         verdict,

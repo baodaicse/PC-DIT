@@ -891,7 +891,9 @@ fn run_system_once(
     );
     let power_platform = crate::power_platform::PowerPlatformEvidence::from_telemetry(&telemetry);
     Ok(SystemRunReport {
-        schema_version: 10,
+        // v11: dit_version.
+        schema_version: 11,
+        dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
         test_id: config.test_id.clone(),

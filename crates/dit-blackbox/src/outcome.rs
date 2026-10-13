@@ -68,6 +68,8 @@ pub fn fail_line(cells: &str) -> String {
 #[derive(Serialize)]
 struct ResultReport<'a> {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     written_by: &'a str,
     run_id: &'a str,
     verdict: &'a str,
@@ -166,7 +168,9 @@ pub fn write_for(
     };
     let now = session::unix_ms();
     let body = ResultReport {
-        schema_version: 1,
+        // v2: dit_version.
+        schema_version: 2,
+        dit_version: dit_contracts::DIT_VERSION,
         written_by: by,
         run_id: &info.run_id,
         verdict,

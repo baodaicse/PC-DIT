@@ -1,5 +1,6 @@
-//! The DIT-01 version shown on every screen (`DIT_VERSION`, see `VERSION`). Image builds pass
-//! `tools/dit-version.sh`'s answer in the environment; otherwise the script is asked here.
+//! The DIT-01 version shown on every screen and written into every report (`DIT_VERSION`, see
+//! `VERSION`). Image builds pass `tools/dit-version.sh`'s answer in the environment; otherwise
+//! the script is asked here.
 
 use std::{env, path::PathBuf, process::Command};
 

@@ -892,6 +892,7 @@ pub fn csv_row(meta: &CsvMeta, counts: &CsvCounts) -> String {
     let mut fields: Vec<String> = vec![
         meta.time.clone(),
         meta.image_id.clone(),
+        dit_contracts::DIT_VERSION.to_owned(),
         meta.test.clone(),
         meta.board.clone(),
         meta.cpu.clone(),
@@ -916,8 +917,9 @@ pub fn csv_row(meta: &CsvMeta, counts: &CsvCounts) -> String {
         .join(",")
 }
 
-/// Header of `fail-summary.csv`.
-pub const CSV_HEADER: &str = "time,image_id,test,board,cpu,memory,gpus,ssds,verdict,\
+/// Header of `fail-summary.csv`. `dit_version` is the version that wrote the row; a file
+/// without that column was written before v1.2 (v1.1).
+pub const CSV_HEADER: &str = "time,image_id,dit_version,test,board,cpu,memory,gpus,ssds,verdict,\
 cpu_fail,ram_fail,pcie_gpu_fail,gpu_fail,vram_fail,ssd_fail,ssd_path_fail,platform_fail,\
 unresolved_fail,confirmed,suspected,cells,hardware_events,report";
 
@@ -952,10 +954,12 @@ pub fn append_csv(path: &Path, ledger: &Ledger, meta: &CsvMeta) -> std::io::Resu
 }
 
 /// Appends one formatted row ([`csv_row`]) to `path`, writing the header first when the file
-/// is new.
+/// is new. A file with another header (written by an older version) is first set aside under
+/// that version's name (`fail-summary-v1.1.csv`) so no file mixes two row layouts.
 /// # Errors
 /// File creation or write failures.
 pub fn append_csv_row(path: &Path, row: &str) -> std::io::Result<()> {
+    set_aside_other_layout(path)?;
     let new = !path.exists();
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -966,6 +970,80 @@ pub fn append_csv_row(path: &Path, row: &str) -> std::io::Result<()> {
     }
     writeln!(file, "{row}")?;
     file.sync_all()
+}
+
+/// Renames `path` when its header is not [`CSV_HEADER`]: to `<stem>-v1.1.csv` without a
+/// `dit_version` column, else to `<stem>-v<version of its last row>.csv`; `-2`, `-3`... when
+/// that name is taken. The file's content is left as it is.
+fn set_aside_other_layout(path: &Path) -> std::io::Result<()> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default();
+    if header == CSV_HEADER {
+        return Ok(());
+    }
+    let version = header
+        .split(',')
+        .position(|column| column == "dit_version")
+        .map_or_else(
+            || "1.1".to_owned(),
+            |index| {
+                lines
+                    .rfind(|line| !line.is_empty())
+                    .and_then(|line| csv_fields(line).into_iter().nth(index))
+                    .filter(|version| !version.is_empty())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            },
+        );
+    let stem = path
+        .file_stem()
+        .map_or_else(|| "fail-summary".into(), |stem| stem.to_string_lossy());
+    let label: String = version
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut copy = 1;
+    loop {
+        let suffix = if copy == 1 {
+            String::new()
+        } else {
+            format!("-{copy}")
+        };
+        let target = path.with_file_name(format!("{stem}-v{label}{suffix}.csv"));
+        if !target.exists() {
+            return std::fs::rename(path, target);
+        }
+        copy += 1;
+    }
+}
+
+/// The fields of one CSV line (quotes as [`csv_field`] writes them).
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            ('"', _) => quoted = !quoted,
+            (',', false) => fields.push(std::mem::take(&mut field)),
+            _ => field.push(c),
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 #[cfg(test)]
@@ -1169,6 +1247,43 @@ mod tests {
         append_csv(&path, &ledger, &meta).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 3, "one header, two rows");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rows_carry_the_version_and_an_older_layout_is_set_aside() {
+        let dir = std::env::temp_dir().join(format!("dit-ledger-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fail-summary.csv");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let row = csv_row(&CsvMeta::default(), &CsvCounts::default());
+        let version_at = CSV_HEADER
+            .split(',')
+            .position(|c| c == "dit_version")
+            .unwrap();
+        assert_eq!(csv_fields(&row)[version_at], dit_contracts::DIT_VERSION);
+
+        // A v1.1 file (no dit_version column) is renamed, untouched; a new file starts.
+        let v11 = "time,image_id,test\n2026-10-01,DIT-01-OLD,CPU-RAM\n";
+        std::fs::write(&path, v11).unwrap();
+        append_csv_row(&path, &row).unwrap();
+        assert_eq!(read("fail-summary-v1.1.csv"), v11);
+        assert_eq!(read("fail-summary.csv"), format!("{CSV_HEADER}\n{row}\n"));
+
+        // Same layout: rows are appended, nothing renamed.
+        append_csv_row(&path, &row).unwrap();
+        assert_eq!(read("fail-summary.csv").lines().count(), 3);
+
+        // A second v1.1 file does not overwrite the first one set aside.
+        std::fs::write(&path, v11).unwrap();
+        append_csv_row(&path, &row).unwrap();
+        assert_eq!(read("fail-summary-v1.1-2.csv"), v11);
+
+        // A later layout that has the column is named after its last row's version.
+        let later = "time,dit_version,extra\n1,1.2.004,x\n2,\"1.2.005\",y\n";
+        std::fs::write(&path, later).unwrap();
+        append_csv_row(&path, &row).unwrap();
+        assert_eq!(read("fail-summary-v1.2.005.csv"), later);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

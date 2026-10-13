@@ -58,9 +58,8 @@ pub fn unicode_terminal() -> bool {
 /// Version of the fixed dashboard shell shared by all active DIT engines.
 pub const UNIFIED_DASHBOARD_ABI: u32 = 1;
 
-/// The DIT-01 version this build was made from (`1.2.007`, `1.2.008-dev`; rule in `VERSION`),
-/// shown on every screen so the operator knows which software tested the machine.
-pub const DIT_VERSION: &str = env!("DIT_VERSION");
+/// The DIT-01 version this build was made from, shown on every screen (`dit_contracts`).
+pub use dit_contracts::DIT_VERSION;
 
 /// Every screen's title: the product, then its version.
 #[must_use]

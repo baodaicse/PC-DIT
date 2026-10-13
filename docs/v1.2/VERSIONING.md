@@ -18,10 +18,10 @@
 |---|---|
 | `VERSION` | `SERIES=1.2` và `FIRST=52`: số commit (`git rev-list --count HEAD`) của commit đầu tiên của dòng |
 | `tools/dit-version.sh` | Nguồn duy nhất của quy tắc: in `1.2.<n>` hoặc `1.2.<n>-dev` |
-| `crates/dit-ui-core/build.rs` | Đưa version vào `dit_ui_core::DIT_VERSION`. Dùng `DIT_VERSION` trong môi trường nếu có, không có thì tự gọi script |
+| `crates/dit-contracts/build.rs` | Đưa version vào `dit_contracts::DIT_VERSION`, crate nền mà mọi binary đều dùng (từ V0b; `dit_ui_core::DIT_VERSION` dùng lại hằng số này). Dùng `DIT_VERSION` trong môi trường nếu có, không có thì tự gọi script |
 | `tools/build_boot_image.sh`, `tools/build_image_extension.sh` | Tính version một lần cho cả lần build, export `DIT_VERSION` cho cargo, ghi vào image |
 
-Commit hoặc checkout làm cargo build lại `dit-ui-core` (theo dõi `.git/HEAD`, `.git/index`,
+Commit hoặc checkout làm cargo build lại `dit-contracts` và các crate dùng nó (theo dõi `.git/HEAD`, `.git/index`,
 `.git/logs/HEAD`). Riêng trạng thái `-dev` của một lần `cargo build` thủ công có thể cũ hơn thực tế
 nếu chỉ sửa file mà chưa stage. Build image luôn đúng vì script truyền `DIT_VERSION` mới tính.
 

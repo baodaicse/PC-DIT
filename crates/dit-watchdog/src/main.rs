@@ -14,7 +14,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 2;
+// v3: dit_version.
+const SCHEMA_VERSION: u32 = 3;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
@@ -113,6 +114,8 @@ enum WatchdogState {
 #[derive(Debug, Serialize)]
 struct WatchdogRecord {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     module: String,
     run_id: String,
     state: WatchdogState,
@@ -675,6 +678,7 @@ impl Supervisor<'_> {
         let cgroup_events_after = self.cgroup_events();
         let record = WatchdogRecord {
             schema_version: SCHEMA_VERSION,
+            dit_version: dit_contracts::DIT_VERSION,
             module: self.args.module.clone(),
             run_id: self.args.run_id.clone(),
             state,

@@ -311,6 +311,8 @@ struct Totals {
 #[derive(Serialize)]
 struct CombinedReport<'a> {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     module_id: &'static str,
     run_id: &'a str,
     verdict: &'static str,
@@ -1989,7 +1991,9 @@ impl Session<'_> {
             combined::session_verdict(&outcomes, completed)
         };
         let report = CombinedReport {
-            schema_version: 1,
+            // v2: dit_version.
+            schema_version: 2,
+            dit_version: dit_contracts::DIT_VERSION,
             module_id: combined::COMBINED_MODULE_ID,
             run_id: &self.run_id,
             verdict,

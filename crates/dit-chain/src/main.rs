@@ -256,6 +256,8 @@ struct PathReport {
 #[derive(Serialize)]
 struct Report {
     schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    dit_version: &'static str,
     module_id: &'static str,
     /// `run`, `run-existing` or `prefill`.
     mode: &'static str,
@@ -485,7 +487,9 @@ impl Ctx {
     fn new(mode: &'static str, layout: &Layout, output: &OutputArgs) -> Self {
         let started = Instant::now();
         let report = Report {
-            schema_version: 1,
+            // v2: dit_version.
+            schema_version: 2,
+            dit_version: dit_contracts::DIT_VERSION,
             module_id: "dit.chain",
             mode,
             verdict: "INVALID",

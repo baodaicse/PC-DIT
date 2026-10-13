@@ -319,6 +319,9 @@ pub struct PowerReport {
     #[serde(default)]
     pub campaign: Option<CampaignProgress>,
     pub schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    #[serde(default)]
+    pub dit_version: String,
     pub boot_id: String,
     pub owner_pid: u32,
     pub config: PowerConfig,
@@ -435,7 +438,7 @@ pub fn run(config: &PowerConfig) -> Result<PowerReport, String> {
         |p| p.hard_deadline_ms,
     );
     let mut report = PowerReport {
-        schema_version: 3, campaign, active_workers: None, safety: None, config: config.clone(), verdict: PowerVerdict::Incomplete,
+        schema_version: 4, dit_version: dit_contracts::DIT_VERSION.to_owned(), campaign, active_workers: None, safety: None, config: config.clone(), verdict: PowerVerdict::Incomplete,
         total_transitions: 0, verified_transitions: 0, total_bursts: 0, total_mismatches: 0,
         transitions_omitted: 0, first_failure: None, pool_workers_started: 0,
         checkpoint_interval_ms: 5000, last_persisted: None, runtime_started: None,
@@ -598,13 +601,13 @@ pub fn run(config: &PowerConfig) -> Result<PowerReport, String> {
     Ok(report)
 }
 
-/// Validate schema-3 aggregate and PASS coverage contracts. Historical reports
+/// Validate schema-3/4 aggregate and PASS coverage contracts (4 adds `dit_version` only). Historical reports
 /// retain their original schema semantics; unknown schemas are never accepted.
 ///
 /// # Errors
 /// Rejects inconsistent retained history, timing recipes or unsupported PASS claims.
 pub fn validate_report(report: &PowerReport) -> Result<(), String> {
-    if !matches!(report.schema_version, 1..=3) {
+    if !matches!(report.schema_version, 1..=4) {
         return Err("unsupported power report schema".into());
     }
     if report.schema_version < 3 {
@@ -925,7 +928,7 @@ pub fn recover(path: &Path) -> Result<PowerReport, String> {
     let mut report: PowerReport =
         serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-    if !matches!(report.schema_version, 1..=3) {
+    if !matches!(report.schema_version, 1..=4) {
         return Err("unsupported power report schema".into());
     }
     if report.availability.status == AvailabilityStatus::Running {

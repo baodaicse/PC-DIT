@@ -44,7 +44,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | ID | Hạng mục | Trạng thái |
 |---|---|---|
 | V0 | Version v1.2.xxx tự động và hiển thị trên UI | `done` (v1.2.000) |
-| V0b | Ghi version vào report và `fail-summary.csv` | `planned` |
+| V0b | Ghi version vào report và `fail-summary.csv` | `done` (v1.2.004) |
 | C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `planned` |
 | C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `planned` |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `planned` |
@@ -56,7 +56,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 
 - `VERSION` + `tools/dit-version.sh` cho ra `1.2.<n>`, n là số commit kể từ đầu dòng 1.2.
 - `crates/dit-ui-core/build.rs` đưa version vào mọi binary có màn hình
-  (`dit_ui_core::DIT_VERSION`, `product_title()`).
+  (`dit_ui_core::DIT_VERSION`, `product_title()`). Từ V0b, `build.rs` chuyển sang `dit-contracts`.
 - Hiện ở:
   - tiêu đề mọi dashboard (`DIT-01 / DATA INTEGRITY TEST ENGINE / v1.2.xxx`);
   - dòng ENGINE của CPU-RAM;
@@ -66,21 +66,39 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 - Image ghi `/etc/cpu-dit/version`, `dit_version=` trong build-info, `"dit_version"` trong manifest
   của `.img` và ISO.
 
-### V0b — Version trong kết quả (`planned`)
+### V0b — Version trong kết quả (`done`, v1.2.004)
 
-Kết quả trên USB hiện chỉ mang `image_id`. Khi gộp kết quả thực tế cần biết ngay lượt nào chạy bản
-nào. Đã chốt 2026-10-13:
+Kết quả trên USB trước đây chỉ mang `image_id`. Nay mọi kết quả ghi luôn version đã tạo ra nó.
 
-- Thêm `dit_version` vào report JSON của mọi module (CPU-RAM, CPU-SSD, GPU-VRAM, combined, kết quả
-  hộp đen/hậu kiểm) và thêm cột `dit_version` vào `fail-summary.csv`.
-- **File cũ bỏ qua, không chuyển đổi.** Mọi report và dòng CSV không có `dit_version` (tức tạo
-  trước 2026-10-13) được coi là bản **v1.1**.
-- Khi USB đã có `fail-summary.csv` dạng cũ (header không có `dit_version`): đổi tên file đó thành
-  `fail-summary-v1.1.csv`, nội dung giữ nguyên, rồi mở `fail-summary.csv` mới với header mới. Nhờ
-  vậy không file nào lẫn hai dạng dòng, và `fail-summary.csv` luôn là file hiện hành.
-- Các engine (`dit-cli`, `cpu-nvme-dit`, `gpu-vram-dit`) chưa phụ thuộc `dit-ui-core`. Version cần
-  chuyển xuống một crate mà mọi binary đều dùng (ví dụ `dit-contracts`), vẫn lấy từ
-  `tools/dit-version.sh`.
+- **Một chỗ giữ version cho mọi binary:** `dit_contracts::DIT_VERSION`. `crates/dit-contracts/build.rs`
+  lấy số từ `tools/dit-version.sh`. `dit-contracts` là crate nền mà engine, orchestrator, hộp đen
+  và UI đều dùng; `dit_ui_core::DIT_VERSION` chỉ dùng lại hằng số đó. Gắn lúc build chứ không
+  truyền lúc chạy: binary build từ commit nào thì tự biết commit đó, không thể ghi nhầm.
+- **Report có trường `dit_version`:**
+
+| Report | File | Schema |
+|---|---|---|
+| CPU-RAM | `system-report.json` | 10 → 11 |
+| Menu [4] power | report power-platform | 3 → 4 (kiểm như 3) |
+| Compute oracle | report compute-oracle | 4 → 5 |
+| CPU-SSD | report từng SSD, report nhiều SSD, report của `nvme-cli` | schema chung, không đổi |
+| GPU-VRAM | report một GPU, nhiều GPU | schema chung, không đổi |
+| Combined | `combined-report.json` | 1 → 2 |
+| Suite | `suite-report.json` | schema chung, không đổi |
+| Hộp đen / hậu kiểm | kết quả do hộp đen ghi | 1 → 2 |
+| Watchdog | `watchdog-status.json`, `watchdog-final.json` | 2 → 3 |
+| Chain | report của chain | 1 → 2 |
+
+- Report đọc lại được đánh `#[serde(default)]`: report cũ không có trường này vẫn đọc được, và
+  `dit_version` rỗng nghĩa là **v1.1**.
+- **`fail-summary.csv`:** thêm cột `dit_version` ngay sau `image_id`. Lần ghi đầu tiên gặp file có
+  header khác, chương trình đổi tên file cũ trước khi ghi, nội dung giữ nguyên:
+  - header không có cột `dit_version` (v1.1) → `fail-summary-v1.1.csv`;
+  - header có cột nhưng khác bố cục → đặt theo version ở dòng cuối, ví dụ
+    `fail-summary-v1.2.005.csv`;
+  - tên đã có thì thêm `-2`, `-3`...
+- **File cũ không chuyển đổi.** Kết quả nào không có `dit_version` (tạo trước 2026-10-13) là bản
+  v1.1.
 
 ### C1 — Sinh pattern theo word (`planned`)
 
@@ -253,8 +271,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 
 ## Thứ tự triển khai
 
-1. V0b: version trong report và CSV. Nhỏ, làm trước để mọi kết quả từ các bản v1.2 sau đều
-   mang version.
+1. V0b: version trong report và CSV (`done`, v1.2.004).
 2. C1: sinh pattern theo word. Độc lập, không đổi dữ liệu, lợi ngay.
 3. C3 + C2: kernel nhiều chuỗi và cách chia worker mới.
 4. C4: binary v3/v4 và cơ chế tự chọn.

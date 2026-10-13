@@ -280,6 +280,9 @@ pub struct SystemProgressReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemRunReport {
     pub schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    #[serde(default)]
+    pub dit_version: String,
     pub test_id: String,
     pub status: RunStatus,
     pub availability: crate::availability::AvailabilityEvidence,

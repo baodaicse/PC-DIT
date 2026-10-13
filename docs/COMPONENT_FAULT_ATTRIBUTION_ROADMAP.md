@@ -161,9 +161,11 @@ FAIL BY PART  CPU 0 | RAM 0 | PCIe-GPU1 12 | GPU1 0 | VRAM1 0 | SSD1 0 | SSD1-pa
 HW EVENTS     RAM CE 0 | PCIe-GPU1 replay +1234 AER +56 link↓2 | Xid 0 | SSD1 media 0
 ```
 
-**`fail-summary.csv`**: mỗi phiên một dòng, nối vào phân vùng kết quả của USB. Các cột: thời gian, image, test/mức,
-mainboard, CPU, RAM, GPU, SSD, verdict, số lỗi của từng ô (confirmed/suspected), unresolved, sự kiện phần cứng chính,
-đường dẫn report. Mở trong Excel là lọc và đếm được cho nhiều máy.
+**`fail-summary.csv`**: mỗi phiên một dòng, nối vào phân vùng kết quả của USB. Các cột: thời gian, image, version
+DIT-01 (`dit_version`, từ v1.2), test/mức, mainboard, CPU, RAM, GPU, SSD, verdict, số lỗi của từng ô
+(confirmed/suspected), unresolved, sự kiện phần cứng chính, đường dẫn report. Mở trong Excel là lọc và đếm được cho
+nhiều máy. File dạng cũ (không có cột `dit_version`, tức bản v1.1) được đổi tên thành `fail-summary-v1.1.csv` ở lần
+ghi đầu tiên của bản v1.2, nội dung giữ nguyên ([v1.2/ROADMAP.md](v1.2/ROADMAP.md), V0b).
 
 ## 4. Roadmap
 

@@ -26,6 +26,9 @@ pub struct DeviceOutcome {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MultiDeviceReport {
     pub schema_version: u32,
+    /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
+    #[serde(default)]
+    pub dit_version: String,
     pub run_id: RunId,
     pub started_unix_ms: u64,
     pub elapsed_seconds: f64,
@@ -110,6 +113,7 @@ where
     let aggregate_verdict = aggregate_verdict(&devices);
     Ok(MultiDeviceReport {
         schema_version: SCHEMA_VERSION,
+        dit_version: dit_contracts::DIT_VERSION.to_owned(),
         run_id,
         started_unix_ms,
         elapsed_seconds: started.elapsed().as_secs_f64(),
