@@ -45,7 +45,7 @@ pub struct CpuRamViewArgs {
     temp_limit_celsius: Option<u32>,
     #[arg(long, default_value_t = 95)]
     full_safe_percent: u32,
-    #[arg(long, default_value = "0.1.0")]
+    #[arg(long, default_value = dit_ui_core::DIT_VERSION)]
     engine_version: String,
     #[arg(long, default_value = "9")]
     report_abi: String,
@@ -631,7 +631,7 @@ mod tests {
             started_unix: 1000,
             temp_limit_celsius: Some(95),
             full_safe_percent: 95,
-            engine_version: "0.1.0".into(),
+            engine_version: dit_ui_core::DIT_VERSION.into(),
             report_abi: "9".into(),
             session_run_id: None,
             watchdog_dir: None,

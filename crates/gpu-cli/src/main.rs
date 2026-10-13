@@ -2936,7 +2936,7 @@ fn render_gpu_ui_legacy(state: &GpuUiState, size: TerminalSize, color: bool) -> 
     );
     let mut lines = vec![
         border("", inner, color),
-        row_colored("DIT-01 / DATA INTEGRITY TEST ENGINE", inner, CYAN, color),
+        row_colored(&dit_ui_core::product_title(), inner, CYAN, color),
         row_colored(
             &format!(
                 "ENGINE GPU-G3-1    REPORT ABI {SCHEMA_VERSION}    BACKEND {}    PROFILE GPU + VRAM / DEEP    HARDWARE {hardware}",

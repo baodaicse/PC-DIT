@@ -110,7 +110,8 @@ c_bar_red="${esc}[22;31m"
 # rule '=' opens a screen's frame the first time and closes it the second; '-' separates.
 rule_open=0
 
-ENGINE_VERSION="${CPU_DIT_ENGINE_VERSION:-0.1.0}"
+# The image's DIT-01 version (tools/dit-version.sh, written by build_boot_image.sh).
+ENGINE_VERSION="${CPU_DIT_ENGINE_VERSION:-$(cat /etc/cpu-dit/version 2>/dev/null || echo unknown)}"
 REPORT_ABI="${CPU_DIT_REPORT_ABI:-9}"
 THERMAL_LIMIT_C="${CPU_DIT_THERMAL_LIMIT_C:-$TEMPERATURE_LIMIT_C}"
 case "${CPU_DIT_TEMP_LIMIT_ENABLED:-$TEMPERATURE_LIMIT_DEFAULT}" in
@@ -991,7 +992,7 @@ draw_running_dashboard() {
     begin_running_frame dashboard
     ui_box 1 1 "$term_rows" "$term_cols" ''
     ui_put 2 4 "$((term_cols - 7))" "$c_cyan" \
-        "CPU-DIT-01 / DATA INTEGRITY TEST ENGINE"
+        "CPU-DIT-01 / DATA INTEGRITY TEST ENGINE / v$ENGINE_VERSION"
     ui_put 3 4 "$((term_cols - 7))" "$c_cyan" \
         "ENGINE $ENGINE_VERSION    REPORT ABI $REPORT_ABI    PROFILE $profile_name / CPU + RAM"
 

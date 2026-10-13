@@ -359,13 +359,14 @@ pub fn render_module_menu(
 ) -> String {
     let width = width.clamp(60, 180);
     let inner = width - 2;
+    let version = dit_ui_core::DIT_VERSION;
     let mut lines = vec![
         format!("+{}+", "-".repeat(inner)),
         menu_line(
-            if attribution {
-                "DIT CONTROL CENTER // FAULT ATTRIBUTION // SELECT TEST MODULE"
+            &if attribution {
+                format!("DIT CONTROL CENTER v{version} // FAULT ATTRIBUTION // SELECT TEST MODULE")
             } else {
-                "DIT CONTROL CENTER // SELECT TEST MODULE"
+                format!("DIT CONTROL CENTER v{version} // SELECT TEST MODULE")
             },
             inner,
         ),

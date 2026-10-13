@@ -216,7 +216,7 @@ fi
 
 # The boot menu names its build: a first information line filled at image build time, with the
 # default chosen by id so that line never becomes what boots unattended.
-grep -Fq 'menuentry "Build @DIT_BUILD_TIME@ | @DIT_IMAGE_ID@" --id build-info' "$GRUB_CONFIG"
+grep -Fq 'menuentry "v@DIT_VERSION@ | Build @DIT_BUILD_TIME@ | @DIT_IMAGE_ID@" --id build-info' "$GRUB_CONFIG"
 grep -Fq 'set default=fault-attribution' "$GRUB_CONFIG"
 # The control center boots with the component fault attribution checks (dit_attribution=1): it
 # is the first test entry, the default and the only control center; the plain one is gone. The

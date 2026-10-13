@@ -1,5 +1,9 @@
 # Roadmap chung DIT-01
 
+> Từ 2026-10-13, phát triển mới đi theo dòng **v1.2.xxx**:
+> [v1.2/ROADMAP.md](v1.2/ROADMAP.md) (test nặng hơn, bắt lỗi nhiều hơn, hiệu quả hơn) và
+> [v1.2/VERSIONING.md](v1.2/VERSIONING.md) (cách đánh số). File này giữ các hạng mục trước v1.2.
+
 ## U1 — Hợp nhất project
 
 - Một workspace 18 crates và một lockfile cho CPU–RAM/CPU–NVMe/GPU–VRAM/watchdog.

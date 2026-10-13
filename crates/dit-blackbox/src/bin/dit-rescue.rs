@@ -222,7 +222,10 @@ impl View {
             sections.push(vec![format!(" {message}")]);
         }
         option_screen(
-            "DIT RESCUE CONSOLE // ALT+F1 RETURNS TO THE TEST",
+            &format!(
+                "DIT RESCUE CONSOLE v{} // ALT+F1 RETURNS TO THE TEST",
+                dit_ui_core::DIT_VERSION
+            ),
             &sections,
             TerminalSize::current(),
         )

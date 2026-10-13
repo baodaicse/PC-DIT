@@ -399,6 +399,7 @@ configure_rootfs() {
     sudo install -D -m 0644 "$ROOT_DIR/vectors/golden-v1.json" \
         "$ROOTFS/opt/cpu-dit-01/vectors/golden-v1.json"
     printf '%s\n' "$image_id" | sudo tee "$ROOTFS/etc/cpu-dit/image-id" >/dev/null
+    printf '%s\n' "$DIT_VERSION" | sudo tee "$ROOTFS/etc/cpu-dit/version" >/dev/null
 
     sudo mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
     sudo ln -sfn /etc/systemd/system/cpu-dit.service \
@@ -422,6 +423,7 @@ configure_rootfs() {
 
     {
         echo "image_id=$image_id"
+        echo "dit_version=$DIT_VERSION"
         echo "ubuntu_release=noble"
         echo "architecture=amd64"
         echo "dit_binary_sha256=$(sha256sum "$ROOT_DIR/target/release/dit-cli" | awk '{print $1}')"
@@ -466,6 +468,7 @@ install_image_extension() {
 render_grub_cfg() {
     local image_id="$1" dest="$2"
     sed -e "s|@DIT_BUILD_TIME@|$BUILD_TIME_LOCAL|" -e "s|@DIT_IMAGE_ID@|$image_id|" \
+        -e "s|@DIT_VERSION@|$DIT_VERSION|" \
         "$ROOT_DIR/image/boot/grub/grub.cfg" >"$dest"
     chmod 0644 "$dest"
     ! grep -q '@DIT_' "$dest" || die "unfilled placeholder left in grub.cfg"
@@ -572,6 +575,7 @@ write_manifest() {
   "project": "DIT-01",
   "modules": ["dit.cpu-ram", "dit.cpu-nvme", "dit.vga", "dit.cpu-power-platform", "dit.combined"],
   "image_id": "$image_id",
+  "dit_version": "$DIT_VERSION",
   "built_local": "$BUILD_TIME_LOCAL",
   "filename": "$(basename "$image")",
   "size_bytes": $bytes,
@@ -593,7 +597,7 @@ EOF
 release_payload_fingerprint() {
     {
         sha256sum "$ROOT_DIR/target/release/dit-cli"
-        printf 'kernel %s\n' "$KERNEL_ABI"
+        printf 'kernel %s\nversion %s\n' "$KERNEL_ABI" "$DIT_VERSION"
         find "$ROOT_DIR/image" "$ROOT_DIR/vectors" -type f -print0 \
             | sort -z \
             | xargs -0 sha256sum
@@ -609,7 +613,10 @@ main() {
     require_project
     install_host_dependencies
     mkdir -p "$BUILD_ROOT" "$OUTPUT_DIR"
-    log "Building unified DIT-01 workspace (CPU-RAM, CPU-SSD/NVMe, GPU-VRAM, control center)"
+    # One version for the whole build: every screen (through cargo), the image, its menu.
+    DIT_VERSION="$("$ROOT_DIR/tools/dit-version.sh")"
+    export DIT_VERSION
+    log "Building unified DIT-01 v$DIT_VERSION workspace (CPU-RAM, CPU-SSD/NVMe, GPU-VRAM, control center)"
     cargo build --release --workspace --manifest-path "$ROOT_DIR/Cargo.toml"
     "$ROOT_DIR/tools/build_image_extension.sh"
     bootstrap_rootfs

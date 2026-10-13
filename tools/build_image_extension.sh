@@ -13,6 +13,10 @@ esac
 mkdir -p "$project_dir/dist" "$staging_dir"
 find "$staging_dir" -mindepth 1 -delete
 
+# The screens show the checkout's version (crates/dit-ui-core/build.rs); build_boot_image.sh
+# passes the one it computed, a direct run computes it here.
+DIT_VERSION="${DIT_VERSION:-$("$project_dir/tools/dit-version.sh")}"
+export DIT_VERSION
 cargo build --release -p nvme-cli -p gpu-cli -p dit-orchestrator -p dit-watchdog -p dit-chain \
     -p dit-blackbox \
     --manifest-path "$project_dir/Cargo.toml"

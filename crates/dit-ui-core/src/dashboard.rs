@@ -220,7 +220,7 @@ pub(super) fn render(state: &UiState, size: TerminalSize, color: bool) -> String
         .duration_limit
         .map_or_else(|| "N/A".to_owned(), |limit| clock(limit.as_secs()));
     let dashboard = UnifiedDashboard {
-        engine: format!("{}-{}", state.title, env!("CARGO_PKG_VERSION")),
+        engine: format!("{}-{}", state.title, crate::DIT_VERSION),
         report_abi: dit_contracts::SCHEMA_VERSION.to_string(),
         profile: "CPU + SSD / NVMe DEEP".to_owned(),
         hardware_rows,

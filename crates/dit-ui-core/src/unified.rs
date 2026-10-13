@@ -381,13 +381,13 @@ fn rescue_hint(room: usize) -> Option<&'static str> {
     .find(|hint| hint.len() + 2 <= room)
 }
 
-/// The title row: the engine's name, centred (painted as a band), and on the right the rescue
-/// console's key.
+/// The title row: the engine's name and version, centred (painted as a band), and on the right
+/// the rescue console's key.
 fn title_row(width: usize) -> String {
     let inner = width.saturating_sub(4);
-    let name = "DIT-01 / DATA INTEGRITY TEST ENGINE";
+    let name = super::product_title();
     let mut row: Vec<char> = format!("{name:^inner$}").chars().collect();
-    let room = inner.saturating_sub(name.len()) / 2;
+    let room = inner.saturating_sub(name.chars().count()) / 2;
     if let Some(hint) = rescue_hint(room) {
         let start = inner - hint.len() - 1;
         for (slot, c) in row[start..].iter_mut().zip(hint.chars()) {

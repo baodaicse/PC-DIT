@@ -933,7 +933,7 @@ fn render_multi_gpu_ui_legacy(
     };
     let mut lines = vec![
         border("", inner, color),
-        row_colored("DIT-01 / DATA INTEGRITY TEST ENGINE", inner, CYAN, color),
+        row_colored(&dit_ui_core::product_title(), inner, CYAN, color),
         row_colored(
             &format!(
                 "ENGINE GPU-G3-1   BACKEND CUDA/VULKAN   PROFILE GPU + VRAM / DEEP   SELECTED {}   PAGE {}/{}",

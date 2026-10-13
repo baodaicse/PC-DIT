@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "dit-blackbox"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "dit-contracts",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "dit-chain"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "dit-contracts",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "dit-cli"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "dit-core",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "dit-contracts"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "dit-core"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "dit-orchestrator"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "dit-source"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "sha2",
  "thiserror",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "dit-system"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "dit-contracts",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "dit-ui-core"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "dit-contracts",
  "serde",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "dit-watchdog"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-cli"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-cuda"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "gpu-engine",
  "gpu-vulkan",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-engine"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-vulkan"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "ash",
  "gpu-engine",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-backend-file"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "libc",
  "memmap2",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-backend-linux"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "dit-contracts",
  "libc",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-cli"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "dit-contracts",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-engine"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "dit-contracts",
  "dit-source",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-inventory"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "dit-contracts",
  "serde",
@@ -593,14 +593,14 @@ dependencies = [
 
 [[package]]
 name = "nvme-io"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "nvme-scheduler"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "dit-contracts",
  "nvme-backend-file",

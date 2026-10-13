@@ -1,5 +1,9 @@
 # DIT-01 — CPU–RAM, CPU–SSD và GPU–VRAM
 
+Version hiện tại: **v1.2.xxx**, tự tăng theo mỗi commit và hiện trên mọi màn hình
+(`./tools/dit-version.sh` in số của checkout này). Roadmap của dòng v1.2:
+[docs/v1.2/ROADMAP.md](docs/v1.2/ROADMAP.md); cách đánh số: [docs/v1.2/VERSIONING.md](docs/v1.2/VERSIONING.md).
+
 Project chung từ ngày 2026-09-06 tại `/home/hoang/DIT-01`: một Cargo workspace, một Cargo.lock, một Makefile và một pipeline Ubuntu Minimal image. Không cần build trong hai project cũ; không liên quan HardwareValidator.
 
 ```bash

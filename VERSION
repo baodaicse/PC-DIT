@@ -1,0 +1,7 @@
+# DIT-01 version: <SERIES>.<n>, n with three digits (v1.2.000, v1.2.001, ...).
+# n counts the commits since the series began, so it moves by itself with every committed change:
+# FIRST is the commit count (git rev-list --count HEAD) of the series' first commit, which is
+# v<SERIES>.000. A build with uncommitted changes shows the number its commit will get, plus
+# "-dev". tools/dit-version.sh applies this rule; see docs/v1.2/VERSIONING.md.
+SERIES=1.2
+FIRST=52

@@ -66,6 +66,8 @@ for file in live/vmlinuz live/initrd.img live/filesystem.squashfs cpu-dit/image-
     [[ -s "$WORK/root/$file" ]] || die "boot payload is missing $file"
 done
 image_id="$(<"$WORK/root/cpu-dit/image-id")"
+# The version the image was built from (its manifest); the ISO adds no code of its own.
+dit_version="$(awk -F'"' '/"dit_version":/ { print $4 }' "$IMAGE.manifest.json" 2>/dev/null || true)"
 iso_time="$(date +'%Y-%m-%d %H:%M %Z')"
 
 layer_image_id="$(awk -F'"' '/"image_id":/ { print $4 }' "$LAYER.manifest.json")"
@@ -130,6 +132,7 @@ cat >"$ISO.manifest.json" <<EOF
   "project": "DIT-01",
   "format": "hybrid_iso",
   "image_id": "$image_id",
+  "dit_version": "${dit_version:-unknown}",
   "built_local": "$iso_time",
   "filename": "$(basename "$ISO")",
   "size_bytes": $bytes,
