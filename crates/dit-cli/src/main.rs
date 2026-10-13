@@ -11,9 +11,10 @@ use dit_core::{
     FaultInjection, RunReport, RunStatus, load_golden_vector, load_verified_source, run_reference,
 };
 use dit_system::{
-    ComputeOracleConfig, ComputeOracleReport, ComputeOracleStatus, EdacPolicy, LockPolicy,
-    MemoryTarget, SafetyFaultInjection, SafetyPolicy, SeedSource, SensorReport, SystemRunConfig,
-    SystemRunReport, collect_sensor_report, format_gpu_summary, run_compute_oracle, run_system,
+    ComputeOracleConfig, ComputeOracleReport, ComputeOracleStatus, EdacPolicy,
+    FMA_ITERATIONS_PER_BURST, LockPolicy, MemoryTarget, SafetyFaultInjection, SafetyPolicy,
+    SeedSource, SensorReport, SystemRunConfig, SystemRunReport, collect_sensor_report,
+    format_gpu_summary, run_compute_oracle, run_system,
 };
 
 #[derive(Debug, Parser)]
@@ -172,14 +173,10 @@ fn power_platform_recover(checkpoint: &Path, output: &Path) -> u8 {
     }
 }
 
-// DIT-DURATION-COMPLEXITY-RAMP-v1 (docs/DURATION_COMPLEXITY_RAMP.md): tiered
-// gate below the threshold, then a capped-linear ramp so a longer
-// --minimum-duration-seconds amortizes a heavier per-burst workload without
-// an unbounded single-burst cost regardless of how large duration is.
-const DEFAULT_DENSE_FMA_ITERATIONS: u32 = 200_000;
-const DENSE_FMA_RAMP_THRESHOLD_SECONDS: u64 = 60;
-const DENSE_FMA_ITERATIONS_PER_SECOND: u32 = 300_000;
-const MAX_AUTO_DENSE_FMA_ITERATIONS: u32 = 500_000_000;
+// Since v1.2 (C3) every burst has the same short length (FMA_ITERATIONS_PER_BURST, about
+// 100 ms), whatever the duration: a longer run checks more bursts instead of longer ones
+// (docs/DURATION_COMPLEXITY_RAMP.md). Before, bursts grew with the duration up to 500 M
+// iterations, and the kernel's recurrence forgot a wrong value long before such a burst ended.
 const MAX_MANUAL_DENSE_FMA_ITERATIONS: u32 = 2_000_000_000;
 
 #[derive(Debug, Args)]
@@ -192,9 +189,8 @@ struct ComputeOracleArgs {
     #[arg(long, default_value_t = 5)]
     minimum_duration_seconds: u64,
 
-    /// FMA/AVX iterations per burst; higher values increase sustained power draw per burst.
-    /// Omit to auto-scale with --minimum-duration-seconds (tiered baseline, then a capped-linear ramp;
-    /// see `docs/DURATION_COMPLEXITY_RAMP.md`, recipe DIT-DURATION-COMPLEXITY-RAMP-v1).
+    /// FMA iterations per burst of the multi-chain kernel. Omit for the standard short burst
+    /// (about 100 ms, the same for every duration; `docs/DURATION_COMPLEXITY_RAMP.md`).
     #[arg(long)]
     dense_fma_iterations: Option<u32>,
 
@@ -718,7 +714,7 @@ fn system_run(args: &SystemRunArgs) -> u8 {
         compute_oracle_workers: args.compute_oracle_workers,
         compute_oracle_dense_fma_iterations: args
             .compute_oracle_dense_fma_iterations
-            .unwrap_or_else(|| suggested_dense_fma_iterations(args.minimum_duration_seconds)),
+            .unwrap_or(FMA_ITERATIONS_PER_BURST),
         compute_oracle_idle_ramp_enabled: args.compute_oracle_idle_ramp,
         compute_oracle_idle_sleep_ms: args.compute_oracle_idle_sleep_ms,
         fault_injection_compute_oracle_worker: args.inject_compute_oracle_worker,
@@ -735,25 +731,10 @@ fn system_run(args: &SystemRunArgs) -> u8 {
     finish_system(&args.report, &report)
 }
 
-/// Tiered gate (below threshold: baseline) then a capped-linear ramp; see
-/// `suggested_compute_rounds` in `crates/gpu-cli/src/main.rs` for the
-/// reference implementation of the same recipe.
-fn suggested_dense_fma_iterations(duration_seconds: u64) -> u32 {
-    if duration_seconds < DENSE_FMA_RAMP_THRESHOLD_SECONDS {
-        return DEFAULT_DENSE_FMA_ITERATIONS;
-    }
-    let extra_seconds = duration_seconds - DENSE_FMA_RAMP_THRESHOLD_SECONDS;
-    let ramped = u64::from(DEFAULT_DENSE_FMA_ITERATIONS)
-        .saturating_add(extra_seconds.saturating_mul(u64::from(DENSE_FMA_ITERATIONS_PER_SECOND)));
-    u32::try_from(ramped)
-        .unwrap_or(u32::MAX)
-        .min(MAX_AUTO_DENSE_FMA_ITERATIONS)
-}
-
-/// Explicit `--dense-fma-iterations` always wins; otherwise derive from duration.
+/// Explicit `--dense-fma-iterations` wins; otherwise the standard short burst.
 fn resolved_dense_fma_iterations(args: &ComputeOracleArgs) -> u32 {
     args.dense_fma_iterations
-        .unwrap_or_else(|| suggested_dense_fma_iterations(args.minimum_duration_seconds))
+        .unwrap_or(FMA_ITERATIONS_PER_BURST)
 }
 
 fn compute_oracle_run(args: &ComputeOracleArgs) -> u8 {
@@ -1000,9 +981,7 @@ const fn status_name(status: RunStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeOracleArgs, DEFAULT_DENSE_FMA_ITERATIONS, DENSE_FMA_RAMP_THRESHOLD_SECONDS,
-        MAX_AUTO_DENSE_FMA_ITERATIONS, parse_seed, resolved_dense_fma_iterations,
-        suggested_dense_fma_iterations,
+        ComputeOracleArgs, FMA_ITERATIONS_PER_BURST, parse_seed, resolved_dense_fma_iterations,
     };
     use clap::Parser;
 
@@ -1051,27 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_fma_iterations_stay_flat_below_threshold_then_ramp_and_cap() {
-        assert_eq!(
-            suggested_dense_fma_iterations(0),
-            DEFAULT_DENSE_FMA_ITERATIONS
-        );
-        assert_eq!(
-            suggested_dense_fma_iterations(DENSE_FMA_RAMP_THRESHOLD_SECONDS),
-            DEFAULT_DENSE_FMA_ITERATIONS
-        );
-        assert!(
-            suggested_dense_fma_iterations(DENSE_FMA_RAMP_THRESHOLD_SECONDS + 1)
-                > DEFAULT_DENSE_FMA_ITERATIONS
-        );
-        assert_eq!(
-            suggested_dense_fma_iterations(u64::MAX),
-            MAX_AUTO_DENSE_FMA_ITERATIONS
-        );
-    }
-
-    #[test]
-    fn explicit_dense_fma_iterations_overrides_the_duration_derived_ramp() {
+    fn bursts_keep_the_standard_length_unless_set_explicitly() {
         let mut args = ComputeOracleArgs {
             workers: 1,
             minimum_duration_seconds: 3_600,
@@ -1084,7 +1043,12 @@ mod tests {
         };
         assert_eq!(
             resolved_dense_fma_iterations(&args),
-            suggested_dense_fma_iterations(3_600)
+            FMA_ITERATIONS_PER_BURST
+        );
+        args.minimum_duration_seconds = 5;
+        assert_eq!(
+            resolved_dense_fma_iterations(&args),
+            FMA_ITERATIONS_PER_BURST
         );
         args.dense_fma_iterations = Some(7);
         assert_eq!(resolved_dense_fma_iterations(&args), 7);

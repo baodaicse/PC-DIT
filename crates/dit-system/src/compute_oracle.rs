@@ -109,17 +109,99 @@ pub(crate) fn heavy_fp_reference(
 /// Eight independent vector dependency chains. This is a portable SIMD workload,
 /// not an assertion that a particular FMA/AVX opcode or peak power was achieved.
 fn heavy_fp_pass(seed: u64, iterations: u32) -> [[u64; FMA_LANES]; HEAVY_ACCUMULATORS] {
-    let pairs: [_; HEAVY_ACCUMULATORS] =
-        std::array::from_fn(|i| fma_seed_lanes(seed.wrapping_add(i as u64)));
+    fma_chains_pass(seed, iterations, FMA_MULTIPLIER)
+}
+
+/// `CHAINS` independent vector FMA recurrences, chain `i` seeded from `seed + i`: while one
+/// chain waits for its previous result the core works on the others, so the FMA units stay busy
+/// instead of idling on one dependency chain's latency.
+fn fma_chains_pass<const CHAINS: usize>(
+    seed: u64,
+    iterations: u32,
+    multiplier: f64,
+) -> [[u64; FMA_LANES]; CHAINS] {
+    let pairs: [_; CHAINS] = std::array::from_fn(|i| fma_seed_lanes(seed.wrapping_add(i as u64)));
     let mut acc = pairs.map(|(initial, _)| f64x4::new(initial));
     let add = pairs.map(|(_, add)| f64x4::new(add));
-    let multiplier = f64x4::splat(FMA_MULTIPLIER);
+    let multiplier = f64x4::splat(multiplier);
     for _ in 0..iterations {
-        for i in 0..HEAVY_ACCUMULATORS {
+        for i in 0..CHAINS {
             acc[i] = acc[i].mul_add(multiplier, add[i]);
         }
     }
     std::hint::black_box(acc.map(|value| value.to_array().map(f64::to_bits)))
+}
+
+/// The compute kernel of CPU-RAM and of the standalone compute oracle since v1.2 (C3):
+/// `FMA_CHAINS` independent vector FMA chains, short bursts, every lane checked bit for bit.
+pub const FMA_KERNEL_ID: &str = "CPU-DIT-FMA-CHAINS-v1";
+
+/// Independent chains per burst: as many as keep the FMA units busy without running out of
+/// registers (measured on a Ryzen 7 3700X: 6 chains reach 31 GFLOP/s with SSE2 while 8 spill and
+/// fall to 12; with AVX2+FMA 10 chains reach 64 GFLOP/s, about 95% of the core's peak).
+#[cfg(target_feature = "fma")]
+pub const FMA_CHAINS: usize = 10;
+/// See the FMA build above.
+#[cfg(not(target_feature = "fma"))]
+pub const FMA_CHAINS: usize = 6;
+
+/// Iterations per burst: about 100 ms on a desktop core (64 ms to 80 ms on the 3700X), so a
+/// result is checked several times a second.
+pub const FMA_ITERATIONS_PER_BURST: u32 = 64_000_000;
+
+/// `1 - 2^-27`. The recurrence `x = m x + a` must stay bounded (it tends to `a / (1 - m)`,
+/// at most about 8.4e6 here) yet forget slowly: with the multiplier of the older kernel
+/// (`1 - 9e-7`), a wrong result was forgotten within about a million iterations, so only the end
+/// of a burst could show it. With `1 - 2^-27` a wrong value still weighs `m^n > 0.6` after a whole
+/// burst.
+const CHAIN_MULTIPLIER: f64 = 0.999_999_992_549_419_4;
+
+/// One step of a chain lane, rounded exactly as the vector path rounds it: one fused rounding
+/// when the build has FMA, a multiply then an add otherwise. IEEE-754 makes either exact, so the
+/// burst is checked bit for bit, not within a tolerance.
+#[inline]
+fn chain_step(acc: f64, add: f64) -> f64 {
+    #[cfg(target_feature = "fma")]
+    {
+        acc.mul_add(CHAIN_MULTIPLIER, add)
+    }
+    #[cfg(not(target_feature = "fma"))]
+    {
+        acc * CHAIN_MULTIPLIER + add
+    }
+}
+
+/// One burst of the C3 kernel on the vector path.
+fn fma_chain_burst(seed: u64, iterations: u32) -> [[u64; FMA_LANES]; FMA_CHAINS] {
+    fma_chains_pass(seed, iterations, CHAIN_MULTIPLIER)
+}
+
+/// What every burst of `(seed, iterations)` must produce: worked out once, lane by lane in plain
+/// scalar code (not the vector path it checks), one thread per chain.
+#[must_use]
+pub fn fma_chain_reference(seed: u64, iterations: u32) -> [[u64; FMA_LANES]; FMA_CHAINS] {
+    let mut reference = [[0_u64; FMA_LANES]; FMA_CHAINS];
+    thread::scope(|scope| {
+        for (chain, result) in reference.iter_mut().enumerate() {
+            scope.spawn(move || {
+                let (mut acc, add) = fma_seed_lanes(seed.wrapping_add(chain as u64));
+                for _ in 0..iterations {
+                    for lane in 0..FMA_LANES {
+                        acc[lane] = chain_step(acc[lane], add[lane]);
+                    }
+                }
+                *result = std::hint::black_box(acc).map(f64::to_bits);
+            });
+        }
+    });
+    reference
+}
+
+/// The chains' final bits folded to one lane set (XOR), compared across workers.
+fn fold_chains(chains: &[[u64; FMA_LANES]; FMA_CHAINS]) -> [u64; FMA_LANES] {
+    chains.iter().fold([0; FMA_LANES], |folded, chain| {
+        std::array::from_fn(|lane| folded[lane] ^ chain[lane])
+    })
 }
 
 pub(crate) fn heavy_fp_mismatches(
@@ -282,6 +364,13 @@ pub struct ComputeOracleReport {
     pub workers_used: usize,
     pub worker_cpu_ids: Vec<usize>,
     pub elapsed_ms: u128,
+    /// The FMA kernel the bursts ran (`CPU-DIT-FMA-CHAINS-v1` since v1.2, checked bit for bit);
+    /// empty in older reports: one chain, checked within a tolerance.
+    #[serde(default)]
+    pub fma_kernel: String,
+    /// Independent FMA chains per burst (1 in older reports).
+    #[serde(default = "crate::report::one_chain")]
+    pub fma_chains: usize,
     pub idle_ramp_cycles: u64,
     /// Resolved value actually used (explicit override or duration-derived
     /// ramp); replay only needs this field, never the original duration.
@@ -351,11 +440,30 @@ pub(crate) fn run_burst(
     }
 }
 
+/// One burst of the CPU-RAM and standalone compute oracle (C3 kernel, branch kernel, AES
+/// known answer), every result checked against its reference.
+pub(crate) fn run_compute_burst(
+    seed: u64,
+    fma_iterations: u32,
+    fma_reference: &[[u64; FMA_LANES]; FMA_CHAINS],
+    branch_predictor_reference: u64,
+) -> BurstOutcome {
+    let chains = fma_chain_burst(std::hint::black_box(seed), fma_iterations);
+    let branch_predictor_final = branch_predictor_pass(seed, BRANCH_PREDICTOR_LENGTH);
+    BurstOutcome {
+        dense_fma_final_bits: fold_chains(&chains),
+        dense_fma_mismatch: chains != *fma_reference,
+        branch_predictor_final,
+        branch_mismatch: branch_predictor_final != branch_predictor_reference,
+        aes_mismatch: !aes256_known_answer(),
+    }
+}
+
 fn worker_loop(
     worker_id: usize,
     cpu_id: usize,
     config: &ComputeOracleConfig,
-    dense_fma_scalar_reference: &[f64; FMA_LANES],
+    fma_reference: &[[u64; FMA_LANES]; FMA_CHAINS],
     branch_predictor_reference: u64,
     deadline: Instant,
 ) -> WorkerOutcome {
@@ -372,10 +480,10 @@ fn worker_loop(
             thread::sleep(Duration::from_millis(config.idle_sleep_ms));
             idle_ramp_cycles += 1;
         }
-        let burst = run_burst(
+        let burst = run_compute_burst(
             config.seed,
             config.dense_fma_iterations_per_burst,
-            dense_fma_scalar_reference,
+            fma_reference,
             branch_predictor_reference,
         );
         dense_fma_final_bits = burst.dense_fma_final_bits;
@@ -421,7 +529,7 @@ pub(crate) fn run_worker_with_control(
     idle_ramp_enabled: bool,
     idle_sleep_ms: u64,
     fault_injection_worker: Option<usize>,
-    dense_fma_scalar_reference: [f64; FMA_LANES],
+    fma_reference: [[u64; FMA_LANES]; FMA_CHAINS],
     branch_predictor_reference: u64,
     control: &RunControl,
     finished: &AtomicBool,
@@ -440,10 +548,10 @@ pub(crate) fn run_worker_with_control(
             thread::sleep(Duration::from_millis(idle_sleep_ms));
             idle_ramp_cycles += 1;
         }
-        let burst = run_burst(
+        let burst = run_compute_burst(
             seed,
             dense_fma_iterations,
-            &dense_fma_scalar_reference,
+            &fma_reference,
             branch_predictor_reference,
         );
         dense_fma_final_bits = burst.dense_fma_final_bits;
@@ -505,8 +613,7 @@ pub fn run_compute_oracle(
     // dense-FMA reference is a pure function of (seed, iterations), so every
     // burst is checked against it below instead of only the last one.
     let branch_predictor_reference = branch_predictor_pass(config.seed, BRANCH_PREDICTOR_LENGTH);
-    let dense_fma_scalar_reference_value =
-        dense_fma_scalar_reference(config.seed, config.dense_fma_iterations_per_burst);
+    let fma_reference = fma_chain_reference(config.seed, config.dense_fma_iterations_per_burst);
 
     let started = Instant::now();
     let deadline = started + Duration::from_millis(config.minimum_duration_ms);
@@ -520,7 +627,7 @@ pub fn run_compute_oracle(
                     worker_id,
                     cpu_id,
                     &config,
-                    &dense_fma_scalar_reference_value,
+                    &fma_reference,
                     branch_predictor_reference,
                     deadline,
                 )
@@ -586,8 +693,8 @@ pub fn run_compute_oracle(
     Ok(ComputeOracleReport {
         // v3: records the resolved dense_fma_iterations_per_burst (DIT-
         // DURATION-COMPLEXITY-RAMP-v1) alongside the v2 per-burst mismatch fix.
-        // v5: dit_version.
-        schema_version: 5,
+        // v5: dit_version. v6: multi-chain FMA kernel (fma_kernel, fma_chains).
+        schema_version: 6,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability: crate::availability::AvailabilityEvidence::new(
             if coverage_met {
@@ -606,6 +713,8 @@ pub fn run_compute_oracle(
         workers_used: worker_cpus.len(),
         worker_cpu_ids: worker_cpus,
         elapsed_ms: started.elapsed().as_millis(),
+        fma_kernel: FMA_KERNEL_ID.to_owned(),
+        fma_chains: FMA_CHAINS,
         idle_ramp_cycles,
         dense_fma_iterations_per_burst: config.dense_fma_iterations_per_burst,
         dense_fma_cross_worker_consistent: aggregate.dense_fma_cross_worker_consistent,
@@ -736,9 +845,47 @@ pub(crate) fn aggregate_outcomes(outcomes: &[WorkerOutcome]) -> ComputeOracleAgg
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeOracleConfig, ComputeOracleStatus, aes256_known_answer, branch_predictor_pass,
-        dense_fma_pass, dense_fma_scalar_reference, run_compute_oracle,
+        BRANCH_PREDICTOR_LENGTH, CHAIN_MULTIPLIER, ComputeOracleConfig, ComputeOracleStatus,
+        FMA_CHAINS, aes256_known_answer, branch_predictor_pass, dense_fma_pass,
+        dense_fma_scalar_reference, fma_chain_burst, fma_chain_reference, run_compute_burst,
+        run_compute_oracle,
     };
+
+    #[test]
+    fn chain_kernel_matches_its_scalar_reference_bit_for_bit() {
+        assert_eq!(
+            CHAIN_MULTIPLIER.to_bits(),
+            (1.0 - 1.0 / f64::from(1_u32 << 27)).to_bits()
+        );
+        for seed in [0, 1, 0x0123_4567_89ab_cdef, u64::MAX] {
+            for iterations in [0, 1, 7, 1_000, 250_000] {
+                assert_eq!(
+                    fma_chain_burst(seed, iterations),
+                    fma_chain_reference(seed, iterations),
+                    "seed {seed:#x}, {iterations} iterations"
+                );
+            }
+        }
+        // Chains are independent: different seeds per chain, different results.
+        let chains = fma_chain_reference(5, 1_000);
+        for (index, chain) in chains.iter().enumerate() {
+            assert!(chains[index + 1..].iter().all(|other| other != chain));
+            assert!(chain.iter().all(|bits| f64::from_bits(*bits).is_finite()));
+        }
+        assert_eq!(chains.len(), FMA_CHAINS);
+    }
+
+    #[test]
+    fn chain_burst_reports_a_single_wrong_bit() {
+        let seed = 0x5eed;
+        let iterations = 10_000;
+        let branch = branch_predictor_pass(seed, BRANCH_PREDICTOR_LENGTH);
+        let reference = fma_chain_reference(seed, iterations);
+        assert!(!run_compute_burst(seed, iterations, &reference, branch).dense_fma_mismatch);
+        let mut wrong = reference;
+        wrong[FMA_CHAINS - 1][3] ^= 1;
+        assert!(run_compute_burst(seed, iterations, &wrong, branch).dense_fma_mismatch);
+    }
 
     #[test]
     fn dense_fma_is_deterministic_for_same_seed() {
@@ -891,5 +1038,45 @@ mod tests {
         let healthy_burst =
             super::run_burst(11, 1_000, &correct_scalar_reference, branch_reference);
         assert!(!healthy_burst.dense_fma_mismatch);
+    }
+
+    /// FMA throughput by chain count (`cargo test --release -p dit-system --lib
+    /// fma_chain_speed -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement, run by hand in release"]
+    fn fma_chain_speed() {
+        fn measure(label: &str, chains: u32, run: impl Fn(u32)) {
+            let iterations = 20_000_000_u32 / chains.max(1);
+            run(iterations / 10);
+            let started = std::time::Instant::now();
+            run(iterations);
+            let seconds = started.elapsed().as_secs_f64();
+            // One fused multiply-add per lane: 2 flops, 4 lanes per chain.
+            let flops = 2.0 * 4.0 * f64::from(chains) * f64::from(iterations);
+            println!(
+                "{label:10} {:6.2} GFLOP/s  {:7.2} ns/iteration",
+                flops / seconds / 1e9,
+                seconds * 1e9 / f64::from(iterations)
+            );
+        }
+        measure("old kernel", 1, |n| {
+            std::hint::black_box(super::dense_fma_pass(1, n));
+        });
+        measure("4 chains", 4, |n| {
+            std::hint::black_box(super::fma_chains_pass::<4>(1, n, super::CHAIN_MULTIPLIER));
+        });
+        measure("6 chains", 6, |n| {
+            std::hint::black_box(super::fma_chains_pass::<6>(1, n, super::CHAIN_MULTIPLIER));
+        });
+        measure("8 chains", 8, |n| {
+            std::hint::black_box(super::fma_chains_pass::<8>(1, n, super::CHAIN_MULTIPLIER));
+        });
+        measure("10 chains", 10, |n| {
+            std::hint::black_box(super::fma_chains_pass::<10>(1, n, super::CHAIN_MULTIPLIER));
+        });
+        let chains = u32::try_from(super::FMA_CHAINS).expect("chains");
+        measure("C3 kernel", chains, |n| {
+            std::hint::black_box(super::fma_chain_burst(1, n));
+        });
     }
 }

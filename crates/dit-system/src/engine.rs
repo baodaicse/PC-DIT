@@ -475,7 +475,7 @@ fn run_system_once(
     // genuinely overlap the RAM write/verify phases in wall-clock time.
     let compute_oracle_branch_reference =
         compute_oracle::branch_predictor_pass(config.seed, compute_oracle::BRANCH_PREDICTOR_LENGTH);
-    let compute_oracle_dense_fma_reference = compute_oracle::dense_fma_scalar_reference(
+    let compute_oracle_fma_reference = compute_oracle::fma_chain_reference(
         config.seed,
         config.compute_oracle_dense_fma_iterations,
     );
@@ -500,7 +500,7 @@ fn run_system_once(
                     idle_ramp_enabled,
                     idle_sleep_ms,
                     fault_worker,
-                    compute_oracle_dense_fma_reference,
+                    compute_oracle_fma_reference,
                     compute_oracle_branch_reference,
                     &control,
                     &finished,
@@ -743,6 +743,8 @@ fn run_system_once(
                 config.compute_oracle_workers,
                 config.compute_oracle_idle_ramp_enabled,
             ),
+            fma_kernel: compute_oracle::FMA_KERNEL_ID.to_owned(),
+            fma_chains: compute_oracle::FMA_CHAINS,
             dense_fma_iterations_per_burst: config.compute_oracle_dense_fma_iterations,
             workers_used: compute_oracle_outcomes.len(),
             worker_cpu_ids: compute_oracle_worker_cpus.clone(),
@@ -915,8 +917,9 @@ fn run_system_once(
     let power_platform = crate::power_platform::PowerPlatformEvidence::from_telemetry(&telemetry);
     Ok(SystemRunReport {
         // v11: dit_version. v12: round digests hashed every CONTENT_HASH_EVERY_ROUNDS rounds
-        // (round_digests[].content_hashed, config.content_hash_every_rounds).
-        schema_version: 12,
+        // (round_digests[].content_hashed, config.content_hash_every_rounds). v13: compute
+        // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains).
+        schema_version: 13,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,

@@ -47,7 +47,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | V0b | Ghi version vào report và `fail-summary.csv` | `done` (v1.2.004) |
 | C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `done` (v1.2.006) |
 | C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `planned` |
-| C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `planned` |
+| C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `done` (v1.2.007) |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `planned` |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `planned` |
@@ -160,13 +160,30 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
 - Kết quả mong muốn: RAM chạy gần đầy bus, đồng thời lõi CPU chịu tải FMA/AVX nặng. Đây là tình
   huống làm lộ lỗi IMC và XMP/EXPO khi dòng điện của lõi cao.
 
-### C3 — Kernel nhiều chuỗi, ramp theo tầng (`planned`)
+### C3 — Kernel nhiều chuỗi, ramp theo tầng (`done`, v1.2.007)
 
-- Tải chính dùng 8–12 chuỗi FMA độc lập (như `heavy_fp_pass` của menu 4) thay cho một chuỗi.
-- Burst ngắn khoảng 50–200 ms để lần kiểm dày hơn.
-- Ramp theo thời lượng thêm **tầng kernel** thay vì kéo dài burst. Ví dụ: 120 s chạy kernel nhiều
-  chuỗi; từ 10 phút trở lên thêm C5; mức dài thêm C6. Hằng số phải đo trước khi chọn
-  (`docs/DURATION_COMPLEXITY_RAMP.md`).
+Áp dụng cho phần tính toán của CPU-RAM (`system-run --compute-oracle-workers`) và
+`compute-oracle-run`. Menu [4] power-sweep giữ kernel cũ.
+
+- **Kernel `CPU-DIT-FMA-CHAINS-v1`:** nhiều chuỗi FMA vector độc lập. Số chuỗi theo tập lệnh của
+  binary, chọn bằng phép đo trên 3700X:
+
+| Binary | Chuỗi | GFLOP/s mỗi lõi | Kernel cũ |
+|---|---|---|---|
+| SSE2 (hiện tại) | 6 | 30,4 | 5,5 |
+| AVX2+FMA (sau C4) | 10 | 64 (khoảng 95% đỉnh) | 6,6 |
+
+  Nhiều chuỗi hơn thì hết thanh ghi và chậm hẳn (SSE2 8 chuỗi: 12–19 GFLOP/s; AVX2 16 chuỗi: 28).
+- **Kiểm khớp từng bit**, không còn ngưỡng 1e-9: đáp án chuẩn tính bằng code scalar riêng, làm
+  tròn đúng như đường vector (một lần khi binary có FMA; nhân rồi cộng khi không có), mỗi chuỗi một
+  luồng lúc bắt đầu phiên. IEEE-754 cho kết quả tất định, nên lệch 1 ulp cũng là lỗi.
+- **Phép lặp quên chậm:** `x = m·x + a` với `m = 1 - 2^-27`. Kernel cũ dùng `m = 1 - 9e-7`, quên
+  một giá trị sai sau khoảng 1 triệu vòng. Với `1 - 2^-27`, sai số còn hơn 60% sau cả một burst.
+- **Burst cố định 64 triệu vòng** (khoảng 100 ms; đo thật 150 ms khi chung lõi với luồng RAM qua
+  SMT), thay cho ramp theo thời lượng lên tới 500 triệu vòng. Phiên dài thì kiểm nhiều burst hơn.
+- **Ramp theo tầng kernel:** hiện chỉ có tầng 1. C5 và C6 sẽ thêm tầng theo thời lượng.
+- Report: `compute_oracle.fma_kernel`, `compute_oracle.fma_chains` (system schema 13, compute
+  oracle schema 6); report cũ không có hai trường này là kernel một chuỗi.
 
 ### C4 — Binary theo mức ISA (`planned`, chốt 2026-10-13)
 
@@ -309,7 +326,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 
 1. V0b: version trong report và CSV (`done`, v1.2.004).
 2. C1: sinh pattern theo word (`done`, v1.2.006).
-3. C3 + C2: kernel nhiều chuỗi và cách chia worker mới.
+3. C3 + C2: kernel nhiều chuỗi (C3 `done`, v1.2.007) và cách chia worker mới.
 4. C4: binary v3/v4 và cơ chế tự chọn.
 5. C5: các kernel mới.
 6. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.

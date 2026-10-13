@@ -43,6 +43,10 @@ pub struct SystemConfigEvidence {
     pub content_hash_every_rounds: u32,
 }
 
+pub(crate) const fn one_chain() -> usize {
+    1
+}
+
 const fn every_round() -> u32 {
     1
 }
@@ -238,6 +242,13 @@ pub struct SystemComputeOracleEvidence {
     pub workers_requested: usize,
     pub minimum_bursts_per_worker: u64,
     pub coverage_met: bool,
+    /// The FMA kernel the bursts ran (`CPU-DIT-FMA-CHAINS-v1` since v1.2, checked bit for bit);
+    /// empty in older reports: one chain, checked within a tolerance.
+    #[serde(default)]
+    pub fma_kernel: String,
+    /// Independent FMA chains per burst (1 in older reports).
+    #[serde(default = "one_chain")]
+    pub fma_chains: usize,
     pub dense_fma_iterations_per_burst: u32,
     pub workers_used: usize,
     pub worker_cpu_ids: Vec<usize>,
@@ -258,6 +269,8 @@ impl SystemComputeOracleEvidence {
             workers_requested: 0,
             minimum_bursts_per_worker: 0,
             coverage_met: true,
+            fma_kernel: String::new(),
+            fma_chains: 0,
             dense_fma_iterations_per_burst: 0,
             workers_used: 0,
             worker_cpu_ids: Vec::new(),

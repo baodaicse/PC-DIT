@@ -20,7 +20,8 @@ mod window;
 
 pub use compute_oracle::{
     ComputeOracleConfig, ComputeOracleMismatch, ComputeOracleReport, ComputeOracleStatus,
-    ComputeOracleWorkerEvidence, run_compute_oracle,
+    ComputeOracleWorkerEvidence, FMA_CHAINS, FMA_ITERATIONS_PER_BURST, FMA_KERNEL_ID,
+    run_compute_oracle,
 };
 pub use engine::{SeedSource, SystemRunConfig, run_system};
 pub use error::SystemDitError;

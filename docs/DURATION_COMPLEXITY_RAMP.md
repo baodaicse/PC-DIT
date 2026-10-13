@@ -1,7 +1,7 @@
 # Duration-Complexity Ramp — thiết kế chung cho DIT-01
 
 Recipe ID: `DIT-DURATION-COMPLEXITY-RAMP-v1`
-Trạng thái: GPU-VRAM `implemented`; CPU-RAM `implemented`; CPU-NVMe `researched, not yet coded` (xem mục roadmap ở cuối file).
+Trạng thái: GPU-VRAM `implemented`; CPU-RAM `implemented`, thay bằng burst cố định từ v1.2.007; CPU-NVMe `researched, not yet coded` (xem mục roadmap ở cuối file).
 Tài liệu này mô tả một pattern chung để bất kỳ AI coding tool hoặc lập trình viên nào cũng triển khai nhất quán, không cần đọc lại toàn bộ lịch sử hội thoại.
 
 ## Từ khóa tra cứu
@@ -67,6 +67,16 @@ Số đo thực nghiệm làm căn cứ chọn `TRẦN`: `rounds=4096` ở `matr
 4. **Validate riêng cho override tường minh**, không áp lên giá trị tự động (giá trị tự động đã an toàn theo thiết kế công thức).
 
 ## Đã triển khai: CPU-RAM (`dense_fma_iterations_per_burst`)
+
+> **Thay thế từ v1.2.007 (C3, [v1.2/ROADMAP.md](v1.2/ROADMAP.md)).** CPU-RAM và `compute-oracle-run`
+> không còn kéo dài burst theo thời lượng. Kernel mới `CPU-DIT-FMA-CHAINS-v1` có nhiều chuỗi FMA
+> độc lập, mỗi burst cố định `FMA_ITERATIONS_PER_BURST` = 64 triệu vòng (khoảng 100 ms) và được
+> kiểm khớp từng bit. Thời lượng dài hơn thì kiểm **nhiều burst hơn**, không phải burst dài hơn. Lý
+> do: phép lặp của kernel cũ (`x = (1 - 9e-7)·x + a`) quên một giá trị sai sau khoảng 1 triệu vòng,
+> nên với burst 500 triệu vòng, lỗi xảy ra trong phần lớn burst đã tắt trước lúc kiểm. Độ nặng theo
+> thời lượng sẽ tăng bằng **tầng kernel** (C5, C6), không bằng độ dài burst.
+> `--dense-fma-iterations` / `--compute-oracle-dense-fma-iterations` vẫn ghi đè được (test, đo).
+> Phần dưới đây là lịch sử của ramp cũ. Menu [4] power-sweep vẫn dùng kernel cũ, không đổi.
 
 Cập nhật 3C (2026-09-18): `system-run` cũng resolve FMA depth theo duration khi
 không truyền `--compute-oracle-dense-fma-iterations`, ghi vào system schema v10.
