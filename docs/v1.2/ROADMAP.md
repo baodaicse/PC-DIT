@@ -44,11 +44,11 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | ID | Hạng mục | Trạng thái |
 |---|---|---|
 | V0 | Version v1.2.xxx tự động và hiển thị trên UI | `done` (v1.2.000) |
-| V0b | Ghi version vào report và `fail-summary.csv` | `proposed` |
+| V0b | Ghi version vào report và `fail-summary.csv` | `planned` |
 | C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `planned` |
-| C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `proposed` |
+| C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `planned` |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `planned` |
-| C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `proposed` |
+| C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `planned` |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `planned` |
 
@@ -66,10 +66,21 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 - Image ghi `/etc/cpu-dit/version`, `dit_version=` trong build-info, `"dit_version"` trong manifest
   của `.img` và ISO.
 
-**V0b (đề xuất):** kết quả trên USB hiện chỉ mang `image_id`. Đề xuất thêm `dit_version` vào
-report JSON của từng module và thêm một cột vào `fail-summary.csv`. Khi gộp kết quả thực tế sẽ biết
-ngay lượt nào chạy bản nào. Cần thống nhất cách xử lý file CSV cũ trên USB: thêm cột cuối, hoặc
-sang file mới khi header khác.
+### V0b — Version trong kết quả (`planned`)
+
+Kết quả trên USB hiện chỉ mang `image_id`. Khi gộp kết quả thực tế cần biết ngay lượt nào chạy bản
+nào. Đã chốt 2026-10-13:
+
+- Thêm `dit_version` vào report JSON của mọi module (CPU-RAM, CPU-SSD, GPU-VRAM, combined, kết quả
+  hộp đen/hậu kiểm) và thêm cột `dit_version` vào `fail-summary.csv`.
+- **File cũ bỏ qua, không chuyển đổi.** Mọi report và dòng CSV không có `dit_version` (tức tạo
+  trước 2026-10-13) được coi là bản **v1.1**.
+- Khi USB đã có `fail-summary.csv` dạng cũ (header không có `dit_version`): đổi tên file đó thành
+  `fail-summary-v1.1.csv`, nội dung giữ nguyên, rồi mở `fail-summary.csv` mới với header mới. Nhờ
+  vậy không file nào lẫn hai dạng dòng, và `fail-summary.csv` luôn là file hiện hành.
+- Các engine (`dit-cli`, `cpu-nvme-dit`, `gpu-vram-dit`) chưa phụ thuộc `dit-ui-core`. Version cần
+  chuyển xuống một crate mà mọi binary đều dùng (ví dụ `dit-contracts`), vẫn lấy từ
+  `tools/dit-version.sh`.
 
 ### C1 — Sinh pattern theo word (`planned`)
 
@@ -83,7 +94,7 @@ sang file mới khi header khác.
 - Đạt khi: cùng từng byte; một worker ≥ 4 GB/s trên 3700X; lượt full trên máy thật gần chạm băng
   thông RAM.
 
-### C2 — Chia worker theo phép đo và loại lõi (`proposed`)
+### C2 — Chia worker theo phép đo và loại lõi (`planned`, chốt 2026-10-13)
 
 - Sau C1, khoảng 12–16 worker là đủ làm đầy bus RAM. Thêm worker RAM nữa không làm RAM nặng hơn,
   vì chúng chỉ chờ bus.
@@ -103,7 +114,7 @@ sang file mới khi header khác.
   chuỗi; từ 10 phút trở lên thêm C5; mức dài thêm C6. Hằng số phải đo trước khi chọn
   (`docs/DURATION_COMPLEXITY_RAMP.md`).
 
-### C4 — Binary theo mức ISA (`proposed`)
+### C4 — Binary theo mức ISA (`planned`, chốt 2026-10-13)
 
 - Build ba bản: v1 (baseline, như hiện nay), v3 (AVX2+FMA), v4 (AVX-512). Repo cấm `unsafe` nên
   tách binary là cách sạch nhất. ISO lớn thêm vài MB.
@@ -232,21 +243,23 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 | Thời lượng | Giữ nguyên, tăng độ nặng | đã chốt (2026-10-13) |
 | Throttle | Không ảnh hưởng kết quả, giữ chính sách hiện nay | đã chốt (2026-10-13) |
 | Version | v1.2.xxx, xxx tự tăng theo commit, hiện trên UI | đã chốt (2026-10-13) |
-| C2 | Tự đo đầu phiên, chia theo loại lõi | chờ xác nhận |
-| C4 | Tự chọn mặc định, `dit_isa=` ẩn cho kỹ thuật viên | chờ xác nhận |
+| C2 | Đầu phiên tự đo để chia worker RAM và worker tính toán; xếp luồng theo loại lõi (P/E) | đã chốt (2026-10-13) |
+| C4 | Tự chọn AVX2/AVX-512 theo CPU là mặc định; `dit_isa=` ẩn cho kỹ thuật viên | đã chốt (2026-10-13) |
 | C6 combined | Deep: A+B, ngân sách cố định khoảng 20% (12 phút) lấy từ pha chạy chồng; Bounded: không xoay; Soak: mỗi chu kỳ một lượt A+B; E-core xoay theo cụm | đã chốt (2026-10-13) |
 | C6 boost | Bước không đạt gần xung tối đa ghi NOTE "không đạt boost", không tính FAIL | đã chốt (2026-10-13) |
 | C6 menu [1] CPU + RAM | Full: A đầu phiên, khoảng 6 phút trong 30 phút; Safe: không xoay | đã chốt (2026-10-13) |
 | C6 menu [4] | Power-sweep giữ nguyên | đã chốt (2026-10-13) |
-| V0b | Version trong report và CSV | chờ xác nhận |
+| V0b | Version trong report và `fail-summary.csv`; file cũ không chuyển đổi, thiếu `dit_version` (trước 2026-10-13) là v1.1; CSV dạng cũ đổi tên `fail-summary-v1.1.csv` | đã chốt (2026-10-13) |
 
 ## Thứ tự triển khai
 
-1. C1: sinh pattern theo word. Độc lập, không đổi dữ liệu, lợi ngay.
-2. C3 + C2: kernel nhiều chuỗi và cách chia worker mới.
-3. C4: binary v3/v4 và cơ chế tự chọn.
-4. C5: các kernel mới.
-5. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.
+1. V0b: version trong report và CSV. Nhỏ, làm trước để mọi kết quả từ các bản v1.2 sau đều
+   mang version.
+2. C1: sinh pattern theo word. Độc lập, không đổi dữ liệu, lợi ngay.
+3. C3 + C2: kernel nhiều chuỗi và cách chia worker mới.
+4. C4: binary v3/v4 và cơ chế tự chọn.
+5. C5: các kernel mới.
+6. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.
