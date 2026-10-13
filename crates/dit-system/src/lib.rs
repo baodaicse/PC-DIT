@@ -15,6 +15,7 @@ pub mod pressure;
 pub mod procs;
 mod report;
 mod safety;
+mod split;
 mod telemetry;
 mod window;
 
@@ -43,6 +44,7 @@ pub use report::{
 pub use safety::{
     AbortEvent, AbortKind, EdacPolicy, SafetyEvidence, SafetyFaultInjection, SafetyPolicy,
 };
+pub use split::{SplitStep, WorkerSplitEvidence};
 pub use telemetry::{
     KernelEventEvidence, LiveSensorSampler, PowerReading, SensorReport, TelemetryAvailability,
     TelemetryEvidence, TelemetrySnapshot, TemperatureReading, ThrottleDelta, ThrottleGroup,

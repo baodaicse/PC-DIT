@@ -332,6 +332,9 @@ pub struct SystemRunReport {
     pub arenas: Vec<ArenaEvidence>,
     pub workers: Vec<WorkerEvidence>,
     pub round_digests: Vec<RoundDigest>,
+    /// How the threads were split between RAM and compute workers (v1.2.009 on; absent before).
+    #[serde(default)]
+    pub worker_split: Option<crate::split::WorkerSplitEvidence>,
     pub window_coverage: WindowCoverageEvidence,
     pub rounds_requested: u32,
     pub rounds_completed: u32,

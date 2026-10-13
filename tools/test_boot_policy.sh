@@ -266,7 +266,7 @@ grub-script-check "$GRUB_CONFIG" 2>/dev/null || ! command -v grub-script-check >
 
 # CPU compute oracle: Full runs it on a quarter of the logical CPUs next to the RAM rounds, and
 # the CPU COMPUTE profile runs it on all but one, with idle/burst ramps.
-grep -Fq -- '--compute-oracle-workers "$ORACLE_CPUS"' "$RUNNER"
+grep -Fq -- '--measure-split' "$RUNNER"
 grep -Fq -- '--compute-oracle-workers "$((LOGICAL_CPUS - 1))"' "$RUNNER"
 grep -Fq -- '--compute-oracle-idle-ramp' "$RUNNER"
 grep -Fq "run_profile compute 'CPU COMPUTE'" "$UI"

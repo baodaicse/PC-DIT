@@ -314,10 +314,10 @@ fi
 
 # CPU compute oracle (ADR-0004: dense FMA/AVX, integer branch predictor, AES-256 known-answer,
 # each with its own oracle) runs on logical CPUs the RAM workers leave free, concurrently with
-# the RAM rounds. Full gives it a quarter of the CPUs; the compute profile gives it all but one.
+# the RAM rounds. Full: the engine measures how many RAM workers fill the memory bus and gives
+# the rest to the oracle, at least a quarter of the CPUs (--measure-split, v1.2 C2); the
+# compute profile gives it all but one.
 LOGICAL_CPUS="$(nproc)"
-ORACLE_CPUS=$(( LOGICAL_CPUS / 4 ))
-(( LOGICAL_CPUS >= 2 && ORACLE_CPUS < 1 )) && ORACLE_CPUS=1
 
 SYSTEM_ARGS=(
     system-run
@@ -358,15 +358,9 @@ case "$PROFILE" in
         PROFILE_DURATION="${CPU_DIT_MIN_DURATION_SECONDS:-$FULL_MINIMUM_DURATION_SECONDS}"
         [[ "$PROFILE_DURATION" =~ ^[0-9]+$ && "$PROFILE_DURATION" -ge 60 ]] || exit 3
         DEADLINE_SECONDS=$((PROFILE_DURATION + FULL_DEADLINE_MARGIN_SECONDS))
-        if (( ORACLE_CPUS > 0 )); then
-            SYSTEM_ARGS+=(
-                --workers "$((LOGICAL_CPUS - ORACLE_CPUS))"
-                --compute-oracle-workers "$ORACLE_CPUS"
-            )
-        else
-            SYSTEM_ARGS+=(--workers 0)
-        fi
         SYSTEM_ARGS+=(
+            --workers 0
+            --measure-split
             --safe-percent "$FULL_SAFE_PERCENT"
             --reserve-mib "$FULL_RESERVE_MIB"
             --rounds "$FULL_MINIMUM_ROUNDS"

@@ -176,6 +176,12 @@ fn fma_chain_burst(seed: u64, iterations: u32) -> [[u64; FMA_LANES]; FMA_CHAINS]
     fma_chains_pass(seed, iterations, CHAIN_MULTIPLIER)
 }
 
+/// The C3 kernel as plain load, unchecked: the split probe (`split.rs`) runs it on the compute
+/// threads so the RAM workers it measures share their cores as they will during the test.
+pub(crate) fn burn_fma(seed: u64, iterations: u32) -> [[u64; FMA_LANES]; FMA_CHAINS] {
+    fma_chain_burst(seed, iterations)
+}
+
 /// What every burst of `(seed, iterations)` must produce: worked out once, lane by lane in plain
 /// scalar code (not the vector path it checks), one thread per chain.
 #[must_use]

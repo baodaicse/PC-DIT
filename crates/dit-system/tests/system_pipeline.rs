@@ -38,6 +38,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
         safety_fault_injection: SafetyFaultInjection::default(),
         diagnostic_rerun: false,
         compute_oracle_workers: 0,
+        measure_split: false,
         compute_oracle_dense_fma_iterations: 1_000,
         compute_oracle_idle_ramp_enabled: false,
         compute_oracle_idle_sleep_ms: 0,
@@ -51,7 +52,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
 fn adaptive_multi_core_pipeline_passes() {
     let report = run_system(&verified_source(), &config(None)).expect("system run");
     assert_eq!(report.status, RunStatus::Pass);
-    assert_eq!(report.schema_version, 14);
+    assert_eq!(report.schema_version, 15);
     assert_eq!(report.dit_version, dit_contracts::DIT_VERSION);
     assert!(!report.compute_oracle.enabled);
     assert!(report.memory.allocation_target_met);
@@ -132,6 +133,40 @@ fn ram_contents_are_hashed_every_fourth_round_and_compared_every_round() {
             .iter()
             .all(|worker| worker.sha256_digest.len() == 64)
     );
+}
+
+#[test]
+fn measured_split_gives_the_rest_of_the_pool_to_compute() {
+    let mut run = config(None);
+    run.requested_workers = 0;
+    run.measure_split = true;
+    run.target = MemoryTarget::Bytes(64 * 1024 * 1024);
+    run.arena_target_bytes = 4 * 1024 * 1024;
+    run.minimum_arena_bytes = 4 * 1024 * 1024;
+    run.rounds = 1;
+    let report = run_system(&verified_source(), &run).expect("measured split run");
+    assert_eq!(report.status, RunStatus::Pass);
+    let split = report.worker_split.expect("split evidence");
+    assert_eq!(split.mode, "measured");
+    assert_eq!(
+        split.ram_workers + split.compute_workers,
+        split.pool_threads
+    );
+    assert!(split.compute_workers >= split.minimum_compute_workers);
+    assert_eq!(report.workers.len(), split.ram_workers.min(16));
+    if split.pool_threads >= 2 {
+        assert!(report.compute_oracle.enabled);
+        assert_eq!(
+            report.compute_oracle.worker_cpu_ids.len(),
+            split.compute_workers
+        );
+        assert!(report.compute_oracle.coverage_met);
+    }
+
+    let mut both = config(None);
+    both.measure_split = true;
+    both.compute_oracle_workers = 1;
+    assert!(run_system(&verified_source(), &both).is_err());
 }
 
 #[test]

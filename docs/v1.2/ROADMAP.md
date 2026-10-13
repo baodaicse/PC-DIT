@@ -46,7 +46,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | V0 | Version v1.2.xxx tự động và hiển thị trên UI | `done` (v1.2.000) |
 | V0b | Ghi version vào report và `fail-summary.csv` | `done` (v1.2.004) |
 | C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `done` (v1.2.006) |
-| C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `in_progress` (C2a đặt theo loại lõi: v1.2.008) |
+| C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `done` (C2a: v1.2.008, C2b: v1.2.009) |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `done` (v1.2.007) |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `planned` |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
@@ -148,7 +148,7 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
   `vpmullq` sẽ nhanh hơn nữa: phần này đi cùng **C4**.
 - "Lượt full gần chạm băng thông RAM": cần đo trên máy thật (DDR5) sau C4 và C2.
 
-### C2 — Chia worker theo phép đo và loại lõi (`planned`, chốt 2026-10-13)
+### C2 — Chia worker theo phép đo và loại lõi (`done`, v1.2.008–009)
 
 - Sau C1, khoảng 12–16 worker là đủ làm đầy bus RAM. Thêm worker RAM nữa không làm RAM nặng hơn,
   vì chúng chỉ chờ bus.
@@ -173,6 +173,29 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
   thứ hai. Worker RAM lấy từ đầu kia. Ví dụ 14900K: tính toán trên 8 P-core (CPU 0, 2, … 14),
   RAM trên 8 luồng SMT thứ hai của P-core và 16 E-core. 9950X: tính toán xen kẽ hai CCD.
 - `compute-oracle-run` cũng chọn luồng theo thứ tự này. Menu [4] power-sweep giữ nguyên.
+
+**C2b — đo đầu phiên để chia worker (`done`, v1.2.009):**
+
+- `system-run --measure-split` (`split.rs`, `CPU-DIT-SPLIT-PROBE-v1`): sau khi cấp phát, chương
+  trình thử 2, 3, 4, 6, 8, 10, 12, 16… worker RAM. Mỗi bước chạy 100 ms khởi động rồi đo 300 ms;
+  các luồng còn lại **cùng lúc chạy kernel FMA C3** như khi test thật, vì worker RAM chung lõi
+  với worker tính toán qua SMT sẽ chậm hơn khi đứng một mình.
+- Đo bằng **pha kiểm** (sinh byte mong đợi, so sánh, reduction), không bằng pha ghi. Đo bằng pha
+  ghi thì trên 3700X bus đầy ở 6–8 worker (khoảng 11 GB/s); nhưng mỗi worker kiểm chậm hơn và
+  phía đọc của bus rộng hơn, nên pha kiểm cần nhiều worker hơn. Pha ghi tự đầy bus với số đó.
+- Dừng khi hai bước liền nhau tăng dưới 5%. Chọn số worker RAM **nhỏ nhất** đạt ≥ 95% mức cao
+  nhất đo được; phần còn lại chạy tính toán, **ít nhất 1/4 số luồng** như trước v1.2.
+- Report: `worker_split` (chế độ, các bước đo, số worker mỗi bên, thời gian đo); khi số worker do
+  dòng lệnh đặt thì `mode: fixed`. System schema 15.
+- Dùng ở menu [1] Full (`boot-runner.sh`) và pha nền của combined (CPU-RAM chạy một mình). Pha
+  chạy chồng của combined giữ số luồng của bộ điều phối, vì lúc đó các lớp khác đang chạy.
+- Đo trên 3700X (16 luồng, DDR4): băng thông kiểm vẫn tăng đến 12 worker (20–22 GB/s), chọn
+  10–12 worker RAM và 4–6 tính toán; mất khoảng 2,9 s. Máy này CPU là nút thắt, chưa phải bus
+  RAM. Máy DDR5 nhiều lõi, hoặc sau C4 khi mỗi worker nhanh hơn, phép đo sẽ chọn ít worker RAM hơn
+  và để nhiều luồng hơn cho tính toán.
+- Kiểm QEMU (image `1.2.009-dev`, 4 vCPU, menu [1] Full 60 s qua `boot-runner.sh`): PASS, schema
+  15; đo 2 → 3 worker, chọn 3 RAM + 1 tính toán (1,8 s); kernel C3 6 chuỗi, mọi burst khớp; 6 vòng
+  RAM, băm ở vòng 0 và 4.
 
 ### C3 — Kernel nhiều chuỗi, ramp theo tầng (`done`, v1.2.007)
 
@@ -340,7 +363,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 
 1. V0b: version trong report và CSV (`done`, v1.2.004).
 2. C1: sinh pattern theo word (`done`, v1.2.006).
-3. C3 + C2: kernel nhiều chuỗi (C3 `done`, v1.2.007) và cách chia worker mới.
+3. C3 + C2: kernel nhiều chuỗi (C3 `done`, v1.2.007) và cách chia worker mới (C2 `done`, v1.2.008–009).
 4. C4: binary v3/v4 và cơ chế tự chọn.
 5. C5: các kernel mới.
 6. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.

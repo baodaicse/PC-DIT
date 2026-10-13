@@ -84,6 +84,13 @@ fn cpu_vectors(cpu_cli: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
+/// CPU-RAM threads: alone, the engine measures how many RAM workers fill the memory bus and
+/// computes on the rest (v1.2 C2); in the overlap, the counts the thread plan gives the layer.
+pub enum CpuSplit {
+    Measured,
+    Fixed { workers: usize, oracle: usize },
+}
+
 /// CPU-RAM memory: all but a reserve when alone, the arbiter's remainder in the overlap.
 pub enum CpuMemory {
     Alone,
@@ -94,8 +101,7 @@ pub fn cpu_ram(
     menu: &MenuArgs,
     dir: &Path,
     seconds: u64,
-    workers: usize,
-    oracle: usize,
+    split: &CpuSplit,
     memory: &CpuMemory,
     reserve_mib: u64,
 ) -> Launch {
@@ -123,10 +129,17 @@ pub fn cpu_ram(
         dir.join("progress.json").into(),
         "--report".into(),
         dir.join("system-report.json").into(),
-        "--workers".into(),
-        workers.to_string().into(),
-        "--compute-oracle-workers".into(),
-        oracle.to_string().into(),
+    ]);
+    match split {
+        CpuSplit::Measured => args.extend(words(&["--workers", "0", "--measure-split"])),
+        CpuSplit::Fixed { workers, oracle } => args.extend([
+            "--workers".into(),
+            workers.to_string().into(),
+            "--compute-oracle-workers".into(),
+            oracle.to_string().into(),
+        ]),
+    }
+    args.extend([
         "--minimum-duration-seconds".into(),
         seconds.to_string().into(),
         "--deadline-seconds".into(),

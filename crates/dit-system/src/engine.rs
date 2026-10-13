@@ -22,8 +22,9 @@ use crate::{
     LockPolicy, MemoryTarget, SystemDitError, SystemInventory,
     compute_oracle::{self, WorkerOutcome as ComputeOracleWorkerOutcome},
     cpu::{
-        CoherencyResult, PLACEMENT_ID, ReductionPair, coherency_test, fp_fma_known_answer_test,
-        integer_known_answer_test, pin_current_thread, place_workers, sha256_known_answer_test,
+        CoherencyResult, PLACEMENT_ID, Placement, ReductionPair, coherency_test, compute_order,
+        fp_fma_known_answer_test, integer_known_answer_test, pin_current_thread, place_workers,
+        sha256_known_answer_test,
     },
     memory::{MemoryArena, plan_and_allocate},
     report::{
@@ -33,6 +34,7 @@ use crate::{
         WorkerEvidence,
     },
     safety::{AbortKind, RunControl, SafetyFaultInjection, SafetyMonitor, SafetyPolicy},
+    split::{self, ProbeWork, WorkerSplitEvidence},
     window::{
         PATTERN_RECIPE_ID, WINDOW_RECIPE_ID, WindowExpected, WindowPlan, WindowSpec,
         build_window_plan, mandatory_pattern_families, mandatory_size_classes, window_sizes_bytes,
@@ -40,6 +42,8 @@ use crate::{
 };
 
 const ROUND_SEED_DOMAIN: &[u8] = b"CPU-DIT-ROUND-SEED-v1";
+/// The split probe writes its own window plan, apart from every round's.
+const SPLIT_PROBE_SEED_DOMAIN: u64 = 0x5350_4c49_542d_7631;
 /// RAM write: bytes generated between two checks for a stop request.
 const FILL_PIECE: usize = 1024 * 1024;
 /// RAM verify: bytes compared, then reduced and hashed while still in cache (a multiple of 32
@@ -164,6 +168,11 @@ pub struct SystemRunConfig {
     /// Zero disables the compute-oracle (ADR-0004 Phase 2); otherwise spare
     /// logical CPUs beyond the RAM workers run it concurrently with the round loop.
     pub compute_oracle_workers: usize,
+    /// v1.2 (C2): measure at the start how many RAM workers fill the memory bus
+    /// (`split::measure`). `requested_workers` is then the pool shared by RAM and compute
+    /// workers (0: every allowed thread), and the compute oracle runs on the rest of the pool,
+    /// at least a quarter of it; `compute_oracle_workers` must be 0.
+    pub measure_split: bool,
     pub compute_oracle_dense_fma_iterations: u32,
     pub compute_oracle_idle_ramp_enabled: bool,
     pub compute_oracle_idle_sleep_ms: u64,
@@ -201,7 +210,15 @@ impl SystemRunConfig {
                 "coherency iterations must be positive".to_owned(),
             ));
         }
-        if self.compute_oracle_workers > 0 && self.compute_oracle_dense_fma_iterations == 0 {
+        if self.measure_split && self.compute_oracle_workers > 0 {
+            return Err(SystemDitError::InvalidConfig(
+                "a measured split chooses the compute workers itself: compute_oracle_workers must be 0"
+                    .to_owned(),
+            ));
+        }
+        if (self.compute_oracle_workers > 0 || self.measure_split)
+            && self.compute_oracle_dense_fma_iterations == 0
+        {
             return Err(SystemDitError::InvalidConfig(
                 "compute_oracle_dense_fma_iterations must be positive when workers > 0".to_owned(),
             ));
@@ -345,12 +362,29 @@ fn run_system_once(
         &counters,
     );
     let inventory = SystemInventory::collect()?;
-    let placement = place_workers(
-        &inventory.cpu,
-        config.requested_workers,
-        config.compute_oracle_workers,
-    )?;
-    let all_worker_cpus = placement.ram;
+    // A measured split knows its pool now and its two sides after the probe; until then every
+    // pool thread counts as a RAM worker (the coherency test runs on all of them).
+    let pool_order = config.measure_split.then(|| {
+        let order = compute_order(&inventory.cpu);
+        let count = if config.requested_workers == 0 {
+            order.len()
+        } else {
+            config.requested_workers.min(order.len())
+        };
+        order[..count].to_vec()
+    });
+    let placement = match &pool_order {
+        Some(pool) => Placement {
+            ram: pool.clone(),
+            compute: Vec::new(),
+        },
+        None => place_workers(
+            &inventory.cpu,
+            config.requested_workers,
+            config.compute_oracle_workers,
+        )?,
+    };
+    let source_bytes = Arc::new(ExpansionSource::new(source.bytes()));
     let monitor = SafetyMonitor::start(
         config.safety_policy.clone(),
         config.safety_fault_injection.clone(),
@@ -358,7 +392,7 @@ fn run_system_once(
     let control = Arc::clone(&monitor.control);
     let cpu_tests_completed = !control.should_stop();
     let coherency = if cpu_tests_completed {
-        coherency_test(&all_worker_cpus, config.coherency_iterations_per_worker)?
+        coherency_test(&placement.ram, config.coherency_iterations_per_worker)?
     } else {
         CoherencyResult::default()
     };
@@ -396,6 +430,36 @@ fn run_system_once(
     )?;
     let mut memory_evidence = allocation.evidence;
     let mut arenas = allocation.arenas;
+    let (all_worker_cpus, compute_oracle_worker_cpus, worker_split) =
+        if let Some(pool) = &pool_order {
+            let plan = build_window_plan(&arenas, config.seed ^ SPLIT_PROBE_SEED_DOMAIN);
+            let evidence = split::measure(
+                pool,
+                &mut arenas,
+                &ProbeWork {
+                    plan: &plan,
+                    source: &source_bytes,
+                    seed: config.seed,
+                },
+                &control,
+            );
+            // Compute on the front of the pool's compute order, RAM on the back.
+            let compute = pool[..evidence.compute_workers].to_vec();
+            let ram = pool[evidence.compute_workers..]
+                .iter()
+                .rev()
+                .copied()
+                .collect();
+            (ram, compute, evidence)
+        } else {
+            let evidence = WorkerSplitEvidence::fixed(placement.ram.len(), placement.compute.len());
+            (placement.ram, placement.compute, evidence)
+        };
+    let compute_workers_requested = if config.measure_split {
+        worker_split.compute_workers
+    } else {
+        config.compute_oracle_workers
+    };
     let worker_count = all_worker_cpus.len().min(arenas.len());
     if worker_count == 0 {
         return Err(SystemDitError::InvalidConfig(
@@ -417,8 +481,7 @@ fn run_system_once(
         )));
     }
     let worker_cpus = all_worker_cpus[..worker_count].to_vec();
-    let compute_oracle_worker_cpus = placement.compute;
-    if config.compute_oracle_workers > 0 && compute_oracle_worker_cpus.is_empty() {
+    if compute_workers_requested > 0 && compute_oracle_worker_cpus.is_empty() {
         return Err(SystemDitError::InvalidConfig(
             "compute_oracle_workers requested but no logical CPU is available for them".to_owned(),
         ));
@@ -432,7 +495,6 @@ fn run_system_once(
         )));
     }
     let mut worker_evidence = initial_worker_evidence(&inventory, &worker_cpus);
-    let source_bytes = Arc::new(ExpansionSource::new(source.bytes()));
     let mut round_digests = Vec::new();
     let mut rounds_completed = 0_u32;
     let mut mismatch = None;
@@ -724,15 +786,15 @@ fn run_system_once(
             }
         }
     }
-    let compute_oracle_evidence = if config.compute_oracle_workers > 0 {
+    let compute_oracle_evidence = if compute_workers_requested > 0 {
         let aggregate = compute_oracle::aggregate_outcomes(&compute_oracle_outcomes);
         SystemComputeOracleEvidence {
             enabled: true,
-            workers_requested: config.compute_oracle_workers,
+            workers_requested: compute_workers_requested,
             minimum_bursts_per_worker: 1,
             coverage_met: compute_oracle::minimum_work_met(
                 &compute_oracle_outcomes,
-                config.compute_oracle_workers,
+                compute_workers_requested,
                 config.compute_oracle_idle_ramp_enabled,
             ),
             fma_kernel: compute_oracle::FMA_KERNEL_ID.to_owned(),
@@ -912,8 +974,8 @@ fn run_system_once(
         // (round_digests[].content_hashed, config.content_hash_every_rounds). v13: compute
         // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains). v14: workers
         // placed by core kind (config.worker_placement; inventory threads' core_kind, smt_rank,
-        // l3_id).
-        schema_version: 14,
+        // l3_id). v15: worker_split (the RAM/compute split, measured or fixed).
+        schema_version: 15,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
@@ -938,6 +1000,7 @@ fn run_system_once(
         arenas: arena_evidence,
         workers: worker_evidence,
         round_digests,
+        worker_split: Some(worker_split),
         window_coverage: WindowCoverageEvidence {
             window_recipe_id: WINDOW_RECIPE_ID.to_owned(),
             pattern_recipe_id: PATTERN_RECIPE_ID.to_owned(),
@@ -2035,6 +2098,7 @@ mod tests {
             safety_fault_injection: SafetyFaultInjection::default(),
             diagnostic_rerun: false,
             compute_oracle_workers: 0,
+            measure_split: false,
             compute_oracle_dense_fma_iterations: 1,
             compute_oracle_idle_ramp_enabled: false,
             compute_oracle_idle_sleep_ms: 0,

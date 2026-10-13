@@ -404,6 +404,12 @@ struct SystemRunArgs {
     #[arg(long, default_value_t = 0)]
     compute_oracle_workers: usize,
 
+    /// Measure at the start how many RAM workers fill the memory bus (a few seconds) and run
+    /// the compute oracle on the rest: --workers is then the pool shared by both (0: every
+    /// allowed CPU), at least a quarter of it computes. Not with --compute-oracle-workers.
+    #[arg(long, conflicts_with = "compute_oracle_workers")]
+    measure_split: bool,
+
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2_000_000_000))]
     compute_oracle_dense_fma_iterations: Option<u32>,
 
@@ -712,6 +718,7 @@ fn system_run(args: &SystemRunArgs) -> u8 {
         },
         diagnostic_rerun: !args.no_diagnostic_rerun,
         compute_oracle_workers: args.compute_oracle_workers,
+        measure_split: args.measure_split,
         compute_oracle_dense_fma_iterations: args
             .compute_oracle_dense_fma_iterations
             .unwrap_or(FMA_ITERATIONS_PER_BURST),

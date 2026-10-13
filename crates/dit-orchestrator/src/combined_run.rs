@@ -6,7 +6,8 @@
 //! runs on (decision 11.1); a layer that ends without a report (crash, OOM, watchdog kill) stops
 //! the session, which is then INVALID.
 use super::combined_layers::{
-    self as layers, ChainWork, CpuMemory, GpuOptions, Launch, LiveLayer, SsdTally, StoragePlan,
+    self as layers, ChainWork, CpuMemory, CpuSplit, GpuOptions, Launch, LiveLayer, SsdTally,
+    StoragePlan,
 };
 use super::combined_view::{
     ChainMeter, DiskMeter, LayerLine, SessionView, Telemetry, format_bytes, format_duration,
@@ -861,27 +862,19 @@ impl Session<'_> {
                     .arena_mib
                     .filter(|_| overlap)
                     .map_or(CpuMemory::Alone, |mib| CpuMemory::Arena { mib });
-                let (workers, oracle) = if overlap {
-                    (
-                        self.threads.cpu_ram_workers,
-                        self.threads.cpu_oracle_workers,
-                    )
+                let split = if overlap {
+                    CpuSplit::Fixed {
+                        workers: self.threads.cpu_ram_workers,
+                        oracle: self.threads.cpu_oracle_workers,
+                    }
                 } else {
-                    let logical =
-                        std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-                    let oracle = if logical >= 2 {
-                        (logical / 4).max(1)
-                    } else {
-                        0
-                    };
-                    (logical - oracle, oracle)
+                    CpuSplit::Measured
                 };
                 layers::cpu_ram(
                     self.menu,
                     &dir,
                     seconds,
-                    workers,
-                    oracle,
+                    &split,
                     &memory,
                     self.settings.memory.reserve_bytes / MIB,
                 )
