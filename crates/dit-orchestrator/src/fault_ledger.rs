@@ -974,11 +974,16 @@ pub fn append_csv_row(path: &Path, row: &str) -> std::io::Result<()> {
 
 /// Renames `path` when its header is not [`CSV_HEADER`]: to `<stem>-v1.1.csv` without a
 /// `dit_version` column, else to `<stem>-v<version of its last row>.csv`; `-2`, `-3`... when
-/// that name is taken. The file's content is left as it is.
+/// that name is taken. The file's content is left as it is. An empty file (cut off between its
+/// creation and its header, e.g. by a power loss) holds nothing to keep: it is removed so the
+/// next row starts it again with the header.
 fn set_aside_other_layout(path: &Path) -> std::io::Result<()> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Ok(());
     };
+    if text.trim().is_empty() {
+        return std::fs::remove_file(path);
+    }
     let mut lines = text.lines();
     let header = lines.next().unwrap_or_default();
     if header == CSV_HEADER {
@@ -1284,6 +1289,12 @@ mod tests {
         std::fs::write(&path, later).unwrap();
         append_csv_row(&path, &row).unwrap();
         assert_eq!(read("fail-summary-v1.2.005.csv"), later);
+
+        // An empty file (cut off before its header) is not kept: the row starts it again.
+        std::fs::write(&path, "").unwrap();
+        append_csv_row(&path, &row).unwrap();
+        assert_eq!(read("fail-summary.csv"), format!("{CSV_HEADER}\n{row}\n"));
+        assert!(!dir.join("fail-summary-v1.1-3.csv").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

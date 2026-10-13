@@ -97,6 +97,8 @@ Kết quả trên USB trước đây chỉ mang `image_id`. Nay mọi kết qu�
   - header có cột nhưng khác bố cục → đặt theo version ở dòng cuối, ví dụ
     `fail-summary-v1.2.005.csv`;
   - tên đã có thì thêm `-2`, `-3`...
+  - file rỗng (bị cắt giữa lúc tạo và lúc ghi header, ví dụ mất điện) thì xóa đi, dòng mới ghi lại
+    từ header.
 - **File cũ không chuyển đổi.** Kết quả nào không có `dit_version` (tạo trước 2026-10-13) là bản
   v1.1.
 
