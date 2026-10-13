@@ -37,6 +37,18 @@ pub struct SystemConfigEvidence {
     pub requested_workers: usize,
     pub lock_policy: String,
     pub coherency_iterations_per_worker: u64,
+    /// RAM contents are hashed (SHA-256) in round 0 and every this many rounds after; 1 in
+    /// reports written before v1.2.006, which hashed every round.
+    #[serde(default = "every_round")]
+    pub content_hash_every_rounds: u32,
+}
+
+const fn every_round() -> u32 {
+    1
+}
+
+const fn hashed() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +102,7 @@ pub struct WorkerEvidence {
     pub exact_verified_bytes: u64,
     pub scalar_simd_comparisons: u64,
     pub scalar_simd_mismatches: u64,
+    /// SHA-256 of the arenas this worker verified in the last round that hashed RAM contents.
     pub sha256_digest: String,
 }
 
@@ -148,6 +161,11 @@ pub struct RoundDigest {
     pub no_overlaps: bool,
     pub tail_verified: bool,
     pub total_windows: u64,
+    /// Whether this round hashed the RAM contents (`config.content_hash_every_rounds`); every
+    /// round did before v1.2.006. The bytes are compared in every round either way.
+    #[serde(default = "hashed")]
+    pub content_hashed: bool,
+    /// SHA-256 over the arenas' digests; empty in a round that did not hash.
     pub sha256: String,
 }
 

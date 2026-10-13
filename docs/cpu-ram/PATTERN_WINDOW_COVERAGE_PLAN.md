@@ -128,6 +128,11 @@ window_coverage.no_overlaps
 window_coverage.tail_verified
 ```
 
+Từ v1.2.006 (schema 12): mọi vòng vẫn so đủ từng byte, nhưng SHA-256 nội dung RAM chỉ tính ở
+vòng 0 rồi cứ `config.content_hash_every_rounds` (4) vòng một lần;
+`round_digests[].content_hashed` cho biết vòng nào có băm, `round_digests[].sha256` rỗng ở vòng
+không băm. Xem [../v1.2/ROADMAP.md](../v1.2/ROADMAP.md), C1.
+
 Unique RAM coverage vẫn là số byte khác nhau được giữ đồng thời. Không cộng các
 size class hoặc round thành unique RAM lớn hơn allocation target.
 

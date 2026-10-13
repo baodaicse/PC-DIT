@@ -72,54 +72,94 @@ pub(crate) fn pin_current_thread(cpu_id: usize) -> Result<(), String> {
 
 #[must_use]
 pub(crate) fn scalar_reduction(bytes: &[u8]) -> [u64; 4] {
-    let mut accumulator = REDUCTION_INITIAL;
-    let (chunks, remainder) = bytes.as_chunks::<8>();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let word = u64::from_le_bytes(*chunk);
-        let lane = index % 4;
-        accumulator[lane] = (accumulator[lane] ^ word).wrapping_add(REDUCTION_ADD[lane]);
-    }
-    if !remainder.is_empty() {
-        let mut tail = [0_u8; 8];
-        tail[..remainder.len()].copy_from_slice(remainder);
-        let word = u64::from_le_bytes(tail);
-        let lane = (bytes.len() / 8) % 4;
-        accumulator[lane] = (accumulator[lane] ^ word).wrapping_add(REDUCTION_ADD[lane]);
-    }
-    accumulator
+    let mut reduction = ReductionPair::new();
+    reduction.update(bytes);
+    reduction.scalar
 }
 
 #[must_use]
 pub(crate) fn simd_reduction(bytes: &[u8]) -> [u64; 4] {
-    let mut accumulator = u64x4::new(REDUCTION_INITIAL);
-    let addition = u64x4::new(REDUCTION_ADD);
-    let (chunks, remainder) = bytes.as_chunks::<32>();
-    for chunk in chunks {
-        let words = std::array::from_fn(|lane| {
-            let start = lane * 8;
-            u64::from_le_bytes(
-                chunk[start..start + 8]
-                    .try_into()
-                    .expect("lane has 8 bytes"),
-            )
-        });
-        accumulator = (accumulator ^ u64x4::new(words)) + addition;
+    let mut reduction = ReductionPair::new();
+    reduction.update(bytes);
+    reduction.simd
+}
+
+/// The scalar and the SIMD reduction of one input, fed a block at a time (the RAM verify feeds
+/// each block right after comparing it, while it is still in cache). The result is the same as
+/// [`scalar_reduction`] and [`simd_reduction`] over the whole input, provided every block but
+/// the last is a multiple of 32 bytes: words keep their lane (word index modulo 4).
+pub(crate) struct ReductionPair {
+    pub(crate) scalar: [u64; 4],
+    pub(crate) simd: [u64; 4],
+    words: usize,
+}
+
+impl ReductionPair {
+    pub(crate) const fn new() -> Self {
+        Self {
+            scalar: REDUCTION_INITIAL,
+            simd: REDUCTION_INITIAL,
+            words: 0,
+        }
     }
-    let mut result = accumulator.to_array();
-    let processed_words = chunks.len() * 4;
-    let (tail_chunks, tail_remainder) = remainder.as_chunks::<8>();
-    for (tail_index, chunk) in tail_chunks.iter().enumerate() {
-        let lane = (processed_words + tail_index) % 4;
-        let word = u64::from_le_bytes(*chunk);
-        result[lane] = (result[lane] ^ word).wrapping_add(REDUCTION_ADD[lane]);
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        debug_assert!(
+            self.words.is_multiple_of(4),
+            "blocks before the last are 32-byte multiples"
+        );
+        Self::scalar_step(&mut self.scalar, self.words, bytes);
+        Self::simd_step(&mut self.simd, self.words, bytes);
+        self.words += bytes.len() / 8;
     }
-    if !tail_remainder.is_empty() {
-        let mut tail = [0_u8; 8];
-        tail[..tail_remainder.len()].copy_from_slice(tail_remainder);
-        let lane = (bytes.len() / 8) % 4;
-        result[lane] = (result[lane] ^ u64::from_le_bytes(tail)).wrapping_add(REDUCTION_ADD[lane]);
+
+    fn scalar_step(accumulator: &mut [u64; 4], words_before: usize, bytes: &[u8]) {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let word = u64::from_le_bytes(*chunk);
+            let lane = (words_before + index) % 4;
+            accumulator[lane] = (accumulator[lane] ^ word).wrapping_add(REDUCTION_ADD[lane]);
+        }
+        if !remainder.is_empty() {
+            let mut tail = [0_u8; 8];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            let word = u64::from_le_bytes(tail);
+            let lane = (words_before + chunks.len()) % 4;
+            accumulator[lane] = (accumulator[lane] ^ word).wrapping_add(REDUCTION_ADD[lane]);
+        }
     }
-    result
+
+    fn simd_step(result: &mut [u64; 4], words_before: usize, bytes: &[u8]) {
+        let mut accumulator = u64x4::new(*result);
+        let addition = u64x4::new(REDUCTION_ADD);
+        let (chunks, remainder) = bytes.as_chunks::<32>();
+        for chunk in chunks {
+            let words = std::array::from_fn(|lane| {
+                let start = lane * 8;
+                u64::from_le_bytes(
+                    chunk[start..start + 8]
+                        .try_into()
+                        .expect("lane has 8 bytes"),
+                )
+            });
+            accumulator = (accumulator ^ u64x4::new(words)) + addition;
+        }
+        *result = accumulator.to_array();
+        let processed_words = words_before + chunks.len() * 4;
+        let (tail_chunks, tail_remainder) = remainder.as_chunks::<8>();
+        for (tail_index, chunk) in tail_chunks.iter().enumerate() {
+            let lane = (processed_words + tail_index) % 4;
+            let word = u64::from_le_bytes(*chunk);
+            result[lane] = (result[lane] ^ word).wrapping_add(REDUCTION_ADD[lane]);
+        }
+        if !tail_remainder.is_empty() {
+            let mut tail = [0_u8; 8];
+            tail[..tail_remainder.len()].copy_from_slice(tail_remainder);
+            let lane = (processed_words + tail_chunks.len()) % 4;
+            result[lane] =
+                (result[lane] ^ u64::from_le_bytes(tail)).wrapping_add(REDUCTION_ADD[lane]);
+        }
+    }
 }
 
 #[must_use]
@@ -185,7 +225,52 @@ pub(crate) fn coherency_test(
 
 #[cfg(test)]
 mod tests {
-    use super::{scalar_reduction, sha256_known_answer_test, simd_reduction};
+    use super::{
+        REDUCTION_ADD, REDUCTION_INITIAL, ReductionPair, integer_known_answer_test,
+        scalar_reduction, sha256_known_answer_test, simd_reduction,
+    };
+
+    /// The reductions as they were written before v1.2 (one pass over the whole input): the
+    /// block-wise ones must give the same values.
+    fn legacy_scalar(bytes: &[u8]) -> [u64; 4] {
+        let mut accumulator = REDUCTION_INITIAL;
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let lane = index % 4;
+            accumulator[lane] =
+                (accumulator[lane] ^ u64::from_le_bytes(*chunk)).wrapping_add(REDUCTION_ADD[lane]);
+        }
+        if !remainder.is_empty() {
+            let mut tail = [0_u8; 8];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            let lane = (bytes.len() / 8) % 4;
+            accumulator[lane] =
+                (accumulator[lane] ^ u64::from_le_bytes(tail)).wrapping_add(REDUCTION_ADD[lane]);
+        }
+        accumulator
+    }
+
+    #[test]
+    fn block_wise_reductions_equal_the_one_pass_ones() {
+        assert!(integer_known_answer_test());
+        let bytes: Vec<u8> = (0_u32..300_007)
+            .map(|value| u8::try_from((value * 131 + value / 7) % 256).expect("byte"))
+            .collect();
+        for length in [0, 1, 7, 8, 31, 32, 33, 4093, 65_536, 65_537, 300_007] {
+            let input = &bytes[..length];
+            let legacy = legacy_scalar(input);
+            assert_eq!(scalar_reduction(input), legacy, "scalar, {length} bytes");
+            assert_eq!(simd_reduction(input), legacy, "simd, {length} bytes");
+            for block in [32, 96, 4096, 65_536] {
+                let mut pair = ReductionPair::new();
+                for piece in input.chunks(block) {
+                    pair.update(piece);
+                }
+                assert_eq!(pair.scalar, legacy, "scalar, {length} bytes by {block}");
+                assert_eq!(pair.simd, legacy, "simd, {length} bytes by {block}");
+            }
+        }
+    }
 
     #[test]
     fn scalar_and_simd_reductions_match_for_tails() {

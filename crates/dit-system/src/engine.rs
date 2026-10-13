@@ -14,7 +14,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use dit_core::{RunStatus, VerifiedSource};
+use dit_core::{ExpansionSource, RunStatus, VerifiedSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -22,9 +22,9 @@ use crate::{
     LockPolicy, MemoryTarget, SystemDitError, SystemInventory,
     compute_oracle::{self, WorkerOutcome as ComputeOracleWorkerOutcome},
     cpu::{
-        CoherencyResult, coherency_test, fp_fma_known_answer_test, integer_known_answer_test,
-        pin_current_thread, scalar_reduction, select_worker_cpus, sha256_known_answer_test,
-        simd_reduction,
+        CoherencyResult, ReductionPair, coherency_test, fp_fma_known_answer_test,
+        integer_known_answer_test, pin_current_thread, select_worker_cpus,
+        sha256_known_answer_test,
     },
     memory::{MemoryArena, plan_and_allocate},
     report::{
@@ -35,13 +35,30 @@ use crate::{
     },
     safety::{AbortKind, RunControl, SafetyFaultInjection, SafetyMonitor, SafetyPolicy},
     window::{
-        PATTERN_RECIPE_ID, WINDOW_RECIPE_ID, WindowPlan, WindowSpec, build_window_plan,
-        expected_byte, expected_word, mandatory_pattern_families, mandatory_size_classes,
-        window_sizes_bytes,
+        PATTERN_RECIPE_ID, WINDOW_RECIPE_ID, WindowExpected, WindowPlan, WindowSpec,
+        build_window_plan, mandatory_pattern_families, mandatory_size_classes, window_sizes_bytes,
     },
 };
 
 const ROUND_SEED_DOMAIN: &[u8] = b"CPU-DIT-ROUND-SEED-v1";
+/// RAM write: bytes generated between two checks for a stop request.
+const FILL_PIECE: usize = 1024 * 1024;
+/// RAM verify: bytes compared, then reduced and hashed while still in cache (a multiple of 32
+/// bytes, which the reductions need; fits a core's L2 with room to spare).
+const VERIFY_BLOCK: usize = 64 * 1024;
+/// RAM verify: expected bytes generated at a time, kept in L1.
+const VERIFY_PIECE: usize = 4 * 1024;
+/// RAM verify: bytes compared between two progress counter updates and stop checks.
+const COUNTER_FLUSH_BYTES: u64 = 1024 * 1024;
+/// RAM verify: the arenas' SHA-256 (round digest, worker digest) is computed in round 0 and every
+/// this many rounds after; every round still compares every byte. Hashing every round made
+/// SHA-256 the slowest part of the verify (about 2 GB/s per core) and added no detection: the
+/// byte compare already catches any difference.
+const CONTENT_HASH_EVERY_ROUNDS: u32 = 4;
+
+const fn content_hashed(round: u32) -> bool {
+    round.is_multiple_of(CONTENT_HASH_EVERY_ROUNDS)
+}
 const ROUND_SEED_DERIVATION: &str = "sha256:CPU-DIT-ROUND-SEED-v1";
 const SEED_COMMITMENT_DOMAIN: &[u8] = b"CPU-DIT-SEED-COMMITMENT-v1";
 const COUNTER_PROGRESS_STRIDE: u64 = 64 * 1024 * 1024;
@@ -423,7 +440,7 @@ fn run_system_once(
         )));
     }
     let mut worker_evidence = initial_worker_evidence(&inventory, &worker_cpus);
-    let source_bytes = Arc::new(source.bytes().to_vec());
+    let source_bytes = Arc::new(ExpansionSource::new(source.bytes()));
     let mut round_digests = Vec::new();
     let mut rounds_completed = 0_u32;
     let mut mismatch = None;
@@ -610,6 +627,7 @@ fn run_system_once(
             && round_exact_verified == memory_evidence.requested_bytes;
         window_all_completed_rounds_met &= round_fully_verified && window_plan.mandatory_recipe_met;
         window_tails_verified &= !window_plan.tail_present || round_fully_verified;
+        let round_hashed = content_hashed(round);
         let mut round_hash = Sha256::new();
         let mut round_entries: Vec<(usize, [u8; 32])> = read_results
             .iter()
@@ -637,7 +655,12 @@ fn run_system_once(
             no_overlaps: window_plan.no_overlaps,
             tail_verified: !window_plan.tail_present || round_fully_verified,
             total_windows: window_plan.total_windows,
-            sha256: hex::encode(round_hash.finalize()),
+            content_hashed: round_hashed,
+            sha256: if round_hashed {
+                hex::encode(round_hash.finalize())
+            } else {
+                String::new()
+            },
         });
         arenas = collect_phase_results(
             read_results,
@@ -891,8 +914,9 @@ fn run_system_once(
     );
     let power_platform = crate::power_platform::PowerPlatformEvidence::from_telemetry(&telemetry);
     Ok(SystemRunReport {
-        // v11: dit_version.
-        schema_version: 11,
+        // v11: dit_version. v12: round digests hashed every CONTENT_HASH_EVERY_ROUNDS rounds
+        // (round_digests[].content_hashed, config.content_hash_every_rounds).
+        schema_version: 12,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
@@ -953,7 +977,7 @@ fn run_system_once(
 fn run_write_phase(
     buckets: Vec<Vec<MemoryArena>>,
     worker_cpus: &[usize],
-    source: &Arc<Vec<u8>>,
+    source: &Arc<ExpansionSource>,
     seed: u64,
     round: u32,
     window_plan: &Arc<WindowPlan>,
@@ -996,7 +1020,7 @@ fn write_worker(
     worker_id: usize,
     cpu_id: usize,
     mut arenas: Vec<MemoryArena>,
-    source: &[u8],
+    source: &ExpansionSource,
     seed: u64,
     round: u32,
     window_plan: &WindowPlan,
@@ -1261,7 +1285,7 @@ fn emit_verify_faults(faults: &FaultWriter, results: &[BatchResult], round: u32)
 fn run_verify_phase(
     buckets: Vec<Vec<MemoryArena>>,
     worker_cpus: &[usize],
-    source: &Arc<Vec<u8>>,
+    source: &Arc<ExpansionSource>,
     seed: u64,
     round: u32,
     window_plan: &Arc<WindowPlan>,
@@ -1305,7 +1329,7 @@ fn verify_worker(
     worker_id: usize,
     cpu_id: usize,
     mut arenas: Vec<MemoryArena>,
-    source: &[u8],
+    source: &ExpansionSource,
     seed: u64,
     round: u32,
     window_plan: &WindowPlan,
@@ -1321,33 +1345,38 @@ fn verify_worker(
     let mut digest_entries = Vec::new();
     let mut first_mismatch = None;
     let mut simd_fault_injected = false;
+    let mut expected = vec![0_u8; VERIFY_PIECE];
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         for arena in &mut arenas {
             if control.should_stop() {
                 break;
             }
             arena.verify_cpu = Some(cpu_id);
-            let (verified, mismatch, cancelled) = verify_arena(
+            let check = verify_arena(
                 arena,
                 &window_plan.by_arena[arena.id],
-                source,
-                seed,
-                round,
-                cpu_id,
+                ArenaVerify {
+                    source,
+                    seed,
+                    round,
+                    verifier_cpu: cpu_id,
+                    hash: content_hashed(round),
+                },
+                &mut expected,
                 control,
                 counters,
             );
-            let arena_matched = mismatch.is_none() && !cancelled;
-            exact_verified += verified;
+            let arena_matched = check.mismatch.is_none() && !check.cancelled;
+            exact_verified += check.verified;
             if first_mismatch.is_none() {
-                first_mismatch = mismatch;
+                first_mismatch = check.mismatch;
             }
-            if cancelled {
+            if check.cancelled {
                 break;
             }
             bytes += u64::try_from(arena.len()).unwrap_or(u64::MAX);
-            let scalar = scalar_reduction(&arena.map);
-            let mut simd = simd_reduction(&arena.map);
+            let scalar = check.reductions.scalar;
+            let mut simd = check.reductions.simd;
             if round == 0 && fault_injection_simd_worker == Some(worker_id) && !simd_fault_injected
             {
                 simd[0] ^= 1;
@@ -1358,8 +1387,9 @@ fn verify_worker(
                 simd_mismatches += 1;
             }
             counters.add(1, u64::from(scalar != simd));
-            let digest: [u8; 32] = Sha256::digest(&arena.map).into();
-            digest_entries.push((arena.id, digest));
+            if let Some(digest) = check.digest {
+                digest_entries.push((arena.id, digest));
+            }
             if arena_matched {
                 arena.rounds_verified += 1;
             }
@@ -1413,136 +1443,159 @@ fn join_workers(
 fn fill_arena(
     arena: &mut MemoryArena,
     windows: &[WindowSpec],
-    source: &[u8],
+    source: &ExpansionSource,
     seed: u64,
     control: &RunControl,
 ) -> bool {
-    let mut processed_words = 0_usize;
     for window in windows {
-        let end = window.arena_offset + window.length;
-        let (chunks, remainder) = arena.map[window.arena_offset..end].as_chunks_mut::<8>();
-        for (word_index, chunk) in chunks.iter_mut().enumerate() {
-            if processed_words.is_multiple_of(131_072) && control.should_stop() {
-                return false;
-            }
-            let offset = window.global_offset + u64::try_from(word_index * 8).unwrap_or(u64::MAX);
-            chunk.copy_from_slice(&expected_word(source, seed, window, offset));
-            processed_words += 1;
-        }
-        if !remainder.is_empty() {
+        let expected = WindowExpected::new(source, seed, window);
+        let mut done = 0;
+        while done < window.length {
             if control.should_stop() {
                 return false;
             }
-            let base = window.global_offset
-                + u64::try_from(window.length - remainder.len()).unwrap_or(u64::MAX);
-            for (index, byte) in remainder.iter_mut().enumerate() {
-                *byte = expected_byte(
-                    source,
-                    seed,
-                    window,
-                    base + u64::try_from(index).unwrap_or(u64::MAX),
-                );
-            }
+            let piece = FILL_PIECE.min(window.length - done);
+            let start = window.arena_offset + done;
+            expected.fill(done, &mut arena.map[start..start + piece]);
+            done += piece;
         }
     }
     true
 }
 
-#[allow(clippy::too_many_arguments)] // Explicit verify inputs keep the byte-exact oracle auditable.
-fn verify_arena(
-    arena: &MemoryArena,
-    windows: &[WindowSpec],
-    source: &[u8],
+/// What one arena's verify found ([`verify_arena`]).
+struct ArenaCheck {
+    verified: u64,
+    mismatch: Option<SystemMismatch>,
+    cancelled: bool,
+    /// Scalar and SIMD reductions of the whole arena, as it was read.
+    reductions: ReductionPair,
+    /// SHA-256 of the whole arena, as it was read, in rounds that hash ([`content_hashed`]).
+    digest: Option<[u8; 32]>,
+}
+
+/// The round an arena is verified in.
+#[derive(Clone, Copy)]
+struct ArenaVerify<'a> {
+    source: &'a ExpansionSource,
     seed: u64,
     round: u32,
     verifier_cpu: usize,
+    /// Whether this round hashes the arena ([`content_hashed`]).
+    hash: bool,
+}
+
+/// Compares every byte of `arena` with its window's expected bytes, and computes the scalar and
+/// SIMD reductions and (in rounds that hash) the SHA-256 of the arena in the same pass. The arena is read once, a
+/// block at a time ([`VERIFY_BLOCK`]): each block is compared against expected bytes generated
+/// a piece at a time into `expected` (kept in L1), then reduced and hashed while it is still in
+/// cache. Before v1.2 the arena was read from memory four times (compare, two reductions, hash).
+fn verify_arena(
+    arena: &MemoryArena,
+    windows: &[WindowSpec],
+    round: ArenaVerify<'_>,
+    expected: &mut [u8],
     control: &RunControl,
     counters: &RunCounters,
-) -> (u64, Option<SystemMismatch>, bool) {
-    let mut verified = 0_u64;
-    let mut processed_words = 0_usize;
+) -> ArenaCheck {
+    let map: &[u8] = &arena.map;
+    let mut check = ArenaCheck {
+        verified: 0,
+        mismatch: None,
+        cancelled: false,
+        reductions: ReductionPair::new(),
+        digest: None,
+    };
+    let mut hash = round.hash.then(Sha256::new);
     let mut pending_calculations = 0_u64;
     let mut pending_failures = 0_u64;
-    let mut first_mismatch = None;
-    for window in windows {
-        let end = window.arena_offset + window.length;
-        let (chunks, remainder) = arena.map[window.arena_offset..end].as_chunks::<8>();
-        for (word_index, chunk) in chunks.iter().enumerate() {
-            let window_offset = word_index * 8;
-            let arena_offset = window.arena_offset + window_offset;
-            let global_offset =
-                window.global_offset + u64::try_from(window_offset).unwrap_or(u64::MAX);
-            let expected = expected_word(source, seed, window, global_offset);
-            let word_failures = chunk
-                .iter()
-                .zip(expected.iter())
-                .filter(|(actual, expected)| actual != expected)
-                .count();
-            if word_failures > 0 && first_mismatch.is_none() {
-                let lane = chunk
-                    .iter()
-                    .zip(expected.iter())
-                    .position(|(actual, expected)| actual != expected)
-                    .unwrap_or(0);
-                let actual = chunk[lane];
-                let expected = expected[lane];
-                first_mismatch = Some(window_mismatch(
-                    arena,
-                    window,
-                    round,
-                    arena_offset + lane,
-                    global_offset + u64::try_from(lane).unwrap_or(u64::MAX),
-                    expected,
-                    actual,
-                    verifier_cpu,
+    let mut window_index = 0;
+    let mut window_expected: Option<(usize, WindowExpected<'_>)> = None;
+    let mut block_start = 0;
+    while block_start < map.len() {
+        let block_end = (block_start + VERIFY_BLOCK).min(map.len());
+        let mut cursor = block_start;
+        while cursor < block_end {
+            while windows
+                .get(window_index)
+                .is_some_and(|window| window.arena_offset + window.length <= cursor)
+            {
+                window_index += 1;
+            }
+            let Some(window) = windows
+                .get(window_index)
+                .filter(|window| window.arena_offset <= cursor)
+            else {
+                // Not covered by a window (the planner leaves no gap): nothing to compare.
+                cursor = windows
+                    .get(window_index)
+                    .map_or(block_end, |window| window.arena_offset.min(block_end));
+                continue;
+            };
+            if window_expected
+                .as_ref()
+                .is_none_or(|(index, _)| *index != window_index)
+            {
+                window_expected = Some((
+                    window_index,
+                    WindowExpected::new(round.source, round.seed, window),
                 ));
             }
-            let word_failures = u64::try_from(word_failures).unwrap_or(8);
-            verified += 8_u64.saturating_sub(word_failures);
-            pending_calculations += 8;
-            pending_failures += word_failures;
-            processed_words += 1;
-            if processed_words.is_multiple_of(131_072) {
-                counters.add(pending_calculations, pending_failures);
-                pending_calculations = 0;
-                pending_failures = 0;
-                if control.should_stop() {
-                    return (verified, first_mismatch, true);
-                }
+            let end = block_end
+                .min(window.arena_offset + window.length)
+                .min(cursor + expected.len());
+            let want = &mut expected[..end - cursor];
+            if let Some((_, generator)) = &window_expected {
+                generator.fill(cursor - window.arena_offset, want);
             }
-        }
-        let base_offset = window.length - remainder.len();
-        for (index, &actual) in remainder.iter().enumerate() {
-            if control.should_stop() {
-                counters.add(pending_calculations, pending_failures);
-                return (verified, first_mismatch, true);
-            }
-            let arena_offset = window.arena_offset + base_offset + index;
-            let global_offset =
-                window.global_offset + u64::try_from(base_offset + index).unwrap_or(u64::MAX);
-            let expected = expected_byte(source, seed, window, global_offset);
-            if actual == expected {
-                verified += 1;
+            let got = &map[cursor..end];
+            let length = u64::try_from(got.len()).unwrap_or(u64::MAX);
+            if got == want {
+                check.verified += length;
             } else {
-                pending_failures += 1;
-                if first_mismatch.is_none() {
-                    first_mismatch = Some(window_mismatch(
+                let failures = got.iter().zip(want.iter()).filter(|(a, e)| a != e).count();
+                let failures = u64::try_from(failures).unwrap_or(length);
+                check.verified += length - failures;
+                pending_failures += failures;
+                if check.mismatch.is_none()
+                    && let Some(lane) = got.iter().zip(want.iter()).position(|(a, e)| a != e)
+                {
+                    let arena_offset = cursor + lane;
+                    check.mismatch = Some(window_mismatch(
                         arena,
                         window,
-                        round,
+                        round.round,
                         arena_offset,
-                        global_offset,
-                        expected,
-                        actual,
-                        verifier_cpu,
+                        window.global_offset
+                            + u64::try_from(arena_offset - window.arena_offset).unwrap_or(u64::MAX),
+                        want[lane],
+                        got[lane],
+                        round.verifier_cpu,
                     ));
                 }
             }
-            pending_calculations += 1;
+            pending_calculations += length;
+            cursor = end;
         }
+        let block = &map[block_start..block_end];
+        check.reductions.update(block);
+        if let Some(hash) = hash.as_mut() {
+            hash.update(block);
+        }
+        if pending_calculations >= COUNTER_FLUSH_BYTES {
+            counters.add(pending_calculations, pending_failures);
+            pending_calculations = 0;
+            pending_failures = 0;
+            if control.should_stop() {
+                check.cancelled = true;
+                return check;
+            }
+        }
+        block_start = block_end;
     }
     counters.add(pending_calculations, pending_failures);
-    (verified, first_mismatch, false)
+    check.digest = hash.map(|hash| hash.finalize().into());
+    check
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1658,11 +1711,14 @@ fn collect_phase_results(
                     .filter(|arena| arena.rounds_verified > 0)
                     .map(|arena| arena.id),
             );
-            let mut digest = Sha256::new();
-            for (_, entry) in &result.digest_entries {
-                digest.update(entry);
+            // The worker's digest is that of the last round that hashed.
+            if !result.digest_entries.is_empty() {
+                let mut digest = Sha256::new();
+                for (_, entry) in &result.digest_entries {
+                    digest.update(entry);
+                }
+                worker.sha256_digest = hex::encode(digest.finalize());
             }
-            worker.sha256_digest = hex::encode(digest.finalize());
         }
         if let Some(crash) = result.crash {
             worker_crashes.push(crash);
@@ -1785,6 +1841,7 @@ fn config_evidence(config: &SystemRunConfig, seed_commitment: &str) -> SystemCon
         requested_workers: config.requested_workers,
         lock_policy: config.lock_policy.as_str().to_owned(),
         coherency_iterations_per_worker: config.coherency_iterations_per_worker,
+        content_hash_every_rounds: CONTENT_HASH_EVERY_ROUNDS,
     }
 }
 

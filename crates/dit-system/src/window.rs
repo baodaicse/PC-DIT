@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use dit_core::expanded_byte;
+use dit_core::{ExpansionSource, expand_into, expanded_byte};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -358,18 +358,35 @@ fn summarize_plan(
     }
 }
 
+/// The seed every byte of `window` derives from in `round_seed`'s round.
+fn window_seed(round_seed: u64, window: &WindowSpec) -> u64 {
+    mix64(
+        round_seed
+            ^ window.id.wrapping_mul(WINDOW_DOMAIN)
+            ^ u64::try_from(window.pattern as usize).unwrap_or(0),
+    )
+}
+
+/// The expected byte at `global_offset` inside `window`: the definition of `CPU-DIT-PATTERN-v1`.
+/// [`WindowExpected`] produces the same bytes a range at a time; this one stays the reference the
+/// tests hold it to.
+#[cfg(test)]
 pub(crate) fn expected_byte(
     source: &[u8],
     round_seed: u64,
     window: &WindowSpec,
     global_offset: u64,
 ) -> u8 {
-    let window_seed = mix64(
-        round_seed
-            ^ window.id.wrapping_mul(WINDOW_DOMAIN)
-            ^ u64::try_from(window.pattern as usize).unwrap_or(0),
-    );
-    match window.pattern {
+    pattern_byte(
+        source,
+        window.pattern,
+        window_seed(round_seed, window),
+        global_offset,
+    )
+}
+
+fn pattern_byte(source: &[u8], pattern: PatternFamily, window_seed: u64, global_offset: u64) -> u8 {
+    match pattern {
         PatternFamily::SourceExpanded => expanded_byte(source, window_seed, global_offset),
         PatternFamily::AllZero => 0,
         PatternFamily::AllOne => u8::MAX,
@@ -393,26 +410,84 @@ pub(crate) fn expected_byte(
         PatternFamily::WalkingZero => {
             !(1_u8 << u32::try_from((global_offset ^ window_seed) & 7).unwrap_or(0))
         }
-        PatternFamily::AddressDerived => {
-            u8::try_from(mix64(window_seed ^ global_offset) & 0xff).unwrap_or(0)
-        }
+        PatternFamily::AddressDerived => address_derived_byte(window_seed, global_offset),
     }
 }
 
-pub(crate) fn expected_word(
-    source: &[u8],
-    round_seed: u64,
-    window: &WindowSpec,
+fn address_derived_byte(window_seed: u64, global_offset: u64) -> u8 {
+    u8::try_from(mix64(window_seed ^ global_offset) & 0xff).unwrap_or(0)
+}
+
+const LANE_OFFSETS: [u64; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// One window's expected bytes, a range at a time ([`Self::fill`]), byte for byte the same as
+/// [`expected_byte`]. The window's seed is worked out once, not once per byte:
+/// - `source_expanded`: one `splitmix64` per 8-byte word ([`expand_into`]);
+/// - all-zero, all-one, checkerboard and walking patterns depend only on the offset modulo 8:
+///   their eight bytes are worked out once and repeated;
+/// - `address_derived` mixes every offset on its own, so it stays one `mix64` per byte.
+pub(crate) struct WindowExpected<'a> {
+    source: &'a ExpansionSource,
+    pattern: PatternFamily,
+    seed: u64,
     global_offset: u64,
-) -> [u8; 8] {
-    std::array::from_fn(|lane| {
-        expected_byte(
+    /// Periodic families: the byte at global offset `g` is `period[g % 8]`.
+    period: [u8; 8],
+}
+
+impl<'a> WindowExpected<'a> {
+    pub(crate) fn new(source: &'a ExpansionSource, round_seed: u64, window: &WindowSpec) -> Self {
+        let seed = window_seed(round_seed, window);
+        let period = std::array::from_fn(|lane| {
+            pattern_byte(
+                source.source(),
+                window.pattern,
+                seed,
+                u64::try_from(lane).expect("lane fits u64"),
+            )
+        });
+        Self {
             source,
-            round_seed,
-            window,
-            global_offset + u64::try_from(lane).expect("word lane fits u64"),
-        )
-    })
+            pattern: window.pattern,
+            seed,
+            global_offset: window.global_offset,
+            period,
+        }
+    }
+
+    /// Writes the expected bytes from `window_offset` bytes into the window on into `out`.
+    pub(crate) fn fill(&self, window_offset: usize, out: &mut [u8]) {
+        let start = self.global_offset + u64::try_from(window_offset).unwrap_or(u64::MAX);
+        match self.pattern {
+            PatternFamily::SourceExpanded => expand_into(self.source, self.seed, start, out),
+            PatternFamily::AddressDerived => {
+                // Eight independent mixes per step, so the core overlaps their multiplies.
+                let (words, tail) = out.as_chunks_mut::<8>();
+                let mut offset = start;
+                for word in words {
+                    *word = std::array::from_fn(|lane| {
+                        address_derived_byte(self.seed, offset + LANE_OFFSETS[lane])
+                    });
+                    offset = offset.wrapping_add(8);
+                }
+                for (lane, byte) in tail.iter_mut().enumerate() {
+                    *byte = address_derived_byte(self.seed, offset + LANE_OFFSETS[lane]);
+                }
+            }
+            PatternFamily::AllZero
+            | PatternFamily::AllOne
+            | PatternFamily::Checkerboard
+            | PatternFamily::CheckerboardInverse
+            | PatternFamily::WalkingOne
+            | PatternFamily::WalkingZero => {
+                let phase = usize::try_from(start % 8).unwrap_or(0);
+                let word: [u8; 8] = std::array::from_fn(|lane| self.period[(phase + lane) % 8]);
+                let (words, tail) = out.as_chunks_mut::<8>();
+                words.fill(word);
+                tail.copy_from_slice(&word[..tail.len()]);
+            }
+        }
+    }
 }
 
 fn deterministic_shuffle<T>(values: &mut [T], seed: u64) {
@@ -434,8 +509,11 @@ const fn mix64(mut value: u64) -> u64 {
 mod tests {
     use memmap2::MmapOptions;
 
+    use dit_core::ExpansionSource;
+
     use super::{
-        PatternFamily, build_window_plan, expected_byte, mandatory_size_classes, summarize_plan,
+        PatternFamily, WindowExpected, build_window_plan, expected_byte, mandatory_size_classes,
+        summarize_plan,
     };
     use crate::memory::MemoryArena;
 
@@ -544,5 +622,93 @@ mod tests {
             .collect();
         assert_eq!(values, replay);
         assert!(values.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn window_expected_matches_expected_byte_for_every_family_and_alignment() {
+        // The second arena starts at an odd global offset, and 4093-byte windows shift the ones
+        // after them: windows start on every lane of a word.
+        let arenas = arenas(&[2 * 1024 * 1024 + 4093, 1024 * 1024 + 13]);
+        let plan = build_window_plan(&arenas, 21);
+        let corpus: Vec<u8> = (0..451_usize)
+            .map(|index| u8::try_from((index * 37 + 11) % 251).expect("byte"))
+            .collect();
+        let source = ExpansionSource::new(&corpus);
+        let windows: Vec<_> = plan.by_arena.iter().flatten().collect();
+        let lanes: std::collections::BTreeSet<u64> = windows
+            .iter()
+            .map(|window| window.global_offset % 8)
+            .collect();
+        assert!(lanes.len() > 1, "windows start on several lanes: {lanes:?}");
+        let mut checked = 0_usize;
+        for window in windows.iter().filter(|window| window.length <= 131_073) {
+            for family in PatternFamily::ALL {
+                let mut window = (*window).clone();
+                window.pattern = family;
+                let expected = WindowExpected::new(&source, 21, &window);
+                let length = window.length;
+                // The whole window, a range starting and ending inside a word, the last bytes.
+                for (offset, count) in [
+                    (0, length),
+                    (5.min(length), 517.min(length - 5.min(length))),
+                    (length.saturating_sub(13), 13.min(length)),
+                ] {
+                    let mut out = vec![0_u8; count];
+                    expected.fill(offset, &mut out);
+                    let reference: Vec<u8> = (offset..offset + count)
+                        .map(|index| {
+                            expected_byte(
+                                &corpus,
+                                21,
+                                &window,
+                                window.global_offset + u64::try_from(index).expect("index"),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        out,
+                        reference,
+                        "{} window {} at {} (+{offset}, {count} bytes)",
+                        family.as_str(),
+                        window.id,
+                        window.global_offset
+                    );
+                    checked += count;
+                }
+            }
+        }
+        assert!(checked > 1_000_000, "checked {checked} bytes");
+    }
+
+    /// Generation speed of each family (`cargo test --release -p dit-system --lib
+    /// window_expected_speed -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement, run by hand in release"]
+    fn window_expected_speed() {
+        let arenas = arenas(&[64 * 1024 * 1024]);
+        let plan = build_window_plan(&arenas, 5);
+        let corpus: Vec<u8> = (0..451_usize)
+            .map(|index| u8::try_from(index % 251).expect("byte"))
+            .collect();
+        let source = ExpansionSource::new(&corpus);
+        let mut window = plan.by_arena[0][0].clone();
+        window.length = 64 * 1024 * 1024;
+        window.global_offset = 3;
+        let mut out = vec![0_u8; 4096];
+        for family in PatternFamily::ALL {
+            window.pattern = family;
+            let expected = WindowExpected::new(&source, 5, &window);
+            let started = std::time::Instant::now();
+            for offset in (0..window.length).step_by(out.len()) {
+                expected.fill(offset, &mut out);
+                std::hint::black_box(&out);
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            println!(
+                "{:22} {:6.2} GB/s",
+                family.as_str(),
+                f64::from(u32::try_from(window.length).expect("length")) / seconds / 1e9
+            );
+        }
     }
 }

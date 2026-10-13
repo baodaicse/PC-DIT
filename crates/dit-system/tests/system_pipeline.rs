@@ -51,7 +51,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
 fn adaptive_multi_core_pipeline_passes() {
     let report = run_system(&verified_source(), &config(None)).expect("system run");
     assert_eq!(report.status, RunStatus::Pass);
-    assert_eq!(report.schema_version, 11);
+    assert_eq!(report.schema_version, 12);
     assert_eq!(report.dit_version, dit_contracts::DIT_VERSION);
     assert!(!report.compute_oracle.enabled);
     assert!(report.memory.allocation_target_met);
@@ -99,6 +99,39 @@ fn release_sized_round_covers_full_window_and_pattern_recipe() {
         64 * 1024 * 1024
     );
     assert_eq!(round.pattern_counts.len(), 8);
+}
+
+#[test]
+fn ram_contents_are_hashed_every_fourth_round_and_compared_every_round() {
+    let mut run = config(None);
+    run.rounds = 5;
+    let report = run_system(&verified_source(), &run).expect("five-round run");
+    assert_eq!(report.status, RunStatus::Pass);
+    assert_eq!(report.config.content_hash_every_rounds, 4);
+    let hashed: Vec<bool> = report
+        .round_digests
+        .iter()
+        .map(|round| round.content_hashed)
+        .collect();
+    assert_eq!(hashed, [true, false, false, false, true]);
+    for round in &report.round_digests {
+        assert_eq!(
+            round.sha256.len(),
+            if round.content_hashed { 64 } else { 0 }
+        );
+        assert_eq!(
+            round.size_class_verified_bytes.values().sum::<u64>(),
+            4 * 1024 * 1024,
+            "round {} compared every byte",
+            round.round
+        );
+    }
+    assert!(
+        report
+            .workers
+            .iter()
+            .all(|worker| worker.sha256_digest.len() == 64)
+    );
 }
 
 #[test]

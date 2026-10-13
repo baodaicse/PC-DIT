@@ -45,7 +45,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 |---|---|---|
 | V0 | Version v1.2.xxx tự động và hiển thị trên UI | `done` (v1.2.000) |
 | V0b | Ghi version vào report và `fail-summary.csv` | `done` (v1.2.004) |
-| C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `planned` |
+| C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `done` (v1.2.006) |
 | C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `planned` |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `planned` |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `planned` |
@@ -102,17 +102,51 @@ Kết quả trên USB trước đây chỉ mang `image_id`. Nay mọi kết qu�
 - **File cũ không chuyển đổi.** Kết quả nào không có `dit_version` (tạo trước 2026-10-13) là bản
   v1.1.
 
-### C1 — Sinh pattern theo word (`planned`)
+### C1 — Sinh pattern theo word (`done`, v1.2.006)
 
-- `expected_byte` hiện tính lại `window_seed`, `splitmix64` và một phép chia lấy dư cho **từng
-  byte**. Chuyển sang tính theo word: seed của cửa sổ tính một lần, `splitmix64` một lần cho mỗi 8
-  byte, chỉ số source đi tuần tự. Áp dụng cho cả 8 họ pattern.
-- Gộp scalar/SIMD reduction vào lượt so sánh. SHA-256 chỉ băm ở một số vòng, có ghi rõ trong
-  report, thay vì băm mọi arena ở mọi vòng.
-- **Không đổi dữ liệu:** `CPU-DIT-PATTERN-v1` giữ nguyên. Test so bản mới với hàm cũ trên mọi họ
-  pattern, cửa sổ lệch biên 8 byte và phần đuôi.
-- Đạt khi: cùng từng byte; một worker ≥ 4 GB/s trên 3700X; lượt full trên máy thật gần chạm băng
-  thông RAM.
+**Đã làm:**
+
+- **Sinh theo đoạn, không theo byte.** `WindowExpected` (`crates/dit-system/src/window.rs`) tính
+  seed của cửa sổ một lần rồi sinh cả đoạn byte:
+  - `source_expanded`: một `splitmix64` cho mỗi 8 byte (`dit_core::expand_into`, đọc source qua
+    `ExpansionSource`, bảng source nối thêm 7 byte để 8 byte liền nhau luôn đọc được một lần);
+  - all-zero, all-one, checkerboard, walking-one/zero chỉ phụ thuộc offset modulo 8: tính 8 byte
+    một lần rồi chép ra cả đoạn;
+  - `address_derived`: vẫn một `mix64` cho mỗi byte (bản chất của họ này), nhưng không còn tính
+    lại seed cửa sổ cho từng byte.
+- **Gộp lượt đọc khi kiểm.** Arena được đọc **một lần**, theo khối 64 KiB: so khối với byte mong
+  đợi (sinh từng đoạn 4 KiB nằm trong L1), rồi tính scalar/SIMD reduction và SHA-256 trên chính
+  khối đó khi nó còn trong cache. Trước đây arena được đọc từ RAM bốn lần.
+- **SHA-256 mỗi 4 vòng:** băm nội dung RAM ở vòng 0, 4, 8... Vòng nào cũng vẫn so **đủ từng
+  byte**. Report ghi `config.content_hash_every_rounds` (4) và `round_digests[].content_hashed`;
+  vòng không băm có `sha256` rỗng. `system-report.json` schema 11 → 12. Report cũ không có hai
+  trường này được đọc là băm mọi vòng.
+- **Không đổi dữ liệu:** `CPU-DIT-PATTERN-v1` giữ nguyên. Test so `WindowExpected` với
+  `expected_byte` (giữ làm chuẩn) trên cả 8 họ, cửa sổ bắt đầu ở mọi lane của word, đoạn cắt
+  giữa word và phần đuôi; `expand_into` với source ngắn hơn 8 byte và offset gần `u64::MAX`;
+  reduction tính theo khối so với bản cũ. Chạy bản cũ và bản mới cùng seed: SHA-256 nội dung RAM
+  của các vòng trùng nhau từng vòng.
+
+**Đo trên máy build (Ryzen 7 3700X, 2 GiB, seed cố định):**
+
+| | Trước | Sau |
+|---|---|---|
+| 1 worker, ghi | 0,51 GB/s | 3,9–4,0 GB/s |
+| 1 worker, kiểm (vòng không băm) | 0,46 GB/s | 2,8–3,0 GB/s |
+| 1 worker, kiểm (vòng có băm) | 0,46 GB/s | 1,2 GB/s |
+| 16 luồng, ghi | 3,9 GB/s | 11–11,7 GB/s |
+| 16 luồng, kiểm (vòng không băm) | 3,9 GB/s | 18–21 GB/s |
+
+Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 50 GB/s, `source_expanded` 4,3 GB/s,
+`address_derived` 0,9 GB/s.
+
+**Chưa đạt:**
+
+- Mục tiêu "một worker ≥ 4 GB/s": ghi đạt, kiểm mới 2,8–3,0 GB/s. Phần còn lại nằm ở
+  `address_derived` (khoảng 1/8 số byte, mỗi byte một `mix64`). Binary SSE2 không có lệnh nhân
+  64-bit vector; tắt vector hoá cũng chỉ được 0,94 GB/s. Bản AVX2 đo được 1,6 GB/s, AVX-512 có
+  `vpmullq` sẽ nhanh hơn nữa: phần này đi cùng **C4**.
+- "Lượt full gần chạm băng thông RAM": cần đo trên máy thật (DDR5) sau C4 và C2.
 
 ### C2 — Chia worker theo phép đo và loại lõi (`planned`, chốt 2026-10-13)
 
@@ -274,7 +308,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 ## Thứ tự triển khai
 
 1. V0b: version trong report và CSV (`done`, v1.2.004).
-2. C1: sinh pattern theo word. Độc lập, không đổi dữ liệu, lợi ngay.
+2. C1: sinh pattern theo word (`done`, v1.2.006).
 3. C3 + C2: kernel nhiều chuỗi và cách chia worker mới.
 4. C4: binary v3/v4 và cơ chế tự chọn.
 5. C5: các kernel mới.
