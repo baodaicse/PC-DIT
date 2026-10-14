@@ -49,7 +49,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `done` (C2a: v1.2.008, C2b: v1.2.009) |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `done` (v1.2.007) |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `done` (v1.2.010) |
-| C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
+| C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `done` (v1.2.011) |
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `planned` |
 
 ### V0 — Version và hiển thị (`done`)
@@ -218,7 +218,8 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
   một giá trị sai sau khoảng 1 triệu vòng. Với `1 - 2^-27`, sai số còn hơn 60% sau cả một burst.
 - **Burst cố định 64 triệu vòng** (khoảng 100 ms; đo thật 150 ms khi chung lõi với luồng RAM qua
   SMT), thay cho ramp theo thời lượng lên tới 500 triệu vòng. Phiên dài thì kiểm nhiều burst hơn.
-- **Ramp theo tầng kernel:** hiện chỉ có tầng 1. C5 và C6 sẽ thêm tầng theo thời lượng.
+- **Ramp theo tầng kernel:** tầng 1 (kernel này) cho mọi phiên; tầng 2 (C5) thêm từ 10 phút. C6 sẽ
+  thêm tầng tiếp theo.
 - Report: `compute_oracle.fma_kernel`, `compute_oracle.fma_chains` (system schema 13, compute
   oracle schema 6); report cũ không có hai trường này là kernel một chuỗi.
 
@@ -262,13 +263,33 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
 | Ryzen 7000 (Zen 4) | v4 (2 lượt 256-bit) |
 | Ryzen 9000 (Zen 5) | v4 (datapath 512-bit thật) |
 
-### C5 — Kernel mới (`planned`)
+### C5 — Kernel mới (`done`, v1.2.011)
+
+**Tầng kernel:** phiên từ **10 phút** trở lên (`TIER2_MINIMUM_SECONDS`) chạy tầng 2: mỗi burst
+vẫn chạy kernel FMA của C3, rồi thêm **một** kernel tầng 2 theo vòng. Các worker bắt đầu ở kernel
+khác nhau, nên cùng lúc máy chịu nhiều loại tải. Phiên ngắn hơn giữ tầng 1. Ép tay:
+`--kernel-tier 1|2` (`compute-oracle-run`), `--compute-kernel-tier 1|2` (`system-run`). Menu [1]
+Full (30 phút) và các pha dài của combined tự lên tầng 2.
 
 | Kernel | Ép phần nào | Cách kiểm |
 |---|---|---|
-| DGEMM khối nằm trong L1/L2 | FMA, load/store, cache | số nguyên biểu diễn bằng double, kết quả chính xác tuyệt đối, so từng bit |
-| Ép từng tầng cache (L1/L2/L3) | cache, ring, fabric | đọc–sửa–ghi trên tập dữ liệu vừa từng tầng, so với đáp án |
-| AES-NI CTR + SHA-NI hàng loạt | đơn vị crypto | tính lại độc lập trên buffer cỡ L2 |
+| `dgemm` | FMA, load/store, L1/L2: ma trận 64×64 (96 KiB), khối 4 hàng × 8 cột (2 hàng trên SSE2) trong thanh ghi vector | phần tử là số nguyên dưới 2^20 lưu dạng `double`: tích dưới 2^40, tổng 64 tích dưới 2^46, nên kết quả **chính xác tuyệt đối** dù có FMA hay không, cộng theo thứ tự nào; so từng bit với tích **số nguyên** (khối ALU khác) |
+| `cache_l1`, `cache_l2`, `cache_l3` | đọc–sửa–ghi nhiều lượt trên phần chia cho mỗi luồng của từng tầng (đọc từ `cpu/cpuN/cache`: kích thước chia cho số luồng dùng chung; L3 tối đa 8 MiB) | mỗi lượt XOR mọi word với khoá của lượt; đáp án dạng đóng (giá trị đầu XOR mọi khoá), không đi qua buffer |
+| `crypto` | AES-NI (AES-256-CTR) và SHA-NI trên buffer 256 KiB (vừa L2) | AES-256 và SHA-256 **phần mềm** tự viết theo FIPS-197 / FIPS 180-4 (`soft_crypto.rs`), tính một lần đầu phiên |
+
+- Bước của kernel cache chọn bằng phép đo: với phép nhân hay dịch-cộng, cả ba tầng chạy cùng tốc
+  độ, tức bị phép tính giới hạn; với chỉ XOR, các tầng tách đúng theo băng thông (3700X, AVX2:
+  L1 128 GB/s, L2 58, L3 55 mỗi lõi).
+- Mỗi burst tầng 2 khoảng 50–120 ms (3700X, v1 và v3): DGEMM 3000 tích, cache 6 GiB đọc–ghi,
+  crypto 320 lượt.
+- AES/SHA phần mềm được test với vector FIPS và với kết quả AES-NI/SHA-NI. Kernel test cả trường
+  hợp đáp án sai phải bị bắt.
+- Report: `compute_oracle.kernel_tier`, `tier2_kernels` (số burst và số lần sai của từng kernel),
+  `tier2_kernels_passed` (system schema 17, compute oracle schema 8). Sai ở kernel tầng 2 là FAIL
+  ô CPU (`cpu:oracle_tier2`), như các kernel tính toán khác.
+- Chạy thật (3700X, 8 worker, 12 s): v1 và v3 PASS, mọi kernel đều được chạy, không lần nào sai;
+  CPU-RAM tầng 2 với phép chia đo được (12 RAM + 4 tính toán) PASS.
+- **Chưa kiểm:** AVX-512 (v4) và CPU hybrid trên máy thật; thời lượng mỗi burst trên E-core.
 
 ### C6 — Xoay từng lõi (`planned`)
 
@@ -387,7 +408,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 2. C1: sinh pattern theo word (`done`, v1.2.006).
 3. C3 + C2: kernel nhiều chuỗi (C3 `done`, v1.2.007) và cách chia worker mới (C2 `done`, v1.2.008–009).
 4. C4: binary v3/v4 và cơ chế tự chọn (`done`, v1.2.010).
-5. C5: các kernel mới.
+5. C5: các kernel mới (`done`, v1.2.011).
 6. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng

@@ -9,6 +9,7 @@ mod gpu;
 mod inventory;
 pub mod isa;
 pub mod kernel_events;
+mod kernels;
 mod memory;
 pub mod pcie;
 pub mod power_platform;
@@ -16,6 +17,7 @@ pub mod pressure;
 pub mod procs;
 mod report;
 mod safety;
+mod soft_crypto;
 mod split;
 mod telemetry;
 mod window;
@@ -23,7 +25,7 @@ mod window;
 pub use compute_oracle::{
     ComputeOracleConfig, ComputeOracleMismatch, ComputeOracleReport, ComputeOracleStatus,
     ComputeOracleWorkerEvidence, FMA_CHAINS, FMA_ITERATIONS_PER_BURST, FMA_KERNEL_ID,
-    run_compute_oracle,
+    TIER2_MINIMUM_SECONDS, kernel_tier_for, run_compute_oracle,
 };
 pub use engine::{SeedSource, SystemRunConfig, run_system};
 pub use error::SystemDitError;
@@ -35,6 +37,7 @@ pub use gpu::{
 pub use inventory::{
     CoreKind, CpuInventory, CpuThread, MemoryInventory, NumaNode, SystemInventory,
 };
+pub use kernels::{KernelTally, TIER2_KERNELS};
 pub use memory::{LockPolicy, MemoryTarget};
 pub use report::{
     ArenaEvidence, CpuEvidence, DiagnosticEvidence, ExecutionEvidence, MemoryPlanEvidence,

@@ -9,7 +9,10 @@
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -25,6 +28,7 @@ use crate::{
     SystemDitError,
     cpu::{compute_order, pin_current_thread},
     inventory::SystemInventory,
+    kernels::{KernelTally, TIER2_KERNELS, Tier2References, Tier2Worker},
     safety::RunControl,
 };
 
@@ -144,6 +148,20 @@ pub const FMA_CHAINS: usize = 10;
 /// See the FMA build above.
 #[cfg(not(target_feature = "fma"))]
 pub const FMA_CHAINS: usize = 6;
+
+/// Sessions at least this long run the tier-2 kernels as well (C5, `kernels.rs`): every burst
+/// adds one of them, in turn. Shorter ones spend their time on the main FMA kernel.
+pub const TIER2_MINIMUM_SECONDS: u64 = 600;
+
+/// The kernel tier for a session of `duration_seconds`: 2 from [`TIER2_MINIMUM_SECONDS`], else 1.
+#[must_use]
+pub const fn kernel_tier_for(duration_seconds: u64) -> u8 {
+    if duration_seconds >= TIER2_MINIMUM_SECONDS {
+        2
+    } else {
+        1
+    }
+}
 
 /// Iterations per burst: about 100 ms on a desktop core (64 ms to 80 ms on the 3700X), so a
 /// result is checked several times a second.
@@ -327,6 +345,9 @@ pub struct ComputeOracleConfig {
     pub dense_fma_iterations_per_burst: u32,
     pub idle_ramp_enabled: bool,
     pub idle_sleep_ms: u64,
+    /// 1: the FMA, branch and AES kernels; 2: plus one tier-2 kernel per burst
+    /// ([`kernel_tier_for`]).
+    pub kernel_tier: u8,
     /// Dev/test-only: force one worker's dense-FMA result to be wrong, to
     /// prove the cross-worker oracle cannot be fooled (`TEST_AND_ACCEPTANCE.md`).
     pub fault_injection_worker: Option<usize>,
@@ -343,6 +364,9 @@ pub struct ComputeOracleWorkerEvidence {
     pub branch_predictor_final: u64,
     pub branch_predictor_mismatches: u64,
     pub aes256_mismatches: u64,
+    /// Tier-2 kernels this worker ran (empty at tier 1 and before v1.2.011).
+    #[serde(default)]
+    pub tier2_kernels: Vec<KernelTally>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +404,14 @@ pub struct ComputeOracleReport {
     /// Independent FMA chains per burst (1 in older reports).
     #[serde(default = "crate::report::one_chain")]
     pub fma_chains: usize,
+    /// 1 or 2 (tier 2 adds the C5 kernels); 1 before v1.2.011.
+    #[serde(default = "crate::report::tier_one")]
+    pub kernel_tier: u8,
+    /// Every tier-2 kernel's bursts and mismatches over all workers.
+    #[serde(default)]
+    pub tier2_kernels: Vec<KernelTally>,
+    #[serde(default = "crate::report::passed")]
+    pub tier2_kernels_passed: bool,
     pub idle_ramp_cycles: u64,
     /// Resolved value actually used (explicit override or duration-derived
     /// ramp); replay only needs this field, never the original duration.
@@ -404,6 +436,8 @@ pub(crate) struct WorkerOutcome {
     pub(crate) branch_predictor_mismatches: u64,
     pub(crate) aes256_mismatches: u64,
     pub(crate) panicked: bool,
+    /// Tier-2 kernels run, in `TIER2_KERNELS` order (empty at tier 1).
+    pub(crate) tier2: Vec<KernelTally>,
 }
 
 pub(crate) fn minimum_work_met(outcomes: &[WorkerOutcome], requested: usize, idle: bool) -> bool {
@@ -474,9 +508,11 @@ fn worker_loop(
     config: &ComputeOracleConfig,
     fma_reference: &[[u64; FMA_LANES]; FMA_CHAINS],
     branch_predictor_reference: u64,
+    tier2: Option<&Tier2References>,
     deadline: Instant,
 ) -> WorkerOutcome {
     let affinity_failed = pin_current_thread(cpu_id).is_err();
+    let mut tier2_worker = tier2.map(|_| Tier2Worker::new(worker_id, cpu_id));
     let mut bursts_completed = 0_u64;
     let mut idle_ramp_cycles = 0_u64;
     let mut dense_fma_mismatches = 0_u64;
@@ -495,6 +531,9 @@ fn worker_loop(
             fma_reference,
             branch_predictor_reference,
         );
+        if let (Some(worker), Some(references)) = (tier2_worker.as_mut(), tier2) {
+            worker.run_next(references);
+        }
         dense_fma_final_bits = burst.dense_fma_final_bits;
         branch_predictor_final = burst.branch_predictor_final;
         dense_fma_mismatches += u64::from(burst.dense_fma_mismatch);
@@ -522,6 +561,9 @@ fn worker_loop(
         branch_predictor_mismatches,
         aes256_mismatches,
         panicked: false,
+        tier2: tier2_worker
+            .map(|worker| worker.tallies)
+            .unwrap_or_default(),
     }
 }
 
@@ -540,10 +582,12 @@ pub(crate) fn run_worker_with_control(
     fault_injection_worker: Option<usize>,
     fma_reference: [[u64; FMA_LANES]; FMA_CHAINS],
     branch_predictor_reference: u64,
+    tier2: Option<&Tier2References>,
     control: &RunControl,
     finished: &AtomicBool,
 ) -> WorkerOutcome {
     let affinity_failed = pin_current_thread(cpu_id).is_err();
+    let mut tier2_worker = tier2.map(|_| Tier2Worker::new(worker_id, cpu_id));
     let mut bursts_completed = 0_u64;
     let mut idle_ramp_cycles = 0_u64;
     let mut dense_fma_mismatches = 0_u64;
@@ -563,6 +607,9 @@ pub(crate) fn run_worker_with_control(
             &fma_reference,
             branch_predictor_reference,
         );
+        if let (Some(worker), Some(references)) = (tier2_worker.as_mut(), tier2) {
+            worker.run_next(references);
+        }
         dense_fma_final_bits = burst.dense_fma_final_bits;
         branch_predictor_final = burst.branch_predictor_final;
         dense_fma_mismatches += u64::from(burst.dense_fma_mismatch);
@@ -587,6 +634,9 @@ pub(crate) fn run_worker_with_control(
         branch_predictor_mismatches,
         aes256_mismatches,
         panicked: false,
+        tier2: tier2_worker
+            .map(|worker| worker.tallies)
+            .unwrap_or_default(),
     }
 }
 
@@ -636,6 +686,7 @@ pub fn run_compute_oracle(
     // burst is checked against it below instead of only the last one.
     let branch_predictor_reference = branch_predictor_pass(config.seed, BRANCH_PREDICTOR_LENGTH);
     let fma_reference = fma_chain_reference(config.seed, config.dense_fma_iterations_per_burst);
+    let tier2 = (config.kernel_tier >= 2).then(|| Arc::new(Tier2References::new(config.seed)));
 
     let started = Instant::now();
     let deadline = started + Duration::from_millis(config.minimum_duration_ms);
@@ -643,6 +694,7 @@ pub fn run_compute_oracle(
     let mut handles = Vec::with_capacity(worker_cpus.len());
     for (worker_id, &cpu_id) in worker_cpus.iter().enumerate() {
         let config = config.clone();
+        let tier2 = tier2.clone();
         handles.push(thread::spawn(move || {
             catch_unwind(AssertUnwindSafe(|| {
                 worker_loop(
@@ -651,6 +703,7 @@ pub fn run_compute_oracle(
                     &config,
                     &fma_reference,
                     branch_predictor_reference,
+                    tier2.as_deref(),
                     deadline,
                 )
             }))
@@ -673,6 +726,7 @@ pub fn run_compute_oracle(
                 branch_predictor_mismatches: 0,
                 aes256_mismatches: 0,
                 panicked: true,
+                tier2: Vec::new(),
             }),
         }
     }
@@ -709,6 +763,7 @@ pub fn run_compute_oracle(
             branch_predictor_final: outcome.branch_predictor_final,
             branch_predictor_mismatches: outcome.branch_predictor_mismatches,
             aes256_mismatches: outcome.aes256_mismatches,
+            tier2_kernels: outcome.tier2.clone(),
         })
         .collect();
 
@@ -716,7 +771,8 @@ pub fn run_compute_oracle(
         // v3: records the resolved dense_fma_iterations_per_burst (DIT-
         // DURATION-COMPLEXITY-RAMP-v1) alongside the v2 per-burst mismatch fix.
         // v5: dit_version. v6: multi-chain FMA kernel (fma_kernel, fma_chains). v7: cpu_isa.
-        schema_version: 7,
+        // v8: kernel_tier, tier2_kernels, tier2_kernels_passed.
+        schema_version: 8,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability: crate::availability::AvailabilityEvidence::new(
             if coverage_met {
@@ -738,6 +794,9 @@ pub fn run_compute_oracle(
         elapsed_ms: started.elapsed().as_millis(),
         fma_kernel: FMA_KERNEL_ID.to_owned(),
         fma_chains: FMA_CHAINS,
+        kernel_tier: config.kernel_tier,
+        tier2_kernels: aggregate.tier2_kernels.clone(),
+        tier2_kernels_passed: aggregate.tier2_kernels_passed,
         idle_ramp_cycles,
         dense_fma_iterations_per_burst: config.dense_fma_iterations_per_burst,
         dense_fma_cross_worker_consistent: aggregate.dense_fma_cross_worker_consistent,
@@ -757,6 +816,8 @@ pub(crate) struct ComputeOracleAggregate {
     pub(crate) dense_fma_scalar_reference_passed: bool,
     pub(crate) branch_predictor_passed: bool,
     pub(crate) aes256_known_answer_passed: bool,
+    pub(crate) tier2_kernels: Vec<KernelTally>,
+    pub(crate) tier2_kernels_passed: bool,
     pub(crate) mismatch: Option<ComputeOracleMismatch>,
 }
 
@@ -843,6 +904,12 @@ pub(crate) fn aggregate_outcomes(outcomes: &[WorkerOutcome]) -> ComputeOracleAgg
         });
     }
 
+    let (tier2_kernels, tier2_mismatch) = tier2_totals(outcomes);
+    let tier2_kernels_passed = tier2_mismatch.is_none();
+    if mismatch.is_none() {
+        mismatch = tier2_mismatch;
+    }
+
     let any_affinity_failure = outcomes.iter().any(|outcome| outcome.affinity_failed);
     if any_affinity_failure && mismatch.is_none() {
         mismatch = Some(ComputeOracleMismatch {
@@ -861,8 +928,49 @@ pub(crate) fn aggregate_outcomes(outcomes: &[WorkerOutcome]) -> ComputeOracleAgg
         dense_fma_scalar_reference_passed,
         branch_predictor_passed,
         aes256_known_answer_passed,
+        tier2_kernels,
+        tier2_kernels_passed,
         mismatch,
     }
+}
+
+/// Tier-2 kernels (C5), summed over workers in `TIER2_KERNELS` order, and the first one that
+/// failed, as the report's mismatch.
+fn tier2_totals(outcomes: &[WorkerOutcome]) -> (Vec<KernelTally>, Option<ComputeOracleMismatch>) {
+    let mut totals: Vec<KernelTally> = Vec::new();
+    for outcome in outcomes {
+        for (index, tally) in outcome.tier2.iter().enumerate() {
+            if totals.len() <= index {
+                totals.resize_with(index + 1, KernelTally::default);
+                totals[index].kernel = TIER2_KERNELS
+                    .get(index)
+                    .map_or_else(|| tally.kernel.clone(), |name| (*name).to_owned());
+            }
+            totals[index].bursts += tally.bursts;
+            totals[index].mismatches += tally.mismatches;
+        }
+    }
+    let mismatch = totals
+        .iter()
+        .find(|tally| tally.mismatches > 0)
+        .map(|failing| {
+            let worker = outcomes.iter().find(|outcome| {
+                outcome
+                    .tier2
+                    .iter()
+                    .any(|tally| tally.kernel == failing.kernel && tally.mismatches > 0)
+            });
+            ComputeOracleMismatch {
+                kernel: format!("tier2:{}", failing.kernel),
+                worker_id: worker.map(|outcome| outcome.worker_id),
+                cpu_id: worker.map(|outcome| outcome.cpu_id),
+                detail: format!(
+                    "{} of {} {} bursts differed from the reference",
+                    failing.mismatches, failing.bursts, failing.kernel
+                ),
+            }
+        });
+    (totals, mismatch)
 }
 
 #[cfg(test)]
@@ -969,8 +1077,37 @@ mod tests {
             dense_fma_iterations_per_burst: 500,
             idle_ramp_enabled: false,
             idle_sleep_ms: 0,
+            kernel_tier: 1,
             fault_injection_worker: None,
         }
+    }
+
+    #[test]
+    fn tier_two_runs_every_kernel_and_reports_each() {
+        assert_eq!(super::kernel_tier_for(599), 1);
+        assert_eq!(super::kernel_tier_for(600), 2);
+        let mut config = base_config();
+        config.kernel_tier = 2;
+        config.minimum_duration_ms = 300;
+        let report = run_compute_oracle(&config).expect("tier-2 run");
+        assert_eq!(report.status, ComputeOracleStatus::Pass);
+        assert_eq!(report.kernel_tier, 2);
+        assert!(report.tier2_kernels_passed);
+        let names: Vec<&str> = report
+            .tier2_kernels
+            .iter()
+            .map(|tally| tally.kernel.as_str())
+            .collect();
+        assert_eq!(names, crate::kernels::TIER2_KERNELS);
+        assert!(report.tier2_kernels.iter().all(|tally| tally.bursts > 0));
+        assert!(
+            report
+                .workers
+                .iter()
+                .all(|worker| worker.tier2_kernels.len() == crate::kernels::TIER2_KERNELS.len())
+        );
+        let tier_one = run_compute_oracle(&base_config()).expect("tier-1 run");
+        assert!(tier_one.tier2_kernels.is_empty() && tier_one.tier2_kernels_passed);
     }
 
     #[test]
@@ -999,6 +1136,7 @@ mod tests {
             branch_predictor_mismatches: 0,
             aes256_mismatches: 0,
             panicked: false,
+            tier2: Vec::new(),
         }];
         assert!(!super::minimum_work_met(&outcomes, 1, false));
         outcomes[0].bursts_completed = 1;

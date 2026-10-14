@@ -14,7 +14,7 @@ use dit_system::{
     ComputeOracleConfig, ComputeOracleReport, ComputeOracleStatus, EdacPolicy,
     FMA_ITERATIONS_PER_BURST, LockPolicy, MemoryTarget, SafetyFaultInjection, SafetyPolicy,
     SeedSource, SensorReport, SystemRunConfig, SystemRunReport, collect_sensor_report,
-    format_gpu_summary, isa, run_compute_oracle, run_system,
+    format_gpu_summary, isa, kernel_tier_for, run_compute_oracle, run_system,
 };
 
 /// v1.2 (C4): run the build of this program made for the widest instructions this CPU has
@@ -260,6 +260,11 @@ struct ComputeOracleArgs {
     #[arg(long)]
     dense_fma_iterations: Option<u32>,
 
+    /// 1: FMA, branch and AES kernels; 2: plus one tier-2 kernel per burst (DGEMM, L1/L2/L3,
+    /// AES+SHA). Omit to choose by duration: tier 2 from 10 minutes.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+    kernel_tier: Option<u8>,
+
     /// Alternate idle sleep and full-load bursts to exercise P-state/voltage transitions.
     #[arg(long)]
     idle_ramp: bool,
@@ -478,6 +483,11 @@ struct SystemRunArgs {
 
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2_000_000_000))]
     compute_oracle_dense_fma_iterations: Option<u32>,
+
+    /// 1: FMA, branch and AES kernels; 2: plus one tier-2 kernel per burst (DGEMM, L1/L2/L3,
+    /// AES+SHA). Omit to choose by --minimum-duration-seconds: tier 2 from 10 minutes.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+    compute_kernel_tier: Option<u8>,
 
     /// Alternate idle sleep and full-load bursts to exercise P-state/voltage transitions.
     #[arg(long)]
@@ -791,6 +801,9 @@ fn system_run(args: &SystemRunArgs) -> u8 {
         compute_oracle_dense_fma_iterations: args
             .compute_oracle_dense_fma_iterations
             .unwrap_or(FMA_ITERATIONS_PER_BURST),
+        compute_kernel_tier: args
+            .compute_kernel_tier
+            .unwrap_or_else(|| kernel_tier_for(args.minimum_duration_seconds)),
         compute_oracle_idle_ramp_enabled: args.compute_oracle_idle_ramp,
         compute_oracle_idle_sleep_ms: args.compute_oracle_idle_sleep_ms,
         fault_injection_compute_oracle_worker: args.inject_compute_oracle_worker,
@@ -845,6 +858,9 @@ fn compute_oracle_run(args: &ComputeOracleArgs) -> u8 {
         dense_fma_iterations_per_burst: resolved_dense_fma_iterations(args),
         idle_ramp_enabled: args.idle_ramp,
         idle_sleep_ms: args.idle_sleep_ms,
+        kernel_tier: args
+            .kernel_tier
+            .unwrap_or_else(|| kernel_tier_for(args.minimum_duration_seconds)),
         fault_injection_worker: args.inject_worker_fault,
     };
     let report = match run_compute_oracle(&config) {
@@ -1111,6 +1127,7 @@ mod tests {
             workers: 1,
             minimum_duration_seconds: 3_600,
             dense_fma_iterations: None,
+            kernel_tier: None,
             idle_ramp: false,
             idle_sleep_ms: 50,
             seed: None,

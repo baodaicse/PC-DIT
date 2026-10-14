@@ -26,6 +26,7 @@ use crate::{
         fp_fma_known_answer_test, integer_known_answer_test, pin_current_thread, place_workers,
         sha256_known_answer_test,
     },
+    kernels::Tier2References,
     memory::{MemoryArena, plan_and_allocate},
     report::{
         ArenaEvidence, CpuEvidence, DiagnosticEvidence, ExecutionEvidence, RoundDigest,
@@ -174,6 +175,9 @@ pub struct SystemRunConfig {
     /// at least a quarter of it; `compute_oracle_workers` must be 0.
     pub measure_split: bool,
     pub compute_oracle_dense_fma_iterations: u32,
+    /// 1: the FMA, branch and AES kernels; 2: plus one tier-2 kernel per burst (C5,
+    /// `compute_oracle::kernel_tier_for`).
+    pub compute_kernel_tier: u8,
     pub compute_oracle_idle_ramp_enabled: bool,
     pub compute_oracle_idle_sleep_ms: u64,
     pub fault_injection_compute_oracle_worker: Option<usize>,
@@ -209,6 +213,12 @@ impl SystemRunConfig {
             return Err(SystemDitError::InvalidConfig(
                 "coherency iterations must be positive".to_owned(),
             ));
+        }
+        if !(1..=2).contains(&self.compute_kernel_tier) {
+            return Err(SystemDitError::InvalidConfig(format!(
+                "compute kernel tier {} is not 1 or 2",
+                self.compute_kernel_tier
+            )));
         }
         if self.measure_split && self.compute_oracle_workers > 0 {
             return Err(SystemDitError::InvalidConfig(
@@ -533,6 +543,8 @@ fn run_system_once(
         config.seed,
         config.compute_oracle_dense_fma_iterations,
     );
+    let compute_oracle_tier2 = (config.compute_kernel_tier >= 2 && compute_workers_requested > 0)
+        .then(|| Arc::new(Tier2References::new(config.seed)));
     let compute_oracle_finished = Arc::new(AtomicBool::new(false));
     let compute_oracle_handles: Vec<_> = compute_oracle_worker_cpus
         .iter()
@@ -545,6 +557,7 @@ fn run_system_once(
             let idle_ramp_enabled = config.compute_oracle_idle_ramp_enabled;
             let idle_sleep_ms = config.compute_oracle_idle_sleep_ms;
             let fault_worker = config.fault_injection_compute_oracle_worker;
+            let tier2 = compute_oracle_tier2.clone();
             thread::spawn(move || {
                 compute_oracle::run_worker_with_control(
                     worker_id,
@@ -556,6 +569,7 @@ fn run_system_once(
                     fault_worker,
                     compute_oracle_fma_reference,
                     compute_oracle_branch_reference,
+                    tier2.as_deref(),
                     &control,
                     &finished,
                 )
@@ -762,14 +776,17 @@ fn run_system_once(
                 branch_predictor_mismatches: 0,
                 aes256_mismatches: 0,
                 panicked: true,
+                tier2: Vec::new(),
             })
         })
         .collect();
     for outcome in &compute_oracle_outcomes {
+        let tier2_mismatches = outcome.tier2.iter().map(|tally| tally.mismatches).sum();
         for (mismatches, source) in [
             (outcome.dense_fma_mismatches, "cpu:oracle_fma"),
             (outcome.branch_predictor_mismatches, "cpu:oracle_branch"),
             (outcome.aes256_mismatches, "cpu:oracle_aes"),
+            (tier2_mismatches, "cpu:oracle_tier2"),
         ] {
             if mismatches > 0 {
                 faults.write(
@@ -800,6 +817,9 @@ fn run_system_once(
             fma_kernel: compute_oracle::FMA_KERNEL_ID.to_owned(),
             fma_chains: compute_oracle::FMA_CHAINS,
             dense_fma_iterations_per_burst: config.compute_oracle_dense_fma_iterations,
+            kernel_tier: config.compute_kernel_tier,
+            tier2_kernels: aggregate.tier2_kernels.clone(),
+            tier2_kernels_passed: aggregate.tier2_kernels_passed,
             workers_used: compute_oracle_outcomes.len(),
             worker_cpu_ids: compute_oracle_worker_cpus.clone(),
             bursts_completed: compute_oracle_outcomes
@@ -975,7 +995,8 @@ fn run_system_once(
         // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains). v14: workers
         // placed by core kind (config.worker_placement; inventory threads' core_kind, smt_rank,
         // l3_id). v15: worker_split (the RAM/compute split, measured or fixed). v16: cpu_isa.
-        schema_version: 16,
+        // v17: compute_oracle.kernel_tier, .tier2_kernels, .tier2_kernels_passed.
+        schema_version: 17,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
@@ -2103,6 +2124,7 @@ mod tests {
             compute_oracle_workers: 0,
             measure_split: false,
             compute_oracle_dense_fma_iterations: 1,
+            compute_kernel_tier: 1,
             compute_oracle_idle_ramp_enabled: false,
             compute_oracle_idle_sleep_ms: 0,
             fault_injection_compute_oracle_worker: None,

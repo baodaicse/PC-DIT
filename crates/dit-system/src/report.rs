@@ -48,6 +48,14 @@ pub struct SystemConfigEvidence {
     pub worker_placement: String,
 }
 
+pub(crate) const fn tier_one() -> u8 {
+    1
+}
+
+pub(crate) const fn passed() -> bool {
+    true
+}
+
 pub(crate) const fn one_chain() -> usize {
     1
 }
@@ -255,6 +263,14 @@ pub struct SystemComputeOracleEvidence {
     #[serde(default = "one_chain")]
     pub fma_chains: usize,
     pub dense_fma_iterations_per_burst: u32,
+    /// 1 or 2 (tier 2 adds the C5 kernels, `kernels.rs`); 1 before v1.2.011.
+    #[serde(default = "tier_one")]
+    pub kernel_tier: u8,
+    /// Every tier-2 kernel's bursts and mismatches over all compute workers.
+    #[serde(default)]
+    pub tier2_kernels: Vec<crate::kernels::KernelTally>,
+    #[serde(default = "passed")]
+    pub tier2_kernels_passed: bool,
     pub workers_used: usize,
     pub worker_cpu_ids: Vec<usize>,
     pub bursts_completed: u64,
@@ -277,6 +293,9 @@ impl SystemComputeOracleEvidence {
             fma_kernel: String::new(),
             fma_chains: 0,
             dense_fma_iterations_per_burst: 0,
+            kernel_tier: 1,
+            tier2_kernels: Vec::new(),
+            tier2_kernels_passed: true,
             workers_used: 0,
             worker_cpu_ids: Vec::new(),
             bursts_completed: 0,

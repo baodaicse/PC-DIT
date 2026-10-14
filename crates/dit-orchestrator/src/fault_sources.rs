@@ -147,6 +147,8 @@ fn cpu_checks(report: &Value, found: &mut Findings) -> u64 {
                 "/compute_oracle/aes256_known_answer_passed",
                 "cpu:oracle_aes",
             ),
+            // v1.2 C5: DGEMM, cache levels, AES-NI/SHA-NI (absent in older reports: passed).
+            ("/compute_oracle/tier2_kernels_passed", "cpu:oracle_tier2"),
         ] {
             if bool_at(report, pointer) == Some(false) {
                 let detail = report
@@ -1520,6 +1522,24 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(found.failures[0].cell, "SSD1|SSD1-path");
         assert!(ssd_kind("write_budget_exceeded", 1).is_none());
+    }
+
+    #[test]
+    fn a_tier_two_kernel_mismatch_is_a_cpu_failure() {
+        let report = serde_json::json!({
+            "compute_oracle": {"enabled": true, "dense_fma_cross_worker_consistent": true,
+                    "dense_fma_scalar_reference_passed": true, "branch_predictor_passed": true,
+                    "aes256_known_answer_passed": true, "tier2_kernels_passed": false,
+                    "mismatch": {"kernel": "tier2:cache_l2", "worker_id": 1, "cpu_id": 4,
+                                 "detail": "1 of 9 cache_l2 bursts differed from the reference"}},
+            "failures_total": 0
+        });
+        let found = cpu_ram(&report, "BASELINE CPU-RAM");
+        assert_eq!(found.failures.len(), 1);
+        assert_eq!(found.failures[0].source, "cpu:oracle_tier2");
+        let mut ledger = Ledger::default();
+        ledger.add_all(found.failures);
+        assert_eq!(ledger.cell(Component::Cpu).confirmed, 1);
     }
 
     #[test]

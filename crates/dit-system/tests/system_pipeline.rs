@@ -39,6 +39,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
         diagnostic_rerun: false,
         compute_oracle_workers: 0,
         measure_split: false,
+        compute_kernel_tier: 1,
         compute_oracle_dense_fma_iterations: 1_000,
         compute_oracle_idle_ramp_enabled: false,
         compute_oracle_idle_sleep_ms: 0,
@@ -52,7 +53,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
 fn adaptive_multi_core_pipeline_passes() {
     let report = run_system(&verified_source(), &config(None)).expect("system run");
     assert_eq!(report.status, RunStatus::Pass);
-    assert_eq!(report.schema_version, 16);
+    assert_eq!(report.schema_version, 17);
     assert_eq!(report.dit_version, dit_contracts::DIT_VERSION);
     assert!(!report.compute_oracle.enabled);
     assert!(report.memory.allocation_target_met);
