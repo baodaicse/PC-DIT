@@ -261,6 +261,8 @@ pub fn summarize(
         return String::new();
     };
     let (findings, machine, gpus, ssds) = module_findings(module, &report);
+    let mut notes = findings.notes.clone();
+    notes.dedup_by_key(|(code, _)| *code);
     let mut ledger = Ledger::default();
     ledger.add_all(findings.failures);
     for event in &findings.hardware {
@@ -289,14 +291,23 @@ pub fn summarize(
             if let Some(code) = cause {
                 counts.add_cause(code);
             }
+            for (code, _) in &notes {
+                counts.add_marked("NOTE", code);
+            }
             csv_row(&meta, &counts)
         }) {
             Ok(()) => format!("Fail summary row added to {}", csv_path.display()),
             Err(error) => format!("Fail summary not written ({error}): {}", csv_path.display()),
         },
     };
+    let mut note_lines = String::new();
+    for (_, text) in &notes {
+        note_lines.push_str("NOTE          ");
+        note_lines.push_str(text);
+        note_lines.push('\n');
+    }
     format!(
-        "{}\n{}\n{}\n{csv}",
+        "{}\n{}\n{}\n{note_lines}{csv}",
         ledger.fail_line(&machine, 0),
         ledger.hardware_line(),
         ledger.throttle_line()

@@ -25,6 +25,7 @@ use dit_orchestrator::hw_events::{self, HwMonitor};
 use dit_orchestrator::session::{
     self, Claim, LayerStatus, SessionInfo, SessionStatus, SessionWriter,
 };
+use dit_system::RotationKind;
 use dit_ui_core::{InPlaceRenderer, TerminalSize};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -39,6 +40,10 @@ const MIB: u64 = 1024 * 1024;
 /// A layer still running this long after its phase should have ended is drained.
 const OVERRUN_GRACE: Duration = Duration::from_mins(15);
 const READY_WAIT: Duration = Duration::from_mins(5);
+/// Rotation B (v1.2 C6): the GPU test keeps two verifier threads, enough for every GPU in the
+/// field results (an RTX 5080 or 4090 needs about one core to keep up; a GTX 960 stayed 95%
+/// busy with two), and leaves the rest of the CPU idle for the core under test.
+const ROTATION_B_GPU_VERIFIERS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum LevelArg {
@@ -377,6 +382,9 @@ struct Session<'a> {
     last_beat: Option<Instant>,
     /// Why the session ended early, as cause codes for its CSV row (`memory_guard`).
     causes: Vec<(&'static str, String)>,
+    /// Observations that count no failure (`no_boost` of a core rotation): `NOTE[code]` in
+    /// the CSV row, a NOTE line on the result.
+    notes: Vec<(&'static str, String)>,
 }
 
 /// Mark of a result from the Fault Attribution boot entry (`fail-summary.csv` test column).
@@ -568,6 +576,14 @@ fn run_session(
     let start_available = mem_available().unwrap_or(0);
     let gpu_budget = combined::gpu_host_budget(start_available);
     let mut phases = combined::schedule(settings.level, available, settings.soak_hours);
+    // v1.2 C6: the core rotation, unless `dit_rotation=0` (kernel command line) or
+    // `DIT_ROTATION=0` turns it off; the schedule is then the one before v1.2.
+    if combined::core_rotation_enabled(
+        std::env::var("DIT_ROTATION").ok().as_deref(),
+        &std::fs::read_to_string("/proc/cmdline").unwrap_or_default(),
+    ) {
+        phases = combined::add_core_rotation(settings.level, available, phases);
+    }
     for phase in &mut phases {
         if phase.seconds > 0 {
             phase.seconds = (phase.seconds * settings.time_scale_percent / 100).max(20);
@@ -656,6 +672,7 @@ fn run_session(
         writer: None,
         last_beat: None,
         causes: Vec::new(),
+        notes: Vec::new(),
     };
     session.writer = SessionWriter::open(
         Path::new(session::ROOT),
@@ -983,6 +1000,13 @@ impl Session<'_> {
                 self.overlap(index, seconds, &mut record);
                 Ok(())
             }
+            PhaseKind::RotationA => self
+                .launch_rotation(index, RotationKind::A, seconds, None)
+                .map(|running| self.supervise(vec![running], seconds, &mut record)),
+            PhaseKind::RotationB => {
+                self.rotation_b(index, seconds, &mut record);
+                Ok(())
+            }
         };
         if let Err(error) = result {
             record.note = Some(error);
@@ -996,6 +1020,89 @@ impl Session<'_> {
                 .iter()
                 .all(|layer| layer.outcome != LayerOutcome::Crashed);
         self.records.push(record);
+    }
+
+    /// v1.2 C6: the core rotation, run as a CPU-RAM layer (`layers::cpu_rotation`): its report
+    /// is a CPU-RAM report, its failures go to the CPU cell the usual way.
+    fn launch_rotation(
+        &self,
+        index: usize,
+        kind: RotationKind,
+        seconds: u64,
+        keep_off_pid: Option<u32>,
+    ) -> Result<Running, String> {
+        let dir = self.phase_dir(index, Layer::CpuRam);
+        let mut launch = layers::cpu_rotation(
+            self.menu,
+            &dir,
+            seconds,
+            kind.as_str(),
+            keep_off_pid,
+            self.settings.memory.reserve_bytes / MIB,
+        );
+        if self.menu.attribution_checks {
+            launch.args.push(attribution_flag(Layer::CpuRam).into());
+        }
+        launch.args.extend([
+            "--fault-events".into(),
+            dir.join("fault-events.jsonl").into(),
+        ]);
+        self.spawn(index, Layer::CpuRam, launch)
+    }
+
+    /// Rotation B: the GPU test flat out first (the Full profile, two verifier threads), then
+    /// the rotation beside it, the GPU test's processes kept off the core under test. The GPU
+    /// layer is started exactly as for its baseline but for the verifier ceiling.
+    fn rotation_b(&mut self, index: usize, seconds: u64, record: &mut PhaseRecord) {
+        let end = Instant::now() + Duration::from_secs(seconds);
+        let mut running: Vec<Running> = Vec::new();
+        if self.available.gpu {
+            let dir = self.phase_dir(index, Layer::Gpu);
+            let mut launch = layers::gpu(
+                self.menu,
+                &dir,
+                seconds,
+                &GpuOptions {
+                    temp_limit: self.settings.gpu_temp_limit,
+                    verifier_max: Some(ROTATION_B_GPU_VERIFIERS),
+                    host_budget_bytes: self.gpu_budget,
+                },
+            );
+            if self.menu.attribution_checks {
+                launch.args.push(attribution_flag(Layer::Gpu).into());
+            }
+            launch.args.extend([
+                "--fault-events".into(),
+                dir.join("fault-events.jsonl").into(),
+            ]);
+            match self.spawn(index, Layer::Gpu, launch) {
+                Ok(gpu) => {
+                    running.push(gpu);
+                    self.wait_ready(&mut running, record);
+                }
+                Err(error) => record
+                    .layers
+                    .push(self.not_started(index, Layer::Gpu, error)),
+            }
+        }
+        if self.abort.is_none() && !INTERRUPTED.load(Ordering::SeqCst) {
+            let keep_off = running
+                .iter()
+                .find(|layer| layer.layer == Layer::Gpu)
+                .map(|layer| layer.child.id());
+            let left = end
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .max(20);
+            match self.launch_rotation(index, RotationKind::B, left, keep_off) {
+                Ok(rotation) => running.push(rotation),
+                Err(error) => record
+                    .layers
+                    .push(self.not_started(index, Layer::CpuRam, error)),
+            }
+        }
+        let left = end.saturating_duration_since(Instant::now()).as_secs();
+        self.supervise(running, left, record);
     }
 
     fn prefill(&mut self, index: usize, record: &mut PhaseRecord) -> Result<(), String> {
@@ -1436,6 +1543,12 @@ impl Session<'_> {
                 fault_sources::chain(&report, phase, gpu, ssd)
             }
         };
+        self.notes.extend(
+            findings
+                .notes
+                .iter()
+                .map(|(code, text)| (*code, format!("{text} ({phase})"))),
+        );
         let report_total: u64 = findings.failures.iter().map(|e| e.count).sum();
         if ended.live_attributed == 0 {
             // No live record: the report is the only source (as in step F0).
@@ -1601,6 +1714,12 @@ impl Session<'_> {
         {
             counts.add_cause(code);
         }
+        let mut noted: Vec<&str> = self.notes.iter().map(|(code, _)| *code).collect();
+        noted.sort_unstable();
+        noted.dedup();
+        for code in noted {
+            counts.add_marked("NOTE", code);
+        }
         let row = dit_orchestrator::fault_ledger::csv_row(&meta, &counts);
         match dit_orchestrator::fault_ledger::append_csv_row(&path, &row) {
             Ok(()) => format!("Fail summary row added to {}", path.display()),
@@ -1618,6 +1737,11 @@ impl Session<'_> {
                 self.causes
                     .iter()
                     .map(|(_, text)| format!("INVALID       {text} (test infrastructure)")),
+            )
+            .chain(
+                self.notes
+                    .iter()
+                    .map(|(_, text)| format!("NOTE          {text}")),
             )
             .collect()
     }

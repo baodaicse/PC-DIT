@@ -148,6 +148,8 @@ fn phase_description(phase: &str) -> &'static str {
         "RAM_VERIFY" => "cross-core RAM readback -> exact comparison",
         "ROUND_COMPLETE" => "exact round committed; next complete round starts",
         "FINALIZING" => "telemetry, safety gates and report finalization",
+        "CORE_ROTATION_A" => "core rotation A: one core at a time at peak boost, the rest idle",
+        "CORE_ROTATION_B" => "core rotation B: one core at a time beside the GPU test",
         _ => "deterministic CPU/RAM data integrity pipeline",
     }
 }

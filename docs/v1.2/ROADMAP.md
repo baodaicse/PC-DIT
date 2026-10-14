@@ -50,7 +50,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `done` (v1.2.007) |
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `done` (v1.2.010) |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `done` (v1.2.011) |
-| C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `planned` |
+| C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `done` (v1.2.012) |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -291,7 +291,7 @@ Full (30 phút) và các pha dài của combined tự lên tầng 2.
   CPU-RAM tầng 2 với phép chia đo được (12 RAM + 4 tính toán) PASS.
 - **Chưa kiểm:** AVX-512 (v4) và CPU hybrid trên máy thật; thời lượng mỗi burst trên E-core.
 
-### C6 — Xoay từng lõi (`planned`)
+### C6 — Xoay từng lõi (`done`, v1.2.012)
 
 **Lý do.** Xung cao nhất (ví dụ 6,0 GHz trên 14900K, 5,7 GHz trên 9950X) chỉ xuất hiện khi 1–2
 lõi hoạt động. Khi test toàn lõi, mỗi lõi chạy khoảng 5,0–5,5 GHz, còn dư biên ổn định, nên lõi bị
@@ -387,6 +387,53 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 - Thước đo hiệu quả sau khi triển khai: số FAIL chỉ xuất hiện ở pha xoay trong khi mọi pha khác
   PASS, đếm trên kết quả thực tế.
 
+**Đã làm (v1.2.012).**
+
+- **Bộ xoay** (`crates/dit-system/src/rotation.rs`, `CPU-DIT-CORE-ROTATION-v1`): P-core và lõi của
+  CPU không hybrid xoay từng lõi trên luồng chính, luồng SMT anh em để trống; E-core xoay theo cụm
+  dùng chung L2 (`cache/index2/shared_cpu_list`), cả cụm chạy cùng lúc. Thứ tự theo
+  `acpi_cppc/highest_perf` (lõi firmware xếp boost cao trước). Ngân sách chia đều; mỗi bước tối
+  thiểu A 10 s, B 20 s; thiếu ngân sách thì giữ các lõi xếp hạng cao, report ghi `not_rotated`.
+- **Kernel:** A chạy kernel nhẹ (số nguyên, rẽ nhánh, so với đáp án), để đạt boost cao nhất; B
+  chạy kernel nhẹ nửa đầu bước, kernel FMA của C3 nửa sau (dòng lớn). Mọi kết quả đều kiểm.
+- **Chạy trong `system-run`** (`--core-rotation a|b --core-rotation-seconds N`), trước khi cấp phát
+  RAM: RAM chưa tồn tại nên nghỉ đúng như yêu cầu. Thời gian xoay tính trong
+  `--minimum-duration-seconds`, phần RAM chạy phần còn lại. Report: mục `core_rotation` (system
+  schema 18), từng bước ghi lõi, loại lõi, hạng firmware, xung tối đa/trung bình/đỉnh, số lần kiểm.
+- **Combined:** pha xoay là lớp CPU-RAM với tham số khác (64 MiB, 2 worker, không tính toán), nên
+  khởi động, theo dõi, report và quy lỗi đi đúng đường của CPU-RAM. Không sửa code lớp GPU.
+  `schedule()` giữ nguyên; `add_core_rotation()` chèn pha: Deep `Baseline → A → Chain → chạy chồng
+  (28 phút) → B → nghỉ → đọc lại`, Soak mỗi chu kỳ `A → chạy chồng (40 phút) → B`, Bounded không
+  đổi. Không có GPU thì không có B, thời gian của B trả về pha chạy chồng.
+- **Pha B:** lớp GPU khởi động như pha nền, chỉ giới hạn `--async-workers-max 2`; khi GPU sẵn sàng,
+  pha xoay khởi động với `--core-rotation-keep-off-pid` (PID của lớp GPU): mỗi bước, mọi luồng của
+  cây tiến trình GPU được đặt affinity tránh lõi đang test và luồng anh em của nó; xong thì trả lại.
+- **Rủi ro của B đã đo trước:** dữ liệu thật trong `Result/` (80 lần chạy GPU): GPU cần tối đa
+  khoảng 1,1 lõi để kiểm kịp (RTX 5080, 4090: 0,8–1,1; RTX 5060 Ti: 0,5–1,0), nên 2 luồng kiểm là
+  dư. GTX 960 trên máy build: 2 luồng giữ GPU bận 95,04% (mặc định 95,02%), không giây nào bị khâu
+  kiểm kìm.
+- **Menu [1] Full:** A đầu phiên, 1/5 thời lượng (30 phút → 6 phút xoay, 24 phút RAM). Safe không
+  xoay. Menu [4] power-sweep không đổi.
+- **Ghi lỗi:** kết quả sai là FAIL ô CPU (`cpu:rotation_a`, `cpu:rotation_b`), ghi ngay vào
+  fault-events như các kernel tính toán; không cộng vào `failures_total` (con số đó dùng để quy lỗi
+  pattern về RAM). Bước dưới 95% xung tối đa là NOTE `no_boost`: `NOTE[no_boost]` trong
+  `fail-summary.csv`, dòng `NOTE` trên màn kết quả; không tính FAIL, không làm phiên INVALID
+  (`Findings.notes`, khác đường `causes` vốn ra INVALID).
+- **Công tắc tắt:** `dit_rotation=0` (tham số boot) hoặc `DIT_ROTATION=0`: lịch combined và menu
+  [1] trở lại y như trước C6.
+
+**Kiểm trên máy build (Ryzen 7 3700X, GTX 960):**
+
+| Kiểm | Kết quả |
+|---|---|
+| Xoay A, 40 s | 4 lõi xếp hạng cao nhất (CPPC 196, 196, 191, 186), 10 s mỗi lõi, khoảng 22 700 lần kiểm mỗi lõi, không sai; 4,20–4,26 GHz / tối đa 4,43; một lõi 94,8% → NOTE |
+| Xoay B, 40 s, cây tiến trình giả 3 luồng chạy liên tục | lõi 0 đang test: affinity của cây 1–7, 9–15; lõi 3: 0–2, 4–10, 12–15; xong trả lại 0–15; kernel nhẹ và FMA đều chạy, không sai |
+| Combined Deep thu nhỏ 5% (CPU-RAM + GTX 960) | mọi pha PASS, grade DEEP; xoay A 2 bước; xoay B dời 11 luồng của lớp GPU, GPU bận 94,4% (nền 94,6%, chạy chồng 70%); CSV `PASS` kèm `NOTE[no_boost]` |
+| `make test` | PASS (thêm test: nhận dạng bước trên 14900K giả lập, chia ngân sách, ngưỡng boost, lịch Deep/Soak/Bounded, công tắc tắt, quy lỗi và NOTE) |
+
+**Chưa kiểm:** CPU hybrid Intel thật (cụm E, xung 6 GHz của P-core), Ryzen nhiều CCD, image/ISO đầy
+đủ, và thước đo hiệu quả của roadmap: số FAIL chỉ xuất hiện ở pha xoay trên kết quả thực tế.
+
 ## Quyết định
 
 | Chủ đề | Quyết định | Trạng thái |
@@ -409,7 +456,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 3. C3 + C2: kernel nhiều chuỗi (C3 `done`, v1.2.007) và cách chia worker mới (C2 `done`, v1.2.008–009).
 4. C4: binary v3/v4 và cơ chế tự chọn (`done`, v1.2.010).
 5. C5: các kernel mới (`done`, v1.2.011).
-6. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.
+6. C6: xoay từng lõi (`done`, v1.2.012). B không cần sửa lớp GPU (đã đo).
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.

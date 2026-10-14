@@ -174,6 +174,44 @@ pub struct GpuOptions {
     pub host_budget_bytes: u64,
 }
 
+/// v1.2 C6: a CPU-RAM run that is the core rotation (`kind` `a` or `b`) for the whole phase,
+/// then one small RAM round (64 MiB, two workers, no compute oracle), so its report is an
+/// ordinary CPU-RAM report read the ordinary way. Rotation B keeps `keep_off_pid`'s process tree
+/// (the GPU test) off the core under test.
+pub fn cpu_rotation(
+    menu: &MenuArgs,
+    dir: &Path,
+    seconds: u64,
+    kind: &str,
+    keep_off_pid: Option<u32>,
+    reserve_mib: u64,
+) -> Launch {
+    let mut launch = cpu_ram(
+        menu,
+        dir,
+        seconds,
+        &CpuSplit::Fixed {
+            workers: 2,
+            oracle: 0,
+        },
+        &CpuMemory::Arena { mib: 64 },
+        reserve_mib,
+    );
+    launch.args.extend([
+        "--core-rotation".into(),
+        kind.into(),
+        "--core-rotation-seconds".into(),
+        seconds.max(1).to_string().into(),
+    ]);
+    if let Some(pid) = keep_off_pid {
+        launch.args.extend([
+            "--core-rotation-keep-off-pid".into(),
+            pid.to_string().into(),
+        ]);
+    }
+    launch
+}
+
 pub fn gpu(menu: &MenuArgs, dir: &Path, seconds: u64, options: &GpuOptions) -> Launch {
     let mut args = vec![
         OsString::from("run"),

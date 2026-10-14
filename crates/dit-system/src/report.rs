@@ -358,6 +358,9 @@ pub struct SystemRunReport {
     /// before: baseline).
     #[serde(default)]
     pub cpu_isa: Option<crate::isa::IsaEvidence>,
+    /// The core rotation run before the RAM rounds (v1.2.012 on; absent: none).
+    #[serde(default)]
+    pub core_rotation: Option<crate::rotation::CoreRotationEvidence>,
     pub window_coverage: WindowCoverageEvidence,
     pub rounds_requested: u32,
     pub rounds_completed: u32,

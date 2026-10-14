@@ -267,6 +267,9 @@ grub-script-check "$GRUB_CONFIG" 2>/dev/null || ! command -v grub-script-check >
 # CPU compute oracle: Full runs it on a quarter of the logical CPUs next to the RAM rounds, and
 # the CPU COMPUTE profile runs it on all but one, with idle/burst ramps.
 grep -Fq -- '--measure-split' "$RUNNER"
+# C6: Full starts with core rotation A (a fifth of the duration), dit_rotation=0 turns it off.
+grep -Fq -- '--core-rotation a --core-rotation-seconds "$ROTATION_SECONDS"' "$RUNNER"
+grep -Fq 'cmdline_value dit_rotation' "$RUNNER"
 # C4: the CPU kernels' v3 (AVX2+FMA) and v4 (AVX-512) builds sit next to the baseline dit-cli,
 # which picks one at start.
 grep -Fq 'ISA_VARIANTS=(v3 v4)' "$ROOT_DIR/tools/build_boot_image.sh"

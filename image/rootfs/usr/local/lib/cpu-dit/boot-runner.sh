@@ -358,6 +358,14 @@ case "$PROFILE" in
         PROFILE_DURATION="${CPU_DIT_MIN_DURATION_SECONDS:-$FULL_MINIMUM_DURATION_SECONDS}"
         [[ "$PROFILE_DURATION" =~ ^[0-9]+$ && "$PROFILE_DURATION" -ge 60 ]] || exit 3
         DEADLINE_SECONDS=$((PROFILE_DURATION + FULL_DEADLINE_MARGIN_SECONDS))
+        # v1.2 C6: core rotation A first, while the machine is cool: a fifth of the duration (6 of
+        # 30 minutes), one core at a time at peak boost. dit_rotation=0 / DIT_ROTATION=0 turns
+        # it off.
+        ROTATION_SECONDS=$((PROFILE_DURATION / 5))
+        if [[ "${DIT_ROTATION:-$(cmdline_value dit_rotation || true)}" != 0 \
+            && "$ROTATION_SECONDS" -ge 10 ]]; then
+            SYSTEM_ARGS+=(--core-rotation a --core-rotation-seconds "$ROTATION_SECONDS")
+        fi
         SYSTEM_ARGS+=(
             --workers 0
             --measure-split

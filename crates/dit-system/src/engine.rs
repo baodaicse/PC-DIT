@@ -34,6 +34,7 @@ use crate::{
         SystemRunReport, SystemSourceEvidence, WindowCoverageEvidence, WorkerCrashEvidence,
         WorkerEvidence,
     },
+    rotation::{CoreRotationEvidence, Rotation, RotationKind},
     safety::{AbortKind, RunControl, SafetyFaultInjection, SafetyMonitor, SafetyPolicy},
     split::{self, ProbeWork, WorkerSplitEvidence},
     window::{
@@ -178,6 +179,12 @@ pub struct SystemRunConfig {
     /// 1: the FMA, branch and AES kernels; 2: plus one tier-2 kernel per burst (C5,
     /// `compute_oracle::kernel_tier_for`).
     pub compute_kernel_tier: u8,
+    /// v1.2 C6: rotate the checked kernels one core at a time before the RAM rounds
+    /// (`rotation.rs`), for `core_rotation_seconds` of `minimum_duration_ms`.
+    pub core_rotation: Option<RotationKind>,
+    pub core_rotation_seconds: u64,
+    /// Kind B: the GPU test's process tree, kept off the core under test.
+    pub core_rotation_keep_off_pid: Option<u32>,
     pub compute_oracle_idle_ramp_enabled: bool,
     pub compute_oracle_idle_sleep_ms: u64,
     pub fault_injection_compute_oracle_worker: Option<usize>,
@@ -212,6 +219,17 @@ impl SystemRunConfig {
         if self.coherency_iterations_per_worker == 0 {
             return Err(SystemDitError::InvalidConfig(
                 "coherency iterations must be positive".to_owned(),
+            ));
+        }
+        if self.core_rotation.is_some() && self.core_rotation_seconds == 0 {
+            return Err(SystemDitError::InvalidConfig(
+                "a core rotation needs core_rotation_seconds".to_owned(),
+            ));
+        }
+        if self.core_rotation_keep_off_pid.is_some() && self.core_rotation != Some(RotationKind::B)
+        {
+            return Err(SystemDitError::InvalidConfig(
+                "only rotation B keeps a process off the core under test".to_owned(),
             ));
         }
         if !(1..=2).contains(&self.compute_kernel_tier) {
@@ -429,6 +447,30 @@ fn run_system_once(
         }
     }
 
+    // v1.2 C6: the core rotation, before any arena exists: nothing else runs (kind A) or only
+    // the GPU test does (kind B). Its time comes out of the RAM rounds' share of the duration.
+    let rotation_started = Instant::now();
+    let core_rotation = config
+        .core_rotation
+        .filter(|_| cpu_tests_completed && !control.should_stop())
+        .map(|kind| {
+            run_core_rotation(
+                config,
+                kind,
+                &inventory,
+                &control,
+                &seed_commitment,
+                &counters,
+                &faults,
+            )
+        });
+    let rotation_ms = if core_rotation.is_some() {
+        u64::try_from(rotation_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let ram_duration_ms = config.minimum_duration_ms.saturating_sub(rotation_ms);
+
     let allocation = plan_and_allocate(
         &inventory.memory,
         &inventory.numa_nodes,
@@ -579,7 +621,7 @@ fn run_system_once(
 
     loop {
         if rounds_completed >= config.rounds
-            && stress_started.elapsed().as_millis() >= u128::from(config.minimum_duration_ms)
+            && stress_started.elapsed().as_millis() >= u128::from(ram_duration_ms)
         {
             break;
         }
@@ -857,8 +899,7 @@ fn run_system_once(
         .sum();
     memory_evidence.coverage_target_met = memory_evidence.allocation_target_met
         && memory_evidence.exact_verified_unique_bytes == memory_evidence.requested_bytes;
-    let duration_target_met =
-        stress_started.elapsed().as_millis() >= u128::from(config.minimum_duration_ms);
+    let duration_target_met = stress_started.elapsed().as_millis() >= u128::from(ram_duration_ms);
     let minimum_rounds_met = rounds_completed >= config.rounds;
     let window_recipe_met = window_all_completed_rounds_met
         && window_plans_no_gaps
@@ -995,8 +1036,9 @@ fn run_system_once(
         // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains). v14: workers
         // placed by core kind (config.worker_placement; inventory threads' core_kind, smt_rank,
         // l3_id). v15: worker_split (the RAM/compute split, measured or fixed). v16: cpu_isa.
-        // v17: compute_oracle.kernel_tier, .tier2_kernels, .tier2_kernels_passed.
-        schema_version: 17,
+        // v17: compute_oracle.kernel_tier, .tier2_kernels, .tier2_kernels_passed. v18:
+        // core_rotation.
+        schema_version: 18,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
@@ -1022,6 +1064,7 @@ fn run_system_once(
         workers: worker_evidence,
         round_digests,
         worker_split: Some(worker_split),
+        core_rotation,
         cpu_isa: Some(crate::isa::IsaEvidence::current()),
         window_coverage: WindowCoverageEvidence {
             window_recipe_id: WINDOW_RECIPE_ID.to_owned(),
@@ -1939,6 +1982,94 @@ fn emit_progress(
     target_bytes: u64,
     counters: &RunCounters,
 ) {
+    emit_progress_with(
+        config,
+        seed_commitment,
+        phase,
+        round,
+        round_seed,
+        elapsed_ms,
+        target_bytes,
+        counters,
+        "",
+    );
+}
+
+/// The core rotation (v1.2 C6) with its progress lines (`phase=CORE_ROTATION_A`, the step, the
+/// threads, the clock now and at most); a wrong result goes to the live fault records at once.
+#[allow(clippy::too_many_arguments)]
+fn run_core_rotation(
+    config: &SystemRunConfig,
+    kind: RotationKind,
+    inventory: &SystemInventory,
+    control: &RunControl,
+    seed_commitment: &str,
+    counters: &RunCounters,
+    faults: &FaultWriter,
+) -> CoreRotationEvidence {
+    let started = Instant::now();
+    let phase = format!("CORE_ROTATION_{}", kind.as_str().to_ascii_uppercase());
+    emit_progress(config, seed_commitment, &phase, 0, None, 0, 0, counters);
+    let evidence = Rotation {
+        kind,
+        budget_seconds: config.core_rotation_seconds,
+        seed: config.seed,
+        keep_off_pid: config.core_rotation_keep_off_pid,
+        inventory: &inventory.cpu,
+        control,
+    }
+    .run(&mut |step| {
+        let mhz = |khz: Option<u64>| khz.map_or_else(|| "N/A".to_owned(), |khz| (khz / 1000).to_string());
+        let cpus: Vec<String> = step.cpus.iter().map(ToString::to_string).collect();
+        emit_progress_with(
+            config,
+            seed_commitment,
+            &phase,
+            0,
+            None,
+            started.elapsed().as_millis(),
+            0,
+            counters,
+            &format!(
+                " rotation_step={}/{} rotation_cpus={} rotation_mhz={} rotation_max_mhz={} rotation_wrong={}",
+                step.step,
+                step.steps,
+                cpus.join(","),
+                mhz(step.current_khz),
+                mhz(step.max_khz),
+                step.mismatches
+            ),
+        );
+    });
+    if evidence.mismatches > 0 {
+        faults.write(&FaultRecord::new(
+            if kind == RotationKind::A {
+                "cpu:rotation_a"
+            } else {
+                "cpu:rotation_b"
+            },
+            evidence.mismatches,
+            evidence
+                .first_mismatch
+                .clone()
+                .unwrap_or_else(|| "core rotation results differed".to_owned()),
+        ));
+    }
+    evidence
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit progress fields keep the live UI event auditable.
+fn emit_progress_with(
+    config: &SystemRunConfig,
+    seed_commitment: &str,
+    phase: &str,
+    round: u32,
+    round_seed: Option<u64>,
+    elapsed_ms: u128,
+    target_bytes: u64,
+    counters: &RunCounters,
+    extra: &str,
+) {
     if !config.emit_progress && config.progress_report_path.is_none() {
         return;
     }
@@ -1952,7 +2083,7 @@ fn emit_progress(
         let round_seed_text =
             round_seed.map_or_else(|| "N/A".to_owned(), |seed| format!("0x{seed:016x}"));
         eprintln!(
-            "CPU_DIT_PROGRESS phase={phase} round={round} minimum_rounds={} elapsed_ms={elapsed_ms} duration_target_ms={} target_bytes={target_bytes} calculations_completed={calculations_completed} failures_total={failures_total} session_seed=0x{:016x} round_seed={round_seed_text} seed_source={} seed_commitment={seed_commitment} window_recipe={WINDOW_RECIPE_ID} pattern_recipe={PATTERN_RECIPE_ID} active_window=MIXED_PARALLEL active_pattern=MULTI_FAMILY temperature_limit={temperature_limit} cpu_isa={} cpu_isa_selection={}",
+            "CPU_DIT_PROGRESS phase={phase} round={round} minimum_rounds={} elapsed_ms={elapsed_ms} duration_target_ms={} target_bytes={target_bytes} calculations_completed={calculations_completed} failures_total={failures_total} session_seed=0x{:016x} round_seed={round_seed_text} seed_source={} seed_commitment={seed_commitment} window_recipe={WINDOW_RECIPE_ID} pattern_recipe={PATTERN_RECIPE_ID} active_window=MIXED_PARALLEL active_pattern=MULTI_FAMILY temperature_limit={temperature_limit} cpu_isa={} cpu_isa_selection={}{extra}",
             config.rounds,
             config.minimum_duration_ms,
             config.seed,
@@ -2125,6 +2256,9 @@ mod tests {
             measure_split: false,
             compute_oracle_dense_fma_iterations: 1,
             compute_kernel_tier: 1,
+            core_rotation: None,
+            core_rotation_seconds: 0,
+            core_rotation_keep_off_pid: None,
             compute_oracle_idle_ramp_enabled: false,
             compute_oracle_idle_sleep_ms: 0,
             fault_injection_compute_oracle_worker: None,

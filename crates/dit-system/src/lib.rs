@@ -16,6 +16,7 @@ pub mod power_platform;
 pub mod pressure;
 pub mod procs;
 mod report;
+mod rotation;
 mod safety;
 mod soft_crypto;
 mod split;
@@ -45,6 +46,7 @@ pub use report::{
     SystemRunReport, SystemSourceEvidence, WindowCoverageEvidence, WorkerCrashEvidence,
     WorkerEvidence,
 };
+pub use rotation::{CoreRotationEvidence, ROTATION_ID, RotationKind, RotationStepEvidence};
 pub use safety::{
     AbortEvent, AbortKind, EdacPolicy, SafetyEvidence, SafetyFaultInjection, SafetyPolicy,
 };

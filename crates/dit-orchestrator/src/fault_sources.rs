@@ -16,6 +16,10 @@ pub struct Findings {
     pub hardware: Vec<HardwareEvent>,
     /// Each device the report measured throttling of: `None` without throttle counters.
     pub throttle: Vec<(Component, Option<Throttle>)>,
+    /// Observations that count no failure and never make a session INVALID: `(code, text)`,
+    /// `NOTE[code]` in the CSV row (`no_boost`: a core rotation step under 95% of the core's
+    /// maximum clock).
+    pub notes: Vec<(&'static str, String)>,
 }
 
 impl Findings {
@@ -64,6 +68,7 @@ const CPU_RAM: &str = "cpu-ram";
 pub fn cpu_ram(report: &Value, phase: &str) -> Findings {
     let mut found = Findings::default();
     let counted = cpu_checks(report, &mut found);
+    core_rotation(report, &mut found);
     ram_pattern(report, &mut found, counted);
     cpu_ram_platform(report, &mut found);
     found.in_phase(phase)
@@ -167,6 +172,51 @@ fn cpu_checks(report: &Value, found: &mut Findings) -> u64 {
         }
     }
     counted_in_total
+}
+
+/// The core rotation (v1.2 C6): a wrong result is a CPU failure, whichever kind (A alone, B
+/// beside the GPU test); a step that stayed under 95% of its core's maximum clock is a note.
+/// Its mismatches are not in `failures_total` (that counts RAM patterns and the CPU checks).
+fn core_rotation(report: &Value, found: &mut Findings) {
+    let Some(rotation) = report
+        .pointer("/core_rotation")
+        .filter(|value| !value.is_null())
+    else {
+        return;
+    };
+    let kind = str_at(rotation, "/kind");
+    let label = kind.to_ascii_uppercase();
+    let mismatches = u64_at(rotation, "/mismatches");
+    if mismatches > 0 {
+        found.fail(FaultEvent::new(
+            CPU_RAM,
+            if kind == "b" {
+                "cpu:rotation_b"
+            } else {
+                "cpu:rotation_a"
+            },
+            mismatches,
+            Attribution::Confirmed(Component::Cpu),
+            "cpu-ram/core_rotation",
+            format!(
+                "core rotation {label}: {}",
+                str_at(rotation, "/first_mismatch")
+            ),
+        ));
+    }
+    let below = u64_at(rotation, "/steps_below_boost");
+    if below > 0 {
+        let steps = rotation
+            .pointer("/steps")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        found.notes.push((
+            "no_boost",
+            format!(
+                "core rotation {label}: {below} of {steps} cores stayed under 95% of their maximum clock"
+            ),
+        ));
+    }
 }
 
 /// RAM pattern mismatches, counted as failing verify rounds.
@@ -1522,6 +1572,40 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(found.failures[0].cell, "SSD1|SSD1-path");
         assert!(ssd_kind("write_budget_exceeded", 1).is_none());
+    }
+
+    #[test]
+    fn core_rotation_failures_are_cpu_failures_and_missed_boost_only_a_note() {
+        let report = serde_json::json!({
+            "core_rotation": {"kind": "b", "mismatches": 3, "steps_below_boost": 2,
+                "first_mismatch": "step 4 (CPU [6], Performance): 3 wrong results",
+                "steps": [{}, {}, {}, {}, {}, {}]},
+            "failures_total": 0
+        });
+        let found = cpu_ram(&report, "CORE ROTATION B");
+        assert_eq!(found.failures.len(), 1);
+        assert_eq!(found.failures[0].source, "cpu:rotation_b");
+        assert_eq!(found.failures[0].count, 3);
+        assert_eq!(found.notes.len(), 1);
+        assert_eq!(found.notes[0].0, "no_boost");
+        assert!(
+            found.notes[0].1.contains("2 of 6 cores"),
+            "{}",
+            found.notes[0].1
+        );
+        let mut ledger = Ledger::default();
+        ledger.add_all(found.failures);
+        assert_eq!(ledger.cell(Component::Cpu).confirmed, 3);
+        assert_eq!(ledger.cell(Component::Ram).confirmed, 0);
+
+        // Below boost alone: a note, no failure.
+        let quiet = serde_json::json!({
+            "core_rotation": {"kind": "a", "mismatches": 0, "steps_below_boost": 1, "steps": [{}]},
+            "failures_total": 0
+        });
+        let found = cpu_ram(&quiet, "");
+        assert!(found.failures.is_empty());
+        assert_eq!(found.notes.len(), 1);
     }
 
     #[test]

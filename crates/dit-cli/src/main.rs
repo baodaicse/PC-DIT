@@ -12,9 +12,10 @@ use dit_core::{
 };
 use dit_system::{
     ComputeOracleConfig, ComputeOracleReport, ComputeOracleStatus, EdacPolicy,
-    FMA_ITERATIONS_PER_BURST, LockPolicy, MemoryTarget, SafetyFaultInjection, SafetyPolicy,
-    SeedSource, SensorReport, SystemRunConfig, SystemRunReport, collect_sensor_report,
-    format_gpu_summary, isa, kernel_tier_for, run_compute_oracle, run_system,
+    FMA_ITERATIONS_PER_BURST, LockPolicy, MemoryTarget, RotationKind, SafetyFaultInjection,
+    SafetyPolicy, SeedSource, SensorReport, SystemRunConfig, SystemRunReport,
+    collect_sensor_report, format_gpu_summary, isa, kernel_tier_for, run_compute_oracle,
+    run_system,
 };
 
 /// v1.2 (C4): run the build of this program made for the widest instructions this CPU has
@@ -83,6 +84,15 @@ fn isa_binary(exe: &Path, level: isa::IsaLevel) -> PathBuf {
     exe.with_file_name(format!("{base}{}", level.binary_suffix().unwrap_or("")))
 }
 
+/// The core rotation's kind (v1.2 C6).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CoreRotationArg {
+    /// Alone: the light kernel at peak boost.
+    A,
+    /// Beside the GPU test: the light kernel, then the FMA kernel.
+    B,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "dit-cli", version, about = "CPU-DIT-01 reference runner")]
 struct Cli {
@@ -112,7 +122,7 @@ enum Command {
     /// Run the deterministic reference CPU-RAM pipeline.
     Run(RunArgs),
     /// Run adaptive mmap RAM coverage and multi-core CPU checks.
-    SystemRun(SystemRunArgs),
+    SystemRun(Box<SystemRunArgs>),
     /// Run the standalone sustained compute-oracle (ADR-0004, Phase 1).
     ComputeOracleRun(ComputeOracleArgs),
     /// Show CPU, RAM, temperature, power and Linux driver evidence.
@@ -481,6 +491,20 @@ struct SystemRunArgs {
     #[arg(long, conflicts_with = "compute_oracle_workers")]
     measure_split: bool,
 
+    /// Before the RAM rounds, rotate checked kernels one core at a time, the rest of the CPU
+    /// idle: `a` alone (peak boost), `b` beside the GPU test. Its time is part of
+    /// --minimum-duration-seconds.
+    #[arg(long, value_enum, requires = "core_rotation_seconds")]
+    core_rotation: Option<CoreRotationArg>,
+
+    /// Seconds of the core rotation.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    core_rotation_seconds: Option<u64>,
+
+    /// Rotation `b`: the GPU test's process (its whole tree) is kept off the core under test.
+    #[arg(long, requires = "core_rotation")]
+    core_rotation_keep_off_pid: Option<u32>,
+
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2_000_000_000))]
     compute_oracle_dense_fma_iterations: Option<u32>,
 
@@ -798,6 +822,12 @@ fn system_run(args: &SystemRunArgs) -> u8 {
         diagnostic_rerun: !args.no_diagnostic_rerun,
         compute_oracle_workers: args.compute_oracle_workers,
         measure_split: args.measure_split,
+        core_rotation: args.core_rotation.map(|kind| match kind {
+            CoreRotationArg::A => RotationKind::A,
+            CoreRotationArg::B => RotationKind::B,
+        }),
+        core_rotation_seconds: args.core_rotation_seconds.unwrap_or(0),
+        core_rotation_keep_off_pid: args.core_rotation_keep_off_pid,
         compute_oracle_dense_fma_iterations: args
             .compute_oracle_dense_fma_iterations
             .unwrap_or(FMA_ITERATIONS_PER_BURST),

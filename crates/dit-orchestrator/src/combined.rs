@@ -88,6 +88,10 @@ pub enum PhaseKind {
     Rest,
     /// The chain re-reads its records after the rest (SSD retention).
     Retention,
+    /// v1.2 C6: one core at a time at peak boost, everything else idle.
+    RotationA,
+    /// v1.2 C6: one core at a time while the GPU test runs flat out.
+    RotationB,
 }
 
 impl PhaseKind {
@@ -100,6 +104,8 @@ impl PhaseKind {
             Self::Overlap => "OVERLAP".into(),
             Self::Rest => "REST".into(),
             Self::Retention => "RETENTION READ".into(),
+            Self::RotationA => "CORE ROTATION A".into(),
+            Self::RotationB => "CORE ROTATION B".into(),
         }
     }
 
@@ -111,6 +117,8 @@ impl PhaseKind {
             Self::Baseline(layer) => vec![layer],
             Self::Overlap => available.layers(),
             Self::Rest => Vec::new(),
+            Self::RotationB if available.gpu => vec![Layer::Gpu, Layer::CpuRam],
+            Self::RotationA | Self::RotationB => vec![Layer::CpuRam],
         }
     }
 }
@@ -211,6 +219,77 @@ pub fn schedule(level: Level, available: Available, soak_hours: u64) -> Vec<Phas
         }
     }
     phases
+}
+
+/// Core rotation budget of a Deep session (v1.2 C6): about 20% of the hour, taken from the
+/// overlap (40 -> 28 minutes). A gets a third, B two thirds (B runs two kernels).
+const DEEP_ROTATION_A_SECONDS: u64 = 240;
+const DEEP_ROTATION_B_SECONDS: u64 = 480;
+/// Per Soak cycle (about 10 minutes of its 50-minute overlap).
+const SOAK_ROTATION_A_SECONDS: u64 = 200;
+const SOAK_ROTATION_B_SECONDS: u64 = 400;
+
+/// Adds the core rotation (v1.2 C6) to a [`schedule`]: rotation A early, while the machine is
+/// cool (Deep: after the baselines, before the chain; Soak: before every overlap), rotation B
+/// right after the overlap, while it is hot. Their time comes out of the overlap, so the session
+/// keeps its length. Without a GPU there is no B, its time stays with the overlap. Bounded is
+/// left alone (its overlap is only 5 minutes).
+#[must_use]
+pub fn add_core_rotation(level: Level, available: Available, phases: Vec<Phase>) -> Vec<Phase> {
+    let (a, b) = match level {
+        Level::Bounded => return phases,
+        Level::Deep => (DEEP_ROTATION_A_SECONDS, DEEP_ROTATION_B_SECONDS),
+        Level::Soak => (SOAK_ROTATION_A_SECONDS, SOAK_ROTATION_B_SECONDS),
+    };
+    let b = if available.gpu { b } else { 0 };
+    let first_after_baselines = phases
+        .iter()
+        .position(|phase| !matches!(phase.kind, PhaseKind::Prefill | PhaseKind::Baseline(_)))
+        .unwrap_or(phases.len());
+    let mut out = Vec::with_capacity(phases.len() + 8);
+    for (index, phase) in phases.into_iter().enumerate() {
+        let rotation_a = Phase {
+            kind: PhaseKind::RotationA,
+            seconds: a,
+        };
+        if level == Level::Deep && index == first_after_baselines {
+            out.push(rotation_a);
+        }
+        if phase.kind == PhaseKind::Overlap {
+            if level == Level::Soak {
+                out.push(rotation_a);
+            }
+            out.push(Phase {
+                kind: PhaseKind::Overlap,
+                seconds: phase.seconds.saturating_sub(a + b),
+            });
+            if b > 0 {
+                out.push(Phase {
+                    kind: PhaseKind::RotationB,
+                    seconds: b,
+                });
+            }
+        } else {
+            out.push(phase);
+        }
+    }
+    out
+}
+
+/// Whether the core rotation runs: on unless `DIT_ROTATION=0` or `dit_rotation=0` on the kernel
+/// command line (the variable wins), a way back to the schedule before v1.2 on a machine where
+/// the rotation misbehaves.
+#[must_use]
+pub fn core_rotation_enabled(env_value: Option<&str>, cmdline: &str) -> bool {
+    let value = env_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cmdline
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix("dit_rotation="))
+        });
+    value != Some("0")
 }
 
 /// Planned seconds of the whole schedule (the prefill counted at `prefill_estimate`).
@@ -490,6 +569,76 @@ mod tests {
         assert_eq!(phases.len(), 2);
         assert_eq!(PhaseKind::Overlap.layers(&cpu_only), vec![Layer::CpuRam]);
         assert_eq!(PhaseKind::Retention.layers(&ALL), vec![Layer::Chain]);
+    }
+
+    #[test]
+    fn core_rotation_can_be_turned_off() {
+        assert!(core_rotation_enabled(None, "boot=live quiet"));
+        assert!(!core_rotation_enabled(None, "boot=live dit_rotation=0"));
+        assert!(core_rotation_enabled(None, "dit_rotation=1"));
+        assert!(!core_rotation_enabled(Some("0"), "dit_rotation=1"));
+        assert!(core_rotation_enabled(Some("1"), "dit_rotation=0"));
+    }
+
+    #[test]
+    fn core_rotation_comes_out_of_the_overlap_and_keeps_the_length() {
+        use PhaseKind::{
+            Baseline, ChainAlone, Overlap, Prefill, Rest, Retention, RotationA, RotationB,
+        };
+        let deep = schedule(Level::Deep, ALL, 0);
+        let rotated = add_core_rotation(Level::Deep, ALL, deep.clone());
+        let kinds: Vec<PhaseKind> = rotated.iter().map(|p| p.kind).collect();
+        // Baseline -> [A] -> Chain -> Overlap -> [B] -> Rest -> Retention.
+        assert_eq!(
+            kinds,
+            vec![
+                Prefill,
+                Baseline(Layer::CpuRam),
+                Baseline(Layer::Gpu),
+                Baseline(Layer::Ssd),
+                RotationA,
+                ChainAlone,
+                Overlap,
+                RotationB,
+                Rest,
+                Retention,
+            ]
+        );
+        assert_eq!(planned_seconds(&rotated, 90), planned_seconds(&deep, 90));
+        let overlap = rotated.iter().find(|p| p.kind == Overlap).unwrap();
+        assert_eq!(overlap.seconds, 2400 - 720, "40 -> 28 minutes");
+
+        // Soak: one A+B per cycle, every cycle still 60 minutes.
+        let soak = schedule(Level::Soak, ALL, 4);
+        let rotated = add_core_rotation(Level::Soak, ALL, soak.clone());
+        assert_eq!(planned_seconds(&rotated, 90), planned_seconds(&soak, 90));
+        let count = |kind| rotated.iter().filter(|p| p.kind == kind).count();
+        assert_eq!(
+            (count(RotationA), count(RotationB), count(Overlap)),
+            (3, 3, 3)
+        );
+        for window in rotated.windows(3) {
+            if window[1].kind == Overlap {
+                assert_eq!((window[0].kind, window[2].kind), (RotationA, RotationB));
+                assert_eq!(window[1].seconds, 3000 - 600);
+            }
+        }
+
+        // Bounded: unchanged. Without a GPU: no B, the overlap keeps its share.
+        let bounded = schedule(Level::Bounded, ALL, 0);
+        assert_eq!(
+            add_core_rotation(Level::Bounded, ALL, bounded.clone()),
+            bounded
+        );
+        let no_gpu = Available { gpu: false, ..ALL };
+        let rotated = add_core_rotation(Level::Deep, no_gpu, schedule(Level::Deep, no_gpu, 0));
+        assert_eq!(rotated.iter().filter(|p| p.kind == RotationB).count(), 0);
+        assert_eq!(
+            rotated.iter().find(|p| p.kind == Overlap).unwrap().seconds,
+            2400 - 240
+        );
+        assert_eq!(RotationB.layers(&ALL), vec![Layer::Gpu, Layer::CpuRam]);
+        assert_eq!(RotationB.layers(&no_gpu), vec![Layer::CpuRam]);
     }
 
     #[test]
