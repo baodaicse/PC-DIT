@@ -267,6 +267,11 @@ grub-script-check "$GRUB_CONFIG" 2>/dev/null || ! command -v grub-script-check >
 # CPU compute oracle: Full runs it on a quarter of the logical CPUs next to the RAM rounds, and
 # the CPU COMPUTE profile runs it on all but one, with idle/burst ramps.
 grep -Fq -- '--measure-split' "$RUNNER"
+# C4: the CPU kernels' v3 (AVX2+FMA) and v4 (AVX-512) builds sit next to the baseline dit-cli,
+# which picks one at start.
+grep -Fq 'ISA_VARIANTS=(v3 v4)' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'RUSTFLAGS="-C target-cpu=x86-64-$level"' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq '"$ROOTFS/opt/cpu-dit-01/dit-cli-$level"' "$ROOT_DIR/tools/build_boot_image.sh"
 grep -Fq -- '--compute-oracle-workers "$((LOGICAL_CPUS - 1))"' "$RUNNER"
 grep -Fq -- '--compute-oracle-idle-ramp' "$RUNNER"
 grep -Fq "run_profile compute 'CPU COMPUTE'" "$UI"

@@ -59,7 +59,7 @@ wait_claim() {
 
 leftovers() {
     pkill -KILL -f 'dit-watchdog supervise' 2>/dev/null
-    pkill -KILL -f 'dit-cli system-run' 2>/dev/null
+    pkill -KILL -f 'dit-cli(-v[34])? system-run' 2>/dev/null
     sleep 2
 }
 

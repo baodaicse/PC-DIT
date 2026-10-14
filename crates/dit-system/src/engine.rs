@@ -974,8 +974,8 @@ fn run_system_once(
         // (round_digests[].content_hashed, config.content_hash_every_rounds). v13: compute
         // oracle on the multi-chain kernel (compute_oracle.fma_kernel, .fma_chains). v14: workers
         // placed by core kind (config.worker_placement; inventory threads' core_kind, smt_rank,
-        // l3_id). v15: worker_split (the RAM/compute split, measured or fixed).
-        schema_version: 15,
+        // l3_id). v15: worker_split (the RAM/compute split, measured or fixed). v16: cpu_isa.
+        schema_version: 16,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability,
         power_platform,
@@ -1001,6 +1001,7 @@ fn run_system_once(
         workers: worker_evidence,
         round_digests,
         worker_split: Some(worker_split),
+        cpu_isa: Some(crate::isa::IsaEvidence::current()),
         window_coverage: WindowCoverageEvidence {
             window_recipe_id: WINDOW_RECIPE_ID.to_owned(),
             pattern_recipe_id: PATTERN_RECIPE_ID.to_owned(),
@@ -1930,11 +1931,13 @@ fn emit_progress(
         let round_seed_text =
             round_seed.map_or_else(|| "N/A".to_owned(), |seed| format!("0x{seed:016x}"));
         eprintln!(
-            "CPU_DIT_PROGRESS phase={phase} round={round} minimum_rounds={} elapsed_ms={elapsed_ms} duration_target_ms={} target_bytes={target_bytes} calculations_completed={calculations_completed} failures_total={failures_total} session_seed=0x{:016x} round_seed={round_seed_text} seed_source={} seed_commitment={seed_commitment} window_recipe={WINDOW_RECIPE_ID} pattern_recipe={PATTERN_RECIPE_ID} active_window=MIXED_PARALLEL active_pattern=MULTI_FAMILY temperature_limit={temperature_limit}",
+            "CPU_DIT_PROGRESS phase={phase} round={round} minimum_rounds={} elapsed_ms={elapsed_ms} duration_target_ms={} target_bytes={target_bytes} calculations_completed={calculations_completed} failures_total={failures_total} session_seed=0x{:016x} round_seed={round_seed_text} seed_source={} seed_commitment={seed_commitment} window_recipe={WINDOW_RECIPE_ID} pattern_recipe={PATTERN_RECIPE_ID} active_window=MIXED_PARALLEL active_pattern=MULTI_FAMILY temperature_limit={temperature_limit} cpu_isa={} cpu_isa_selection={}",
             config.rounds,
             config.minimum_duration_ms,
             config.seed,
             config.seed_source.as_str(),
+            crate::isa::compiled_level(),
+            crate::isa::IsaEvidence::current().selection.as_str(),
         );
     }
     if let Some(path) = &config.progress_report_path {

@@ -392,6 +392,9 @@ configure_rootfs() {
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-driver-install.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/nvidia-driver-install.sh"
     sudo install -D -m 0755 "$ROOT_DIR/target/release/dit-cli" "$ROOTFS/opt/cpu-dit-01/dit-cli"
+    for level in "${ISA_VARIANTS[@]}"; do
+        sudo install -D -m 0755 "$(isa_variant_binary "$level")" "$ROOTFS/opt/cpu-dit-01/dit-cli-$level"
+    done
     sudo install -D -m 0644 "$ROOT_DIR/vectors/source-v1.dat" \
         "$ROOTFS/opt/cpu-dit-01/vectors/source-v1.dat"
     sudo install -D -m 0644 "$ROOT_DIR/vectors/source-v1.manifest.json" \
@@ -427,6 +430,9 @@ configure_rootfs() {
         echo "ubuntu_release=noble"
         echo "architecture=amd64"
         echo "dit_binary_sha256=$(sha256sum "$ROOT_DIR/target/release/dit-cli" | awk '{print $1}')"
+        for level in "${ISA_VARIANTS[@]}"; do
+            echo "dit_binary_${level}_sha256=$(sha256sum "$(isa_variant_binary "$level")" | awk '{print $1}')"
+        done
         echo "extension_manifest_sha256=$EXTENSION_MANIFEST_SHA"
         echo "gpu_driver_profile=$GPU_DRIVER_PROFILE"
         echo "nvidia_driver_package=${NVIDIA_DRIVER_PACKAGE:-none}"
@@ -597,6 +603,9 @@ EOF
 release_payload_fingerprint() {
     {
         sha256sum "$ROOT_DIR/target/release/dit-cli"
+        for level in "${ISA_VARIANTS[@]}"; do
+            sha256sum "$(isa_variant_binary "$level")"
+        done
         printf 'kernel %s\nversion %s\n' "$KERNEL_ABI" "$DIT_VERSION"
         find "$ROOT_DIR/image" "$ROOT_DIR/vectors" -type f -print0 \
             | sort -z \
@@ -609,6 +618,28 @@ release_payload_fingerprint() {
     } | sha256sum | awk '{print substr($1,1,12)}'
 }
 
+# The CPU kernels (dit-cli) built again for x86-64-v3 (AVX2+FMA) and x86-64-v4 (AVX-512), each in
+# its own target directory; the baseline dit-cli runs the widest one the CPU has (v1.2 C4,
+# crates/dit-system/src/isa.rs). The explicit --target keeps RUSTFLAGS off the build scripts and
+# proc macros, which run on this build machine: built for AVX-512, they kill rustc with SIGILL on
+# a machine without it.
+ISA_VARIANTS=(v3 v4)
+ISA_TARGET=x86_64-unknown-linux-gnu
+isa_variant_binary() {
+    printf '%s\n' "$ROOT_DIR/target/isa-$1/$ISA_TARGET/release/dit-cli"
+}
+
+build_isa_variants() {
+    local level
+    for level in "${ISA_VARIANTS[@]}"; do
+        log "Building dit-cli for x86-64-$level"
+        CARGO_TARGET_DIR="$ROOT_DIR/target/isa-$level" RUSTFLAGS="-C target-cpu=x86-64-$level" \
+            cargo build --release -p dit-cli --target "$ISA_TARGET" \
+            --manifest-path "$ROOT_DIR/Cargo.toml"
+        [[ -x "$(isa_variant_binary "$level")" ]] || die "dit-cli for x86-64-$level was not built"
+    done
+}
+
 main() {
     require_project
     install_host_dependencies
@@ -618,6 +649,7 @@ main() {
     export DIT_VERSION
     log "Building unified DIT-01 v$DIT_VERSION workspace (CPU-RAM, CPU-SSD/NVMe, GPU-VRAM, control center)"
     cargo build --release --workspace --manifest-path "$ROOT_DIR/Cargo.toml"
+    build_isa_variants
     "$ROOT_DIR/tools/build_image_extension.sh"
     bootstrap_rootfs
     ensure_diagnostic_packages

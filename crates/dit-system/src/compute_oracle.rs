@@ -369,6 +369,9 @@ pub struct ComputeOracleReport {
     pub seed_hex: String,
     pub workers_used: usize,
     pub worker_cpu_ids: Vec<usize>,
+    /// The instruction-set level the kernels ran at (v1.2.010 on; absent before: baseline).
+    #[serde(default)]
+    pub cpu_isa: Option<crate::isa::IsaEvidence>,
     pub elapsed_ms: u128,
     /// The FMA kernel the bursts ran (`CPU-DIT-FMA-CHAINS-v1` since v1.2, checked bit for bit);
     /// empty in older reports: one chain, checked within a tolerance.
@@ -712,8 +715,8 @@ pub fn run_compute_oracle(
     Ok(ComputeOracleReport {
         // v3: records the resolved dense_fma_iterations_per_burst (DIT-
         // DURATION-COMPLEXITY-RAMP-v1) alongside the v2 per-burst mismatch fix.
-        // v5: dit_version. v6: multi-chain FMA kernel (fma_kernel, fma_chains).
-        schema_version: 6,
+        // v5: dit_version. v6: multi-chain FMA kernel (fma_kernel, fma_chains). v7: cpu_isa.
+        schema_version: 7,
         dit_version: dit_contracts::DIT_VERSION.to_owned(),
         availability: crate::availability::AvailabilityEvidence::new(
             if coverage_met {
@@ -731,6 +734,7 @@ pub fn run_compute_oracle(
         seed_hex: format!("0x{:016x}", config.seed),
         workers_used: worker_cpus.len(),
         worker_cpu_ids: worker_cpus,
+        cpu_isa: Some(crate::isa::IsaEvidence::current()),
         elapsed_ms: started.elapsed().as_millis(),
         fma_kernel: FMA_KERNEL_ID.to_owned(),
         fma_chains: FMA_CHAINS,

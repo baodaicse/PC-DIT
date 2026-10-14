@@ -14,8 +14,74 @@ use dit_system::{
     ComputeOracleConfig, ComputeOracleReport, ComputeOracleStatus, EdacPolicy,
     FMA_ITERATIONS_PER_BURST, LockPolicy, MemoryTarget, SafetyFaultInjection, SafetyPolicy,
     SeedSource, SensorReport, SystemRunConfig, SystemRunReport, collect_sensor_report,
-    format_gpu_summary, run_compute_oracle, run_system,
+    format_gpu_summary, isa, run_compute_oracle, run_system,
 };
+
+/// v1.2 (C4): run the build of this program made for the widest instructions this CPU has
+/// (`dit-cli-v3`, `dit-cli-v4` next to this one; `isa::choose`), or the one `DIT_ISA` /
+/// `dit_isa=` forces. Replaces this process with it (same PID, same arguments); returns only when
+/// this binary is the one to run (`None`) or the choice is impossible (an exit code).
+fn choose_isa() -> Option<ExitCode> {
+    if let Ok(value) = std::env::var(isa::ISA_CHOSEN_ENV) {
+        // The baseline binary chose this one.
+        isa::record_selection(isa::parse_chosen(&value).unwrap_or(isa::IsaSelection::Direct));
+        return None;
+    }
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let request = match isa::request(std::env::var(isa::ISA_ENV).ok().as_deref(), &cmdline) {
+        Ok(request) => request,
+        Err(reason) => {
+            eprintln!("INVALID: {reason}");
+            return Some(ExitCode::from(3));
+        }
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return None;
+    };
+    let installed: Vec<isa::IsaLevel> = isa::IsaLevel::ALL
+        .into_iter()
+        .filter(|&level| level == isa::compiled_level() || isa_binary(&exe, level).is_file())
+        .collect();
+    let (level, selection) = match isa::choose(request, isa::cpu_level(), &installed) {
+        Ok(choice) => choice,
+        Err(reason) => {
+            eprintln!("INVALID: {reason}");
+            return Some(ExitCode::from(3));
+        }
+    };
+    if level == isa::compiled_level() {
+        isa::record_selection(selection);
+        return None;
+    }
+    let path = isa_binary(&exe, level);
+    let error = std::os::unix::process::CommandExt::exec(
+        std::process::Command::new(&path)
+            .args(std::env::args_os().skip(1))
+            .env(isa::ISA_CHOSEN_ENV, isa::chosen_value(level, selection)),
+    );
+    // Only reached when the exec failed.
+    eprintln!("dit-cli: could not start {}: {error}", path.display());
+    if selection == isa::IsaSelection::Manual {
+        return Some(ExitCode::from(3));
+    }
+    isa::record_selection(isa::IsaSelection::Auto);
+    None
+}
+
+/// `level`'s build of the running program: `dit-cli-v3` next to `dit-cli` (any level suffix of
+/// the running file's name is replaced).
+fn isa_binary(exe: &Path, level: isa::IsaLevel) -> PathBuf {
+    let name = exe
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = isa::IsaLevel::ALL
+        .into_iter()
+        .filter_map(isa::IsaLevel::binary_suffix)
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(&name);
+    exe.with_file_name(format!("{base}{}", level.binary_suffix().unwrap_or("")))
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "dit-cli", version, about = "CPU-DIT-01 reference runner")]
@@ -437,6 +503,9 @@ struct SystemRunArgs {
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = choose_isa() {
+        return code;
+    }
     let cli = Cli::parse();
     let code = match cli.command {
         Command::PowerPlatformRun(args) => power_platform_run(&args),

@@ -231,6 +231,7 @@ struct Frame<'a> {
     throttle: &'a ThrottleLive,
 }
 
+#[allow(clippy::too_many_lines)] // One screen's rows, kept in the order they are shown.
 fn dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
     let args = frame.args;
     let (total, available, cache) = frame.memory;
@@ -249,6 +250,10 @@ fn dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
         |bytes| format!("{} MiB", bytes >> 20),
     );
     let text = |key: &str, default: &'static str| progress.field(key).unwrap_or(default).to_owned();
+    let kernels = kernels_text(
+        progress.field("cpu_isa"),
+        progress.field("cpu_isa_selection"),
+    );
     let used = total.saturating_sub(available);
     UnifiedDashboard {
         engine: format!("CPU-RAM {}", args.engine_version),
@@ -310,7 +315,7 @@ fn dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
                 text("seed_source", "pending")
             ),
             format!("ROUND SEED    {}", text("round_seed", "N/A")),
-            format!("WORKERS       auto topology    TEST BUFFER  {target_text}"),
+            format!("CPU KERNELS   {kernels}    TEST BUFFER  {target_text}"),
             format!(
                 "RECIPE        {} | {}",
                 text("window_recipe", "planning"),
@@ -331,6 +336,19 @@ fn dashboard(frame: &Frame<'_>, progress: &Progress) -> UnifiedDashboard {
             },
         ),
     }
+}
+
+/// The instruction set the CPU kernels run with (v1.2 C4), `AVX-512 (v4, auto)`; `pending` until
+/// the engine reports it.
+fn kernels_text(level: Option<&str>, selection: Option<&str>) -> String {
+    let Some(level) = level else {
+        return "pending".to_owned();
+    };
+    let label = dit_system::isa::IsaLevel::ALL
+        .into_iter()
+        .find(|known| known.as_str() == level)
+        .map_or_else(|| level.to_owned(), |known| known.label().to_owned());
+    format!("{label} ({level}, {})", selection.unwrap_or("auto"))
 }
 
 /// The CPU availability / power-platform test: transitions or, in the campaign, minimum time and
@@ -620,6 +638,19 @@ pub fn command(args: &CpuRamViewArgs) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_level_row_names_the_instructions() {
+        assert_eq!(
+            super::kernels_text(Some("v4"), Some("auto")),
+            "AVX-512 (v4, auto)"
+        );
+        assert_eq!(
+            super::kernels_text(Some("v3"), Some("manual")),
+            "AVX2+FMA (v3, manual)"
+        );
+        assert_eq!(super::kernels_text(None, None), "pending");
+    }
 
     fn args() -> CpuRamViewArgs {
         CpuRamViewArgs {

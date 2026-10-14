@@ -7,6 +7,7 @@ mod engine;
 mod error;
 mod gpu;
 mod inventory;
+pub mod isa;
 pub mod kernel_events;
 mod memory;
 pub mod pcie;

@@ -48,7 +48,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C1 | Sinh pattern theo word, gộp lượt đọc khi kiểm | `done` (v1.2.006) |
 | C2 | Chia worker RAM / tính toán bằng phép đo, theo loại lõi | `done` (C2a: v1.2.008, C2b: v1.2.009) |
 | C3 | Kernel nhiều chuỗi song song, burst ngắn, ramp theo tầng kernel | `done` (v1.2.007) |
-| C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `planned` |
+| C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `done` (v1.2.010) |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `planned` |
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `planned` |
 
@@ -222,17 +222,39 @@ Tốc độ sinh từng họ (một luồng): các họ lặp chu kỳ khoảng 
 - Report: `compute_oracle.fma_kernel`, `compute_oracle.fma_chains` (system schema 13, compute
   oracle schema 6); report cũ không có hai trường này là kernel một chuỗi.
 
-### C4 — Binary theo mức ISA (`planned`, chốt 2026-10-13)
+### C4 — Binary theo mức ISA (`done`, v1.2.010)
 
-- Build ba bản: v1 (baseline, như hiện nay), v3 (AVX2+FMA), v4 (AVX-512). Repo cấm `unsafe` nên
-  tách binary là cách sạch nhất. ISO lớn thêm vài MB.
-- **Tự chọn mặc định** theo cờ trong `/proc/cpuinfo`: có `avx512f` chạy v4; có `avx2` và `fma`
-  chạy v3; còn lại chạy v1. Người vận hành không phải chọn, nên không có rủi ro chọn sai gây chết
-  chương trình bằng SIGILL.
-- **Chỉnh tay (ẩn) cho kỹ thuật viên:** tham số boot `dit_isa=v1|v3|v4` hoặc biến môi trường trong
-  shell. Nếu ép mức CPU không hỗ trợ thì chương trình từ chối ngay khi bắt đầu, kèm lý do.
-- UI và report ghi mức đang dùng, ví dụ `CPU kernels: AVX-512 (v4, auto)`. Kết quả đúng/sai không
-  phụ thuộc mức ISA, vì mọi kernel so với đáp án tính độc lập.
+- **Ba bản `dit-cli`** trong image, cùng thư mục `/opt/cpu-dit-01/`: `dit-cli` (v1, SSE2),
+  `dit-cli-v3` (x86-64-v3: AVX2, FMA…), `dit-cli-v4` (x86-64-v4: AVX-512). Mỗi bản khoảng 3,5 MB.
+  `build_boot_image.sh` build hai bản sau với `--target x86_64-unknown-linux-gnu`; thiếu
+  `--target`, `RUSTFLAGS` áp cả cho proc-macro, mà proc-macro chạy trong `rustc` trên máy build,
+  nên máy build không có AVX-512 sẽ chết vì SIGILL.
+- **Một điểm vào:** `dit-cli` (v1) chọn mức khi khởi động rồi `exec` sang bản đó
+  (`crates/dit-system/src/isa.rs`, `choose_isa` trong `dit-cli`). Cùng PID, cùng tham số, nên
+  launcher, watchdog và combined không phải đổi gì.
+- **Tự chọn:** mức cao nhất mà CPU chạy được và image có. Kiểm bằng `is_x86_feature_detected!`
+  đủ bộ tính năng của mức đó (v3: AVX, AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE…; v4: AVX-512 F, BW,
+  CD, DQ, VL); cách này kiểm cả việc kernel đã bật thanh ghi AVX, điều cờ `/proc/cpuinfo` không nói.
+- **Chỉnh tay (ẩn) cho kỹ thuật viên:** biến `DIT_ISA=v1|v3|v4|auto` trong shell, hoặc tham số boot
+  `dit_isa=` (nhấn `e` ở menu GRUB, thêm vào dòng `linux`); biến môi trường thắng. Ép mức CPU không
+  có thì chương trình từ chối ngay, exit 3, ví dụ: `INVALID: dit_isa=v4 needs AVX-512 F, BW, CD,
+  DQ and VL, which this CPU does not have (it runs up to v3)`.
+- **Ghi lại:** `cpu_isa` (mức đang chạy, `auto`/`manual`/`direct`, mức CPU hỗ trợ) trong report
+  CPU-RAM (schema 16), compute oracle (7) và power (5); dòng `CPU KERNELS  AVX2+FMA (v3, auto)`
+  trên dashboard CPU+RAM.
+- **Đo trên 3700X (v3 so với v1, cùng seed):**
+
+| | v1 | v3 |
+|---|---|---|
+| 1 worker, ghi RAM | 3,83 GB/s | 5,58 GB/s |
+| 1 worker, kiểm RAM | 2,72 GB/s | 3,65 GB/s |
+| 16 luồng, kiểm RAM | 19,6 GB/s | 24,1 GB/s |
+| 16 luồng, ghi RAM | 11,6 GB/s | 11,4 GB/s (đã chạm bus ghi) |
+| Tính toán mỗi worker | 29 GFLOP/s (6 chuỗi) | 55 GFLOP/s (10 chuỗi) |
+
+  Digest nội dung RAM giống hệt giữa v1 và v3. Bản v4 có `vpmullq` (nhân 64-bit vector, phần
+  `address_derived` của C1 cần), nhưng máy build không có AVX-512 nên chưa đo.
+- **Chưa kiểm:** bản v4 trên máy thật (Ryzen 7000/9000), image/ISO build đầy đủ.
 
 | CPU | Mức tự chọn |
 |---|---|
@@ -364,7 +386,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 1. V0b: version trong report và CSV (`done`, v1.2.004).
 2. C1: sinh pattern theo word (`done`, v1.2.006).
 3. C3 + C2: kernel nhiều chuỗi (C3 `done`, v1.2.007) và cách chia worker mới (C2 `done`, v1.2.008–009).
-4. C4: binary v3/v4 và cơ chế tự chọn.
+4. C4: binary v3/v4 và cơ chế tự chọn (`done`, v1.2.010).
 5. C5: các kernel mới.
 6. C6: xoay từng lõi. Bộ xoay và A trước, B sau, vì B cần đo và có thể phải sửa lớp GPU.
 

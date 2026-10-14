@@ -335,6 +335,10 @@ pub struct SystemRunReport {
     /// How the threads were split between RAM and compute workers (v1.2.009 on; absent before).
     #[serde(default)]
     pub worker_split: Option<crate::split::WorkerSplitEvidence>,
+    /// The instruction-set level the RAM and compute kernels ran at (v1.2.010 on; absent
+    /// before: baseline).
+    #[serde(default)]
+    pub cpu_isa: Option<crate::isa::IsaEvidence>,
     pub window_coverage: WindowCoverageEvidence,
     pub rounds_requested: u32,
     pub rounds_completed: u32,
