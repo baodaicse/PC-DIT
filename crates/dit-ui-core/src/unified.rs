@@ -201,8 +201,9 @@ fn big_word(word: &str, scale: usize) -> Option<Vec<String>> {
 }
 
 /// The word the screen shows in big letters: the verdict once a result is on the screen (its
-/// `RESULT: <VERDICT>` row; none for a verdict without glyphs), else FAIL from the first failure
-/// counted and PASS before it.
+/// `RESULT: <VERDICT>` row; none for a verdict without glyphs); while the test runs, FAIL from
+/// the first failure counted and nothing before it. PASS only ever comes with the result: a
+/// running test has not passed yet.
 fn banner_word(dashboard: &UnifiedDashboard) -> Option<&'static str> {
     if let Some(row) = dashboard
         .running_rows
@@ -214,11 +215,7 @@ fn banner_word(dashboard: &UnifiedDashboard) -> Option<&'static str> {
             .into_iter()
             .find(|word| verdict.eq_ignore_ascii_case(word));
     }
-    Some(if dashboard.failures > 0 {
-        "FAIL"
-    } else {
-        "PASS"
-    })
+    (dashboard.failures > 0).then_some("FAIL")
 }
 
 fn verdict_color(word: &str) -> &'static str {
@@ -1260,17 +1257,33 @@ mod tests {
             .trim_end()
     }
 
-    /// PASS until a failure is counted, then FAIL: in big letters on the TESTING panel's last
-    /// rows, right above the footer, centred, as big as the spare rows allow.
+    /// Nothing in big letters while a test runs without a failure; FAIL from the first failure
+    /// counted; PASS only on the result: in big letters on the TESTING panel's last rows, right
+    /// above the footer, centred, as big as the spare rows allow.
     #[test]
     fn big_verdict_sits_at_the_bottom_of_the_testing_panel() {
         let size = TerminalSize {
             cols: 160,
             rows: 50,
         };
-        for (failures, word, color) in [(0, "PASS", GREEN), (1, "FAIL", RED)] {
+        let running = render_unified_dashboard(&model(), size, false);
+        for word in ["PASS", "FAIL"] {
+            let art = big_word(word, 3).expect("glyphs");
+            assert!(
+                !running
+                    .lines()
+                    .any(|line| inside(line).trim() == art[0].trim()),
+                "no {word} while the test runs without a failure"
+            );
+        }
+        for (failures, word, color) in [(1, "FAIL", RED), (0, "PASS", GREEN)] {
             let mut dashboard = model();
             dashboard.failures = failures;
+            if word == "PASS" {
+                dashboard
+                    .running_rows
+                    .insert(0, "RESULT: PASS    All gates passed.".to_owned());
+            }
             let frame = render_unified_dashboard(&dashboard, size, false);
             let lines: Vec<&str> = frame.lines().collect();
             let art = big_word(word, 3).expect("glyphs");
@@ -1306,7 +1319,11 @@ mod tests {
         }
         // A smaller screen gets smaller letters.
         let small = TerminalSize { cols: 90, rows: 34 };
-        let frame = render_unified_dashboard(&model(), small, false);
+        let mut passed = model();
+        passed
+            .running_rows
+            .insert(0, "RESULT: PASS    All gates passed.".to_owned());
+        let frame = render_unified_dashboard(&passed, small, false);
         let art = big_word("PASS", 1).expect("glyphs");
         let lines: Vec<&str> = frame.lines().collect();
         assert_eq!(inside(lines[lines.len() - 3]).trim(), art[4].trim());

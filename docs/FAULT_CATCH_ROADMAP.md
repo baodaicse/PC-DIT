@@ -314,7 +314,9 @@ Result của hộp đen:
 - Thêm dòng nguyên nhân (CAUSE) và tình trạng cuối (LAST STATE).
 - Màn kết quả giống app: verdict cỡ lớn ở đáy khung TESTING, căn giữa (FAIL đỏ, INVALID vàng, PASS xanh); dưới đó
   mỗi ô linh kiện bị FAIL một dòng kèm thiết bị, ví dụ `SSD1 2  -  Samsung SSD 990 PRO 1TB`. Phần này đã có trong
-  `dit-ui-core` (2026-10-12), dùng chung cho mọi màn test và màn kết quả.
+  `dit-ui-core` (2026-10-12), dùng chung cho mọi màn test và màn kết quả. Từ v1.2.014: trong lúc test chạy,
+  chưa có lỗi thì không hiện chữ lớn nào; FAIL hiện ngay từ lỗi đầu tiên; PASS chỉ hiện trên màn kết quả, khi
+  test đã hoàn tất (dòng `RESULT: PASS`).
 - Vì không can thiệp, các lớp còn chạy lúc hộp đen ghi result vẫn chạy tiếp; result ghi tên các lớp đó. Report của
   chúng nếu xong sau vẫn nằm trong thư mục phiên nhưng không đổi result đã ghi. Muốn dừng thì người vận hành dùng
   console cứu hộ (FC1) hoặc khởi động lại.
