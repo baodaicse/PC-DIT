@@ -908,9 +908,10 @@ impl Session<'_> {
             ),
             Layer::Ssd => {
                 let storage = self.storage.as_ref().ok_or("no storage plan")?;
-                // The baseline writes at most the Light budget; the overlap the chosen level.
+                // The baseline writes at most the Light budget; the overlap the chosen level (less
+                // the share of a rotation B right after it, which writes the rest).
                 let budget = if overlap {
-                    storage.write_budget_mib
+                    self.ssd_budget_split(index, storage.write_budget_mib).0
                 } else {
                     storage.write_budget_mib.min(2048)
                 };
@@ -1001,7 +1002,7 @@ impl Session<'_> {
                 Ok(())
             }
             PhaseKind::RotationA => self
-                .launch_rotation(index, RotationKind::A, seconds, None)
+                .launch_rotation(index, RotationKind::A, seconds, &[])
                 .map(|running| self.supervise(vec![running], seconds, &mut record)),
             PhaseKind::RotationB => {
                 self.rotation_b(index, seconds, &mut record);
@@ -1029,7 +1030,7 @@ impl Session<'_> {
         index: usize,
         kind: RotationKind,
         seconds: u64,
-        keep_off_pid: Option<u32>,
+        keep_off_pids: &[u32],
     ) -> Result<Running, String> {
         let dir = self.phase_dir(index, Layer::CpuRam);
         let mut launch = layers::cpu_rotation(
@@ -1037,7 +1038,7 @@ impl Session<'_> {
             &dir,
             seconds,
             kind.as_str(),
-            keep_off_pid,
+            keep_off_pids,
             self.settings.memory.reserve_bytes / MIB,
         );
         if self.menu.attribution_checks {
@@ -1050,15 +1051,24 @@ impl Session<'_> {
         self.spawn(index, Layer::CpuRam, launch)
     }
 
-    /// Rotation B: the GPU test flat out first (the Full profile, two verifier threads), then
-    /// the rotation beside it, the GPU test's processes kept off the core under test. The GPU
-    /// layer is started exactly as for its baseline but for the verifier ceiling.
-    fn rotation_b(&mut self, index: usize, seconds: u64, record: &mut PhaseRecord) {
-        let end = Instant::now() + Duration::from_secs(seconds);
-        let mut running: Vec<Running> = Vec::new();
-        if self.available.gpu {
-            let dir = self.phase_dir(index, Layer::Gpu);
-            let mut launch = layers::gpu(
+    /// The overlap's SSD write budget shared with the rotation B after it
+    /// (`combined::ssd_budget_split`).
+    fn ssd_budget_split(&self, overlap_index: usize, budget_mib: u64) -> (u64, u64) {
+        combined::ssd_budget_split(&self.phases, overlap_index, budget_mib)
+    }
+
+    /// A test running beside rotation B (v1.2.013): started as in the overlap but for three
+    /// things: the GPU keeps two verifier threads, the SSD writes B's share of the overlap's
+    /// budget, and nothing is injected (the negative gate belongs to the overlap).
+    fn launch_beside_rotation(
+        &self,
+        index: usize,
+        layer: Layer,
+        seconds: u64,
+    ) -> Result<Running, String> {
+        let dir = self.phase_dir(index, layer);
+        let mut launch = match layer {
+            Layer::Gpu => layers::gpu(
                 self.menu,
                 &dir,
                 seconds,
@@ -1067,34 +1077,97 @@ impl Session<'_> {
                     verifier_max: Some(ROTATION_B_GPU_VERIFIERS),
                     host_budget_bytes: self.gpu_budget,
                 },
-            );
-            if self.menu.attribution_checks {
-                launch.args.push(attribution_flag(Layer::Gpu).into());
+            ),
+            Layer::Ssd => {
+                let storage = self.storage.as_ref().ok_or("no storage plan")?;
+                let (_, budget) =
+                    self.ssd_budget_split(index.saturating_sub(1), storage.write_budget_mib);
+                if budget == 0 {
+                    return Err("no SSD write budget left for rotation B".into());
+                }
+                layers::ssd(
+                    self.menu,
+                    &dir,
+                    seconds,
+                    storage,
+                    budget,
+                    self.threads.ssd_workers,
+                    random_seed(),
+                )
             }
+            Layer::Chain => {
+                let file = self.chain_file.as_deref().ok_or("chain records missing")?;
+                let generations = match self.settings.intensity {
+                    Intensity::Balanced => 4,
+                    Intensity::Max => 1,
+                };
+                layers::chain(
+                    self.menu,
+                    &dir,
+                    &ChainWork::Read {
+                        file,
+                        seconds,
+                        generations,
+                    },
+                )
+            }
+            Layer::CpuRam => return Err("CPU-RAM rests during rotation B".into()),
+        };
+        if self.menu.attribution_checks {
+            launch.args.push(attribution_flag(layer).into());
+        }
+        if layer != Layer::Ssd {
             launch.args.extend([
                 "--fault-events".into(),
                 dir.join("fault-events.jsonl").into(),
             ]);
-            match self.spawn(index, Layer::Gpu, launch) {
-                Ok(gpu) => {
-                    running.push(gpu);
+        }
+        self.spawn(index, layer, launch)
+    }
+
+    /// Rotation B: the overlap without CPU-RAM (the data chain, the GPU and the SSD, started in
+    /// the overlap's order, each once ready), then the rotation beside them, their process trees
+    /// kept off the core under test.
+    fn rotation_b(&mut self, index: usize, seconds: u64, record: &mut PhaseRecord) {
+        let end = Instant::now() + Duration::from_secs(seconds);
+        let remaining = || {
+            end.saturating_duration_since(Instant::now())
+                .as_secs()
+                .max(20)
+        };
+        let mut running: Vec<Running> = Vec::new();
+        let mut order = Vec::new();
+        if self.available.chain && self.chain_file.is_some() {
+            order.push(Layer::Chain);
+        }
+        if self.available.gpu {
+            order.push(Layer::Gpu);
+        }
+        if self.available.ssd {
+            order.push(Layer::Ssd);
+        }
+        for layer in order {
+            match self.launch_beside_rotation(index, layer, remaining()) {
+                Ok(started) => {
+                    running.push(started);
+                    let launched = Instant::now();
                     self.wait_ready(&mut running, record);
+                    while launched.elapsed() < LAYER_START_GAP
+                        && self.abort.is_none()
+                        && !INTERRUPTED.load(Ordering::SeqCst)
+                    {
+                        self.tick(&mut running, record);
+                    }
                 }
-                Err(error) => record
-                    .layers
-                    .push(self.not_started(index, Layer::Gpu, error)),
+                Err(error) => record.layers.push(self.not_started(index, layer, error)),
+            }
+            if self.abort.is_some() || INTERRUPTED.load(Ordering::SeqCst) {
+                break;
             }
         }
         if self.abort.is_none() && !INTERRUPTED.load(Ordering::SeqCst) {
-            let keep_off = running
-                .iter()
-                .find(|layer| layer.layer == Layer::Gpu)
-                .map(|layer| layer.child.id());
-            let left = end
-                .saturating_duration_since(Instant::now())
-                .as_secs()
-                .max(20);
-            match self.launch_rotation(index, RotationKind::B, left, keep_off) {
+            let keep_off: Vec<u32> = running.iter().map(|layer| layer.child.id()).collect();
+            match self.launch_rotation(index, RotationKind::B, remaining(), &keep_off) {
                 Ok(rotation) => running.push(rotation),
                 Err(error) => record
                     .layers

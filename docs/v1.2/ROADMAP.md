@@ -434,6 +434,23 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 **Chưa kiểm:** CPU hybrid Intel thật (cụm E, xung 6 GHz của P-core), Ryzen nhiều CCD, image/ISO đầy
 đủ, và thước đo hiệu quả của roadmap: số FAIL chỉ xuất hiện ở pha xoay trên kết quả thực tế.
 
+**Sau đánh giá v1.2 (v1.2.013, chốt 2026-10-14).** Hai thay đổi để tăng khả năng bắt lỗi mà không
+bỏ phần nào của C6:
+
+- **B là "pha chạy chồng trừ CPU-RAM":** data chain, GPU và SSD khởi động theo đúng thứ tự của pha
+  chạy chồng, rồi bộ xoay dời cây tiến trình của cả ba ra khỏi lõi đang test. Bản đầu của C6 lấy 12
+  phút tải đồng thời của SSD, GPU và chain trong Deep (40 → 28 phút); nay chỉ CPU-RAM mất 12 phút
+  (C1 đã bù gấp 3–4 lần số vòng RAM), còn SSD, GPU, chain chạy gần đủ 40 phút như trước.
+  - Ngân sách ghi SSD (Standard 16 GiB, Heavy 64 GiB mỗi pha chạy chồng) được **chia** giữa pha
+    chạy chồng và B theo tỷ lệ thời gian (`combined::ssd_budget_split`), nên tổng lượng ghi lên SSD
+    của phiên giữ nguyên, không tăng hao mòn.
+  - Chain chỉ đọc. GPU giữ 2 luồng kiểm. Không bơm lỗi thử nghiệm ở B (thuộc về pha chạy chồng).
+  - B nặng hơn nên xung lõi thấp là bình thường: B vẫn ghi xung của từng bước nhưng **không** ghi
+    NOTE `no_boost`; chỉ A (máy nghỉ) mới ghi.
+- **Bounded có A 20 s** ngay sau các pha nền (pha chạy chồng 5 phút → 4 phút 40 giây). Bộ lập lịch
+  tự giữ 2 lõi firmware xếp boost cao nhất, 10 s mỗi lõi: nhóm lõi chạy điện áp cao nhất, hay suy
+  giảm trước nhất trên Raptor Lake. Bounded vẫn không có B.
+
 ## Quyết định
 
 | Chủ đề | Quyết định | Trạng thái |
@@ -444,6 +461,7 @@ Bộ xoay của C6 dùng chung phần nhận dạng lõi với nó, không thay 
 | C2 | Đầu phiên tự đo để chia worker RAM và worker tính toán; xếp luồng theo loại lõi (P/E) | đã chốt (2026-10-13) |
 | C4 | Tự chọn AVX2/AVX-512 theo CPU là mặc định; `dit_isa=` ẩn cho kỹ thuật viên | đã chốt (2026-10-13) |
 | C6 combined | Deep: A+B, ngân sách cố định khoảng 20% (12 phút) lấy từ pha chạy chồng; Bounded: không xoay; Soak: mỗi chu kỳ một lượt A+B; E-core xoay theo cụm | đã chốt (2026-10-13) |
+| C6 sau đánh giá | B chạy cùng GPU, SSD, chain (chỉ CPU-RAM nghỉ), ngân sách ghi SSD chia giữa pha chạy chồng và B; Bounded xoay A trên 2 lõi xếp hạng cao nhất (20 s); chỉ A ghi NOTE `no_boost` | đã chốt (2026-10-14) |
 | C6 boost | Bước không đạt gần xung tối đa ghi NOTE "không đạt boost", không tính FAIL | đã chốt (2026-10-13) |
 | C6 menu [1] CPU + RAM | Full: A đầu phiên, khoảng 6 phút trong 30 phút; Safe: không xoay | đã chốt (2026-10-13) |
 | C6 menu [4] | Power-sweep giữ nguyên | đã chốt (2026-10-13) |

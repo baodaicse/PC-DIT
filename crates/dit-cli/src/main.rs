@@ -501,9 +501,10 @@ struct SystemRunArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     core_rotation_seconds: Option<u64>,
 
-    /// Rotation `b`: the GPU test's process (its whole tree) is kept off the core under test.
+    /// Rotation `b`: a test running beside it (GPU, SSD, data chain), its whole process tree
+    /// kept off the core under test. Repeat for each.
     #[arg(long, requires = "core_rotation")]
-    core_rotation_keep_off_pid: Option<u32>,
+    core_rotation_keep_off_pid: Vec<u32>,
 
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2_000_000_000))]
     compute_oracle_dense_fma_iterations: Option<u32>,
@@ -827,7 +828,7 @@ fn system_run(args: &SystemRunArgs) -> u8 {
             CoreRotationArg::B => RotationKind::B,
         }),
         core_rotation_seconds: args.core_rotation_seconds.unwrap_or(0),
-        core_rotation_keep_off_pid: args.core_rotation_keep_off_pid,
+        core_rotation_keep_off_pids: args.core_rotation_keep_off_pid.clone(),
         compute_oracle_dense_fma_iterations: args
             .compute_oracle_dense_fma_iterations
             .unwrap_or(FMA_ITERATIONS_PER_BURST),

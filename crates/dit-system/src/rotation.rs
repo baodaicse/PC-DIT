@@ -13,10 +13,11 @@
 //! Targets go in the order the firmware ranks them (`acpi_cppc/highest_perf`, its preferred
 //! cores first). Kind A (`a`) runs the light integer kernel, which reaches the highest boost;
 //! kind B (`b`) runs it, then the C3 FMA kernel (the largest current), and is meant to run while
-//! the GPU test loads the machine (`keep_off_pid`: that process tree is kept off the core under
-//! test). Every result is checked; a wrong one is a CPU failure. The clock each step reached is
-//! read from cpufreq (MSRs are locked under Secure Boot): a step under 95% of the core's maximum
-//! is a note, never a failure.
+//! the GPU, SSD and data-chain tests load the machine (`keep_off_pids`: those process trees are
+//! kept off the core under test). Every result is checked; a wrong one is a CPU failure. The
+//! clock each step reached is read from cpufreq (MSRs are locked under Secure Boot). In kind A a
+//! step under 95% of the core's maximum is a note, never a failure; kind B records its clocks
+//! but notes nothing, the other tests running beside it lower the boost as they should.
 
 use std::{
     path::Path,
@@ -245,9 +246,10 @@ pub struct CoreRotationEvidence {
     pub not_rotated: Vec<Vec<usize>>,
     pub mismatches: u64,
     pub passed: bool,
-    /// Steps whose clock stayed under 95% of the maximum (a note, not a failure).
+    /// Kind A steps whose clock stayed under 95% of the maximum (a note, not a failure). Kind B
+    /// counts none: the tests beside it lower the boost (each step still records its clock).
     pub steps_below_boost: usize,
-    /// Threads of the kept-off process tree (kind B) moved off each step's core.
+    /// Threads of the kept-off process trees (kind B) moved off each step's core.
     pub kept_off_threads: u64,
     /// The first wrong result: step, threads and kernel.
     pub first_mismatch: Option<String>,
@@ -268,8 +270,9 @@ pub(crate) struct Rotation<'a> {
     pub(crate) kind: RotationKind,
     pub(crate) budget_seconds: u64,
     pub(crate) seed: u64,
-    /// Kind B: the GPU test's process tree, kept off the core under test.
-    pub(crate) keep_off_pid: Option<u32>,
+    /// Kind B: the process trees of the tests running beside it (GPU, SSD, data chain), kept off
+    /// the core under test.
+    pub(crate) keep_off_pids: &'a [u32],
     pub(crate) inventory: &'a CpuInventory,
     pub(crate) control: &'a RunControl,
 }
@@ -306,8 +309,8 @@ impl Rotation<'_> {
             if self.control.should_stop() {
                 break;
             }
-            if let Some(pid) = self.keep_off_pid {
-                let avoid: Vec<usize> = target.cpus.iter().chain(&target.quiet).copied().collect();
+            let avoid: Vec<usize> = target.cpus.iter().chain(&target.quiet).copied().collect();
+            for &pid in self.keep_off_pids {
                 evidence.kept_off_threads += keep_off(pid, &avoid, &self.inventory.allowed_cpu_ids);
             }
             let step = self.step(
@@ -336,10 +339,12 @@ impl Rotation<'_> {
                 ));
             }
             evidence.mismatches += step.mismatches;
-            evidence.steps_below_boost += usize::from(step.boost_reached == Some(false));
+            if self.kind == RotationKind::A {
+                evidence.steps_below_boost += usize::from(step.boost_reached == Some(false));
+            }
             evidence.steps.push(step);
         }
-        if let Some(pid) = self.keep_off_pid {
+        for &pid in self.keep_off_pids {
             keep_off(pid, &[], &self.inventory.allowed_cpu_ids);
         }
         evidence.passed = evidence.mismatches == 0;

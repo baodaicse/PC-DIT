@@ -183,8 +183,9 @@ pub struct SystemRunConfig {
     /// (`rotation.rs`), for `core_rotation_seconds` of `minimum_duration_ms`.
     pub core_rotation: Option<RotationKind>,
     pub core_rotation_seconds: u64,
-    /// Kind B: the GPU test's process tree, kept off the core under test.
-    pub core_rotation_keep_off_pid: Option<u32>,
+    /// Kind B: the process trees of the tests beside it (GPU, SSD, data chain), kept off the
+    /// core under test.
+    pub core_rotation_keep_off_pids: Vec<u32>,
     pub compute_oracle_idle_ramp_enabled: bool,
     pub compute_oracle_idle_sleep_ms: u64,
     pub fault_injection_compute_oracle_worker: Option<usize>,
@@ -226,7 +227,8 @@ impl SystemRunConfig {
                 "a core rotation needs core_rotation_seconds".to_owned(),
             ));
         }
-        if self.core_rotation_keep_off_pid.is_some() && self.core_rotation != Some(RotationKind::B)
+        if !self.core_rotation_keep_off_pids.is_empty()
+            && self.core_rotation != Some(RotationKind::B)
         {
             return Err(SystemDitError::InvalidConfig(
                 "only rotation B keeps a process off the core under test".to_owned(),
@@ -2014,7 +2016,7 @@ fn run_core_rotation(
         kind,
         budget_seconds: config.core_rotation_seconds,
         seed: config.seed,
-        keep_off_pid: config.core_rotation_keep_off_pid,
+        keep_off_pids: &config.core_rotation_keep_off_pids,
         inventory: &inventory.cpu,
         control,
     }
@@ -2258,7 +2260,7 @@ mod tests {
             compute_kernel_tier: 1,
             core_rotation: None,
             core_rotation_seconds: 0,
-            core_rotation_keep_off_pid: None,
+            core_rotation_keep_off_pids: Vec::new(),
             compute_oracle_idle_ramp_enabled: false,
             compute_oracle_idle_sleep_ms: 0,
             fault_injection_compute_oracle_worker: None,

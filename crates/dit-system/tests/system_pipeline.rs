@@ -42,7 +42,7 @@ fn config(fault: Option<u64>) -> SystemRunConfig {
         compute_kernel_tier: 1,
         core_rotation: None,
         core_rotation_seconds: 0,
-        core_rotation_keep_off_pid: None,
+        core_rotation_keep_off_pids: Vec::new(),
         compute_oracle_dense_fma_iterations: 1_000,
         compute_oracle_idle_ramp_enabled: false,
         compute_oracle_idle_sleep_ms: 0,

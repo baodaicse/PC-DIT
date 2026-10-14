@@ -117,8 +117,17 @@ impl PhaseKind {
             Self::Baseline(layer) => vec![layer],
             Self::Overlap => available.layers(),
             Self::Rest => Vec::new(),
-            Self::RotationB if available.gpu => vec![Layer::Gpu, Layer::CpuRam],
-            Self::RotationA | Self::RotationB => vec![Layer::CpuRam],
+            Self::RotationA => vec![Layer::CpuRam],
+            // The overlap without CPU-RAM, then the rotation (v1.2.013).
+            Self::RotationB => {
+                let mut layers: Vec<Layer> = available
+                    .layers()
+                    .into_iter()
+                    .filter(|layer| *layer != Layer::CpuRam)
+                    .collect();
+                layers.push(Layer::CpuRam);
+                layers
+            }
         }
     }
 }
@@ -221,6 +230,10 @@ pub fn schedule(level: Level, available: Available, soak_hours: u64) -> Vec<Phas
     phases
 }
 
+/// Rotation A of a Bounded session (v1.2.013): the two cores the firmware ranks highest, 10 s
+/// each (the planner keeps the best-ranked ones when the budget is short), taken from its 5-minute
+/// overlap. They are the cores most likely to fail at peak boost.
+const BOUNDED_ROTATION_A_SECONDS: u64 = 20;
 /// Core rotation budget of a Deep session (v1.2 C6): about 20% of the hour, taken from the
 /// overlap (40 -> 28 minutes). A gets a third, B two thirds (B runs two kernels).
 const DEEP_ROTATION_A_SECONDS: u64 = 240;
@@ -230,14 +243,14 @@ const SOAK_ROTATION_A_SECONDS: u64 = 200;
 const SOAK_ROTATION_B_SECONDS: u64 = 400;
 
 /// Adds the core rotation (v1.2 C6) to a [`schedule`]: rotation A early, while the machine is
-/// cool (Deep: after the baselines, before the chain; Soak: before every overlap), rotation B
-/// right after the overlap, while it is hot. Their time comes out of the overlap, so the session
-/// keeps its length. Without a GPU there is no B, its time stays with the overlap. Bounded is
-/// left alone (its overlap is only 5 minutes).
+/// cool (Bounded and Deep: after the baselines, before the chain; Soak: before every overlap),
+/// rotation B right after the overlap, while it is hot (Deep and Soak). Their time comes out of
+/// the overlap, so the session keeps its length. Without a GPU there is no B, its time stays with
+/// the overlap. Bounded only rotates its two best-ranked cores (20 s of its 5-minute overlap).
 #[must_use]
 pub fn add_core_rotation(level: Level, available: Available, phases: Vec<Phase>) -> Vec<Phase> {
     let (a, b) = match level {
-        Level::Bounded => return phases,
+        Level::Bounded => (BOUNDED_ROTATION_A_SECONDS, 0),
         Level::Deep => (DEEP_ROTATION_A_SECONDS, DEEP_ROTATION_B_SECONDS),
         Level::Soak => (SOAK_ROTATION_A_SECONDS, SOAK_ROTATION_B_SECONDS),
     };
@@ -252,7 +265,7 @@ pub fn add_core_rotation(level: Level, available: Available, phases: Vec<Phase>)
             kind: PhaseKind::RotationA,
             seconds: a,
         };
-        if level == Level::Deep && index == first_after_baselines {
+        if level != Level::Soak && index == first_after_baselines {
             out.push(rotation_a);
         }
         if phase.kind == PhaseKind::Overlap {
@@ -290,6 +303,24 @@ pub fn core_rotation_enabled(env_value: Option<&str>, cmdline: &str) -> bool {
                 .find_map(|word| word.strip_prefix("dit_rotation="))
         });
     value != Some("0")
+}
+
+/// The SSD write budget of the overlap at `overlap_index`, shared with the rotation B right after
+/// it in proportion to their lengths (v1.2.013): `(overlap, B)` MiB. The SSD runs in both, so a
+/// session writes what it wrote with the overlap alone; without a rotation B after it the overlap
+/// keeps it all.
+#[must_use]
+pub fn ssd_budget_split(phases: &[Phase], overlap_index: usize, budget_mib: u64) -> (u64, u64) {
+    let overlap = phases.get(overlap_index).map_or(0, |phase| phase.seconds);
+    let rotation = phases
+        .get(overlap_index + 1)
+        .filter(|phase| phase.kind == PhaseKind::RotationB)
+        .map_or(0, |phase| phase.seconds);
+    if rotation == 0 {
+        return (budget_mib, 0);
+    }
+    let share = budget_mib * rotation / (overlap + rotation);
+    (budget_mib - share, share)
 }
 
 /// Planned seconds of the whole schedule (the prefill counted at `prefill_estimate`).
@@ -572,6 +603,26 @@ mod tests {
     }
 
     #[test]
+    fn the_ssd_writes_what_it_wrote_before_rotation_b() {
+        let deep = add_core_rotation(Level::Deep, ALL, schedule(Level::Deep, ALL, 0));
+        let overlap = deep
+            .iter()
+            .position(|p| p.kind == PhaseKind::Overlap)
+            .unwrap();
+        // Standard: 16 GiB over 28 + 8 minutes.
+        let (main, rotation) = ssd_budget_split(&deep, overlap, 16_384);
+        assert_eq!(main + rotation, 16_384);
+        assert_eq!(rotation, 16_384 * 480 / 2160);
+        // No rotation B after it (Bounded, or rotation off): the overlap keeps it all.
+        let bounded = add_core_rotation(Level::Bounded, ALL, schedule(Level::Bounded, ALL, 0));
+        let overlap = bounded
+            .iter()
+            .position(|p| p.kind == PhaseKind::Overlap)
+            .unwrap();
+        assert_eq!(ssd_budget_split(&bounded, overlap, 2048), (2048, 0));
+    }
+
+    #[test]
     fn core_rotation_can_be_turned_off() {
         assert!(core_rotation_enabled(None, "boot=live quiet"));
         assert!(!core_rotation_enabled(None, "boot=live dit_rotation=0"));
@@ -624,12 +675,28 @@ mod tests {
             }
         }
 
-        // Bounded: unchanged. Without a GPU: no B, the overlap keeps its share.
+        // Bounded: A on the two best-ranked cores (20 s) out of the 5-minute overlap, no B.
         let bounded = schedule(Level::Bounded, ALL, 0);
+        let rotated = add_core_rotation(Level::Bounded, ALL, bounded.clone());
+        let kinds: Vec<PhaseKind> = rotated.iter().map(|p| p.kind).collect();
         assert_eq!(
-            add_core_rotation(Level::Bounded, ALL, bounded.clone()),
-            bounded
+            kinds,
+            vec![
+                Prefill,
+                Baseline(Layer::CpuRam),
+                Baseline(Layer::Gpu),
+                Baseline(Layer::Ssd),
+                RotationA,
+                ChainAlone,
+                Overlap,
+            ]
         );
+        assert_eq!(planned_seconds(&rotated, 90), planned_seconds(&bounded, 90));
+        assert_eq!(
+            rotated.iter().find(|p| p.kind == Overlap).unwrap().seconds,
+            280
+        );
+        // Without a GPU: no B, the overlap keeps its share.
         let no_gpu = Available { gpu: false, ..ALL };
         let rotated = add_core_rotation(Level::Deep, no_gpu, schedule(Level::Deep, no_gpu, 0));
         assert_eq!(rotated.iter().filter(|p| p.kind == RotationB).count(), 0);
@@ -637,8 +704,12 @@ mod tests {
             rotated.iter().find(|p| p.kind == Overlap).unwrap().seconds,
             2400 - 240
         );
-        assert_eq!(RotationB.layers(&ALL), vec![Layer::Gpu, Layer::CpuRam]);
-        assert_eq!(RotationB.layers(&no_gpu), vec![Layer::CpuRam]);
+        // B: the overlap's layers but CPU-RAM, then the rotation (a CPU-RAM layer).
+        assert_eq!(
+            RotationB.layers(&ALL),
+            vec![Layer::Gpu, Layer::Ssd, Layer::Chain, Layer::CpuRam]
+        );
+        assert_eq!(RotationA.layers(&ALL), vec![Layer::CpuRam]);
     }
 
     #[test]
