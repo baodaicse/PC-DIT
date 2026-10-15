@@ -51,6 +51,10 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C4 | Binary v1 / v3 (AVX2+FMA) / v4 (AVX-512), tự chọn theo CPU | `done` (v1.2.010) |
 | C5 | Kernel mới: DGEMM chính xác, ép từng tầng cache, AES-NI/SHA-NI hàng loạt | `done` (v1.2.011) |
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `done` (v1.2.012) |
+| C7 | GPU: K của GEMM tự tăng khi CPU kiểm không kịp | `done` (v1.2.018) |
+| C8 | GPU: INT8 Tensor core trong test đầy đủ và COMBINED | `done` (v1.2.018) |
+| C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word | `planned` (thảo luận) |
+| C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -451,6 +455,113 @@ bỏ phần nào của C6:
   tự giữ 2 lõi firmware xếp boost cao nhất, 10 s mỗi lõi: nhóm lõi chạy điện áp cao nhất, hay suy
   giảm trước nhất trên Raptor Lake. Bounded vẫn không có B.
 
+## Sửa sau kết quả thực địa (v1.2.015–018, 2026-10-15)
+
+Kết quả thực địa của v1.2.013 (ProArt X870E 9950X + RTX 3050, MAG X870E 9950X3D + RTX 5060 Ti) dẫn tới
+bốn thay đổi. Chi tiết trong từng commit.
+
+- **v1.2.015, rút USB bất kỳ lúc nào:** test ghi vào tmpfs, chép lên USB một lần khi xong; mọi kiểm tra "có ổ
+  kết quả" xét thiết bị còn thật hay không; cắm lại thì menu gắn lại ổ sau `fsck.fat`. Hộp đen ghi journal mỗi
+  60 s (10 s khi máy căng tải) thay vì mỗi lần đổi phase, để USB không bị ghi liên tục và nóng.
+- **v1.2.016, nhiều GPU:** heartbeat chung cho watchdog. Trước đó GPU + iGPU bị dừng oan ở phút thứ 5 của pha chạy
+  chồng (`INVALID[startup_stall]`) dù cả hai GPU vẫn chạy đúng.
+- **v1.2.017, pha chạy chồng `max`:** CPU-RAM chạy `nice 10`. Từ C1 mỗi worker RAM đọc/ghi RAM liên tục và các luồng
+  CPU kiểm kết quả GPU bị tụt lại: RTX 5060 Ti trên MAG X870E giảm từ khoảng 1000 MiB/s (trước v1.2) xuống
+  507 MiB/s. Đo trên 3700X + GTX 960: GPU bận 60 → 79 %, công suất 66 → 86 W, CPU-RAM ít hơn 6 % số round.
+- **v1.2.018:** C7 và C8 bên dưới.
+
+### C7 — K của GEMM tự tăng (`done`, v1.2.018)
+
+Mỗi word output mà CPU so chứa 2·K phép tính của GPU. Khi ≥ 2/3 số burst (tối thiểu 4) kể từ lần quyết định trước
+ở trạng thái `VERIFIER_BOUND`, corpus kế tiếp dùng K gấp đôi và số job một nửa, tới K 4096; jobs × K giữ nguyên
+nên VRAM của corpus và công dựng oracle không đổi. Chỉ tăng, không giảm; tắt khi đặt `--matrix-inner`. CPU vẫn so
+toàn bộ từng word với oracle độc lập. Cái giá: lane CPU-verified và bộ quét DRAM được ít thời gian GPU hơn, nên K
+chỉ tăng khi CPU kiểm là giới hạn. GTX 960 chạy cạnh CPU-RAM 12 + 4 luồng: K 286 → 2288 trong 11 s, khoảng
+152 G phép tính được kiểm/s so với 80 G ở K cố định 256. Chi tiết: [mục 3.1 tài liệu GPU](../gpu-vram/GPU_ALGORITHMS_AND_VRAM_VERIFICATION.md).
+
+### C8 — INT8 Tensor core trong test đầy đủ (`done`, v1.2.018)
+
+Chế độ 1 của GPU-VRAM và lớp GPU của COMBINED chạy `--compute-mix all` (u32 → FP32 → INT8; INT8 chỉ trên
+compute capability ≥ 8.0). Bằng chứng: RTX 5060 Ti (CC 12.0), 30 phút, 2,9·10¹¹ kết quả INT8 khớp oracle CPU từng
+bit (2026-10-08). Chưa có lần chạy trên CC 8.x (RTX 30/40): chế độ 2 (Tensor INT8 check) vẫn để kiểm dòng card mới,
+chế độ 3 là test đầy đủ không INT8 cho card bị nghi lỗi phần mềm INT8.
+
+### C9 — GEMM nhiều tầng trên dữ liệu VRAM (`planned`)
+
+**Mục tiêu.** GPU tính nặng hơn nhiều trên mỗi word CPU phải so, và ép cả VRAM lẫn ALU, mà vẫn giữ chuẩn của tài
+liệu GPU: CPU so **toàn bộ** output với một đáp án độc lập, chính xác từng bit, không lấy mẫu.
+
+**Phép tính đề xuất (u32, lấy dư 2³²).** Mỗi job: X₀ = A (N×K) từ corpus; L tầng X_s = X_{s−1} · M_s với M_s là
+ma trận K×K dùng chung cho mọi job, nằm sẵn trong VRAM; cuối cùng Y = X_L · B (K×N) cho output N×N như hiện nay, cộng
+tag generation và word canh như mục 3.3.
+
+| | GEMM hiện nay (K 1024) | C9, L = 4 |
+|---|---|---|
+| Phép tính mỗi job | 2·N²·K ≈ 8,4 M | L·2·N·K² + 2·N²·K ≈ 545 M |
+| Output CPU phải so mỗi job | N² + 4 word (16 KiB) | không đổi |
+| Phép tính trên mỗi word CPU so | ~2 K | ~130 K (gấp ~65 lần) |
+| Dữ liệu trung gian | trong shared memory | X_s ghi/đọc VRAM (N×K mỗi job, 128 MiB mỗi tầng với 512 job) |
+
+- **Điều kiện để lỗi không bị nuốt:** mọi hệ số của M_s và B là số **lẻ**. Với phép lấy dư 2³², lỗi e ở một ô trung
+  gian lan sang cả hàng kế tiếp là e·m; nếu m lẻ thì e·m ≡ 0 chỉ khi e ≡ 0, nên một lỗi đơn ở bất kỳ tầng nào chắc
+  chắn đổi output cuối. (Nếu m chẵn, lỗi e = 2³¹ có thể biến mất.)
+- **Oracle:** CPU tính cả chuỗi bằng vòng lặp vô hướng độc lập, một lần cho mỗi corpus, dựng sẵn ở nền như hiện nay;
+  corpus được GPU tính lại 256 batch với generation khác nhau, nên công CPU chia đều cho 256 lần. Với L = 4 và 512 job:
+  khoảng 275 G phép tính mỗi corpus (vài chục giây trên 4 luồng phụ); cần đo để chắc dựng kịp trên CPU yếu.
+- **Lỗi cài sẵn để kiểm bộ xác thực** (thêm vào `MatrixFault`): lật 1 bit một ô trung gian; bỏ ghi một tầng (đọc lại X
+  cũ); đọc nhầm M của tầng khác; mỗi loại phải ra FAIL.
+- **Báo cáo:** phép tính thứ tư trong vòng luân phiên (`u32-chain`), số phép tính đã kiểm tính riêng; tầng L có thể
+  là bậc tiếp theo của C7 sau K 4096 (L 1 → 2 → 4).
+- **Rủi ro:** công dựng oracle trên CPU ít lõi (giảm số job hoặc L theo máy); kernel tile cơ bản chỉ đạt một phần nhỏ
+  sức GPU (tối ưu tile là việc riêng); batch dài hơn làm bộ điều khiển phản ứng chậm hơn; VRAM dành cho trung gian
+  (2 bộ đệm luân phiên khoảng 256 MiB) bớt khỏi vùng `--vram-max`.
+
+**Cần chốt khi thảo luận:** chỉ u32 trước hay cả FP32 (cần chuẩn hóa để không tràn) và INT8 (trung gian int32 phải gập
+về int8 bằng XOR các byte để lỗi bit cao không bị cắt mất); L cố định hay tự tăng; thêm vào vòng `all` hay thay u32
+thường khi CPU kiểm là giới hạn; ngưỡng chấp nhận.
+
+**Các bước:** C9a oracle CPU, logic thuần và test (điều kiện hệ số lẻ, lan lỗi); C9b kernel CUDA, các lỗi cài sẵn, test
+phần cứng trên GTX 960; C9c đưa vào vòng luân phiên, báo cáo, UI, nối với C7; C9d đo trên máy thật (COMBINED trên
+một máy 9950X3D + RTX 5060 Ti).
+
+### C10 — Compute sweep khả nghịch, GPU tự kiểm (`planned`)
+
+**Mục tiêu.** Lấp thời gian GPU đang rảnh vì chờ CPU kiểm bằng tải ALU + VRAM nặng, tự kiểm trên GPU. Theo đúng quy
+tắc của bộ quét DRAM hiện có (mục 2.5 tài liệu GPU): phần này là **device-verified**, báo riêng, **không bao giờ** cộng
+vào phần CPU đã kiểm; CPU kiểm lại theo checkpoint.
+
+**Phép tính đề xuất.** Trên nửa vùng VRAM của bộ quét: (1) ghi pattern `sweep_word(địa chỉ, khóa)` như hiện nay;
+(2) kernel tiến chạy R vòng một hàm trộn **khả nghịch** trên từng khối 128 bit (cộng, xoay bit, xor với khóa vòng, nhân
+với hằng số lẻ, trộn giữa 4 word) rồi ghi lại VRAM; (3) dữ liệu nằm trong VRAM trong lúc phần còn lại của vùng được
+quét (retention); (4) kernel lùi chạy R vòng nghịch đảo theo thứ tự ngược, so với pattern gốc và đếm word sai trên GPU.
+
+- **Vì sao bắt lỗi chắc chắn:** mọi bước là song ánh trên khối 128 bit, nên một khối bị sai ở bất kỳ thời điểm nào (ALU
+  khi tiến, lật bit khi nằm trong VRAM, ALU khi lùi) cho kết quả cuối khác pattern gốc. Lỗi địa chỉ: pattern là song ánh
+  theo địa chỉ, nên hai địa chỉ trùng một ô thì một trong hai sai.
+- **Kiểm lại trên CPU:** theo chu kỳ (như checkpoint 16 MiB mỗi ~2 s của bộ quét), đọc về một khối ở trạng thái **sau
+  khi tiến** và CPU tự tính hàm tiến bằng mã độc lập để so. Nhờ đó chứng minh GPU tính đúng, chứ không chỉ "đi rồi về
+  khớp nhau" (một ALU hỏng theo cách nhất quán ở cả hai chiều vẫn bị bắt). Sai ở checkpoint là FAIL phase
+  `compute-sweep-checkpoint`; GPU đếm sai là FAIL phase `compute-sweep`.
+- **Chia thời gian:** dùng chung stream và duty của bộ quét DRAM. Duty tăng (ví dụ 0,25 → 0,75) chỉ khi CPU kiểm là
+  giới hạn (`VERIFIER_BOUND`), để không lấy thời gian của GEMM CPU-verified khi GPU tự là giới hạn. R điều chỉnh tỉ lệ
+  ALU / băng thông DRAM.
+- **Lỗi cài sẵn:** lật bit trạng thái giữa tiến và lùi; sai khóa vòng khi lùi; bỏ qua một khối khi tiến; làm hỏng
+  checkpoint; mỗi loại phải ra FAIL.
+- **Báo cáo và UI:** dòng `COMPUTE SWEEP` (phép tính device-verified/s, số pass, checkpoint CPU đã kiểm); report
+  `async_compute.compute_sweep` và `detection.coverage.device_verified_compute_ops`, tách khỏi số CPU-verified.
+- **Rủi ro:** bằng chứng yếu hơn phần CPU kiểm toàn bộ (vì vậy báo tách); kernel mỗi lần gửi phải ngắn (≤ ~50 ms) để
+  bộ điều khiển còn phản ứng; chỉ CUDA lúc đầu (Vulkan chưa có bộ quét).
+
+**Cần chốt khi thảo luận:** hàm trộn cụ thể và R; chính sách duty (cố định hay theo `VERIFIER_BOUND`); có thay hẳn
+pattern đơn giản của bộ quét DRAM hiện tại hay chạy xen; ngưỡng chấp nhận.
+
+**Các bước:** C10a hàm trộn và nghịch đảo trong `gpu-engine` cùng test thuộc tính (lùi ∘ tiến = đồng nhất, đổi 1 bit
+lan khắp khối); C10b kernel CUDA tiến/lùi + kiểm, gắn vào stream của bộ quét; C10c chính sách duty, checkpoint CPU, báo
+cáo, UI; C10d đo trên máy thật.
+
+**Thứ tự đề xuất:** đo COMBINED v1.2.018 trên một máy thật trước, để biết sau C7 + `nice 10` GPU còn chờ CPU tới đâu.
+Rồi C9 (tăng phần CPU-verified, chuẩn mạnh nhất) trước C10 (device-verified, lấp phần rảnh còn lại).
+
 ## Quyết định
 
 | Chủ đề | Quyết định | Trạng thái |
@@ -465,6 +576,10 @@ bỏ phần nào của C6:
 | C6 boost | Bước không đạt gần xung tối đa ghi NOTE "không đạt boost", không tính FAIL | đã chốt (2026-10-13) |
 | C6 menu [1] CPU + RAM | Full: A đầu phiên, khoảng 6 phút trong 30 phút; Safe: không xoay | đã chốt (2026-10-13) |
 | C6 menu [4] | Power-sweep giữ nguyên | đã chốt (2026-10-13) |
+| Pha chạy chồng `max` | CPU-RAM `nice 10` (không dành luồng riêng cho GPU: dành luồng thì GPU hồi phục ít hơn và mất nửa oracle) | đã chốt (2026-10-15) |
+| C7 | K tự tăng khi CPU kiểm là giới hạn, chỉ tăng, jobs × K giữ nguyên, tối đa 4096 | đã chốt (2026-10-15) |
+| C8 | INT8 Tensor vào chế độ 1 và COMBINED sau bằng chứng RTX 5060 Ti; chế độ 3 = không INT8 | đã chốt (2026-10-15) |
+| C9, C10 | Giữ chuẩn: CPU-verified chỉ khi CPU so toàn bộ với oracle độc lập; device-verified báo riêng. Không dùng tổng kiểm tra kiểu ABFT/Freivalds, FP16/BF16 hay thuật toán không có đáp án chính xác từng bit | đã chốt hướng (2026-10-15), chi tiết cần thảo luận |
 | V0b | Version trong report và `fail-summary.csv`; file cũ không chuyển đổi, thiếu `dit_version` (trước 2026-10-13) là v1.1; CSV dạng cũ đổi tên `fail-summary-v1.1.csv` | đã chốt (2026-10-13) |
 
 ## Thứ tự triển khai
@@ -475,6 +590,8 @@ bỏ phần nào của C6:
 4. C4: binary v3/v4 và cơ chế tự chọn (`done`, v1.2.010).
 5. C5: các kernel mới (`done`, v1.2.011).
 6. C6: xoay từng lõi (`done`, v1.2.012). B không cần sửa lớp GPU (đã đo).
+7. C7 + C8: K tự tăng, INT8 trong test đầy đủ (`done`, v1.2.018).
+8. Đo COMBINED v1.2.018 trên máy thật, rồi C9 → C10 sau khi thảo luận.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.
