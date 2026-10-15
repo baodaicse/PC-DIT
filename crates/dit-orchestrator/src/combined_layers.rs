@@ -460,11 +460,9 @@ fn cpu_live(dir: &Path) -> LiveLayer {
     }
 }
 
-/// GPU progress snapshots: one file for one GPU, one per `device-N/` with several.
+/// GPU progress snapshots: one file for one GPU, one per `device-N/` with several (the top file
+/// is then the watchdog's heartbeat of them all, not a GPU).
 fn gpu_snapshots(dir: &Path) -> Vec<serde_json::Value> {
-    if let Some(single) = json(&dir.join("progress.json")) {
-        return vec![single];
-    }
     let mut devices: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -479,7 +477,12 @@ fn gpu_snapshots(dir: &Path) -> Vec<serde_json::Value> {
         })
         .unwrap_or_default();
     devices.sort();
-    devices.iter().filter_map(|path| json(path)).collect()
+    let devices: Vec<serde_json::Value> = devices.iter().filter_map(|path| json(path)).collect();
+    if devices.is_empty() {
+        json(&dir.join("progress.json")).into_iter().collect()
+    } else {
+        devices
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -860,6 +863,34 @@ pub fn tree_memory(root: u32) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_gpus_are_read_from_their_device_files_not_the_heartbeat() {
+        let dir = std::env::temp_dir().join(format!("dit-combined-gpus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("device-1")).unwrap();
+        std::fs::create_dir_all(dir.join("device-2")).unwrap();
+        std::fs::write(
+            dir.join("progress.json"),
+            r#"{"state":"RUNNING","devices":2}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("device-1/progress.json"), r#"{"name":"A"}"#).unwrap();
+        std::fs::write(dir.join("device-2/progress.json"), r#"{"name":"B"}"#).unwrap();
+        let names = |dir: &Path| {
+            gpu_snapshots(dir)
+                .iter()
+                .map(|snapshot| snapshot["name"].as_str().unwrap_or("").to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&dir), ["A", "B"]);
+        // One GPU: its own snapshot is the top file.
+        std::fs::remove_dir_all(dir.join("device-1")).unwrap();
+        std::fs::remove_dir_all(dir.join("device-2")).unwrap();
+        std::fs::write(dir.join("progress.json"), r#"{"name":"solo"}"#).unwrap();
+        assert_eq!(names(&dir), ["solo"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_refusal_is_invalid_and_a_signal_is_a_crash() {

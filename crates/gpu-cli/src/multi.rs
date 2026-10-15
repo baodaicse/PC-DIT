@@ -17,7 +17,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
@@ -439,15 +439,21 @@ fn run_multi(
     let mut snapshots = selected.iter().map(initial_snapshot).collect::<Vec<_>>();
     merge_parent_telemetry(&mut snapshots, &parent_telemetry);
     let mut cancel_started = None;
+    let mut heartbeat = args.progress_file.clone().map(Heartbeat::new);
     loop {
         let mut running = 0_usize;
+        let mut written = Vec::with_capacity(tasks.len());
         for (position, task) in tasks.iter_mut().enumerate() {
             if let Some(snapshot) = read_progress(&task.progress_path) {
                 snapshots[position] = snapshot;
             }
             if task.child.try_wait()?.is_none() {
                 running += 1;
+                written.push(modified(&task.progress_path));
             }
+        }
+        if let Some(heartbeat) = heartbeat.as_mut() {
+            heartbeat.beat(&written, &snapshots, started.elapsed());
         }
         if last_parent_telemetry.elapsed() >= Duration::from_secs(1) {
             let latest = gpu_feed.samples();
@@ -617,6 +623,62 @@ fn initial_snapshot(info: &VulkanDeviceInfo) -> GpuProgressSnapshot {
         telemetry_source: "waiting for worker telemetry".to_owned(),
         hardware_note: None,
     }
+}
+
+/// The parent's own `--progress-file` with several GPUs: the watchdog's heartbeat (each worker's
+/// snapshot is `device-N/progress.json`). It moves only once every running worker has written
+/// its progress since the last move, so one GPU stuck in its driver still stops it.
+struct Heartbeat {
+    path: PathBuf,
+    floor: Option<SystemTime>,
+}
+
+impl Heartbeat {
+    fn new(path: PathBuf) -> Self {
+        Self { path, floor: None }
+    }
+
+    /// `written`: when each running worker last wrote its progress (`None`: not yet).
+    fn beat(
+        &mut self,
+        written: &[Option<SystemTime>],
+        snapshots: &[GpuProgressSnapshot],
+        elapsed: Duration,
+    ) {
+        let Some(floor) = heartbeat_floor(written) else {
+            return;
+        };
+        if self.floor.is_some_and(|last| floor <= last) {
+            return;
+        }
+        self.floor = Some(floor);
+        let body = serde_json::json!({
+            "state": "RUNNING",
+            "devices": snapshots.len(),
+            "running": written.len(),
+            "elapsed_seconds": elapsed.as_secs_f64(),
+            "failures": snapshots
+                .iter()
+                .map(|snapshot| snapshot.failures)
+                .fold(0_u64, u64::saturating_add),
+        });
+        let temporary = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        if std::fs::write(&temporary, format!("{body}\n")).is_ok() {
+            let _ = std::fs::rename(&temporary, &self.path);
+        }
+    }
+}
+
+/// The oldest of the running workers' last progress writes: the heartbeat moves when it does.
+/// `None` while a worker has not written yet, or none runs.
+fn heartbeat_floor(written: &[Option<SystemTime>]) -> Option<SystemTime> {
+    written.iter().copied().min().flatten()
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 fn read_progress(path: &Path) -> Option<GpuProgressSnapshot> {
@@ -1171,6 +1233,38 @@ mod tests {
                 memory_budget_supported: true,
             })
             .collect()
+    }
+
+    #[test]
+    fn the_heartbeat_moves_only_when_every_running_gpu_has_moved() {
+        let dir = std::env::temp_dir().join(format!("dit-gpu-heartbeat-{}", std::process::id()));
+        create_dir_all(&dir).unwrap();
+        let path = dir.join("progress.json");
+        let snapshots = devices(2).iter().map(initial_snapshot).collect::<Vec<_>>();
+        let at = |seconds: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+        let mut heartbeat = Heartbeat::new(path.clone());
+        // A worker that has not written yet holds it.
+        heartbeat.beat(&[at(10), None], &snapshots, Duration::from_secs(1));
+        assert!(!path.exists());
+        heartbeat.beat(&[at(10), at(11)], &snapshots, Duration::from_secs(2));
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("\"devices\":2"), "{first}");
+        // Both wrote after the beat at 10 (the second at 11): one more beat, at 11.
+        std::fs::remove_file(&path).unwrap();
+        heartbeat.beat(&[at(20), at(11)], &snapshots, Duration::from_secs(3));
+        assert!(path.exists());
+        // Then the second GPU is stuck at 11 while the first goes on: no new beat.
+        std::fs::remove_file(&path).unwrap();
+        heartbeat.beat(&[at(30), at(11)], &snapshots, Duration::from_secs(4));
+        assert!(!path.exists());
+        // Both moved: it beats again.
+        heartbeat.beat(&[at(30), at(31)], &snapshots, Duration::from_secs(5));
+        assert!(path.exists());
+        // A worker that ended no longer counts.
+        std::fs::remove_file(&path).unwrap();
+        heartbeat.beat(&[at(40)], &snapshots, Duration::from_secs(6));
+        assert!(path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
