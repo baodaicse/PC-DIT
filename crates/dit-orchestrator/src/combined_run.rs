@@ -887,14 +887,20 @@ impl Session<'_> {
                 } else {
                     CpuSplit::Measured
                 };
-                layers::cpu_ram(
+                let launch = layers::cpu_ram(
                     self.menu,
                     &dir,
                     seconds,
                     &split,
                     &memory,
                     self.settings.memory.reserve_bytes / MIB,
-                )
+                );
+                // In the overlap the GPU, SSD and chain feeders come first (ThreadPlan).
+                if overlap {
+                    layers::niced(launch, self.threads.cpu_ram_nice)
+                } else {
+                    launch
+                }
             }
             Layer::Gpu => layers::gpu(
                 self.menu,
@@ -2181,8 +2187,8 @@ impl Session<'_> {
             combined::session_verdict(&outcomes, completed)
         };
         let report = CombinedReport {
-            // v2: dit_version.
-            schema_version: 2,
+            // v2: dit_version. v3: threads.cpu_ram_nice.
+            schema_version: 3,
             dit_version: dit_contracts::DIT_VERSION,
             module_id: combined::COMBINED_MODULE_ID,
             run_id: &self.run_id,

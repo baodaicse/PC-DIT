@@ -257,7 +257,13 @@ phần RAM do GPU/SSD/chuỗi giữ được kiểm bằng oracle của chúng t
 ### 6.3 Luồng CPU (chỉ khác nhau giữa `balanced` và `max`)
 
 Ví dụ 16 luồng, `balanced`: CPU-RAM 6, compute-oracle 2, verifier GPU 3–4, pool SSD 2–3, `dit-chain` 1, OS/UI 1. Ở
-`max`, mỗi engine lấy mặc định của nó và để hệ điều hành chia.
+`max`, mỗi engine lấy mặc định của nó và để hệ điều hành chia; riêng lớp CPU-RAM trong overlap chạy `nice 10`
+(`ThreadPlan.cpu_ram_nice`, từ v1.2.017). Lý do: CPU-RAM chiếm đủ mọi luồng, và từ v1.2 C1 mỗi worker đọc/ghi RAM
+liên tục (nhanh gấp ~3,4 lần), nên ở cùng độ ưu tiên các luồng CPU kiểm kết quả của GPU bị tụt lại và GPU phải chờ.
+Đo trên 3700X + GTX 960 (overlap kiểu `max`, 60 s): ưu tiên ngang nhau GPU bận 60 %, 66 W, 157 M phép ma trận được
+kiểm/s; CPU-RAM `nice 10` thì 79 %, 86 W, 246 M/s, còn CPU-RAM chỉ ít hơn 6 % số round và vẫn lấp mọi chu kỳ còn
+trống. Dành hẳn luồng riêng cho GPU (thử 4 luồng, hoặc 2 core trọn) chỉ được 70–71 %, 77 W và oracle mất một nửa,
+vì thứ bị giành chủ yếu là băng thông RAM chứ không phải số core.
 
 ### 6.4 Rủi ro và cách giảm
 

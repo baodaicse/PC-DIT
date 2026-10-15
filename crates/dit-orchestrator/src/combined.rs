@@ -347,7 +347,17 @@ pub struct ThreadPlan {
     pub ssd_workers: Option<usize>,
     pub chain_threads: usize,
     pub os_threads: usize,
+    /// Niceness of the CPU-RAM layer in the overlap (`max`: 10). Its workers fill every thread
+    /// there, and since v1.2 C1 they keep the memory bus busy: at the same priority the GPU
+    /// test's CPU verifiers fell behind and the GPU waited (on a 3700X + GTX 960: busy 60%,
+    /// 66 W; at niceness 10: 79%, 86 W, CPU-RAM 6% fewer rounds). It still takes every cycle the
+    /// others leave, so the CPU stays fully loaded. `balanced` gives each layer its own threads.
+    #[serde(default)]
+    pub cpu_ram_nice: i32,
 }
+
+/// [`ThreadPlan::cpu_ram_nice`] at `max`.
+pub const MAX_CPU_RAM_NICE: i32 = 10;
 
 #[must_use]
 pub fn plan_threads(logical: usize, intensity: Intensity, available: Available) -> ThreadPlan {
@@ -364,6 +374,7 @@ pub fn plan_threads(logical: usize, intensity: Intensity, available: Available) 
                 ssd_workers: None,
                 chain_threads: chain,
                 os_threads: 0,
+                cpu_ram_nice: MAX_CPU_RAM_NICE,
             }
         }
         Intensity::Balanced => {
@@ -388,6 +399,7 @@ pub fn plan_threads(logical: usize, intensity: Intensity, available: Available) 
                 ssd_workers: available.ssd.then_some(ssd),
                 chain_threads: chain,
                 os_threads: os,
+                cpu_ram_nice: 0,
             }
         }
     }
@@ -742,6 +754,9 @@ mod tests {
         let max = plan_threads(16, Intensity::Max, ALL);
         assert_eq!((max.cpu_ram_workers, max.cpu_oracle_workers), (12, 4));
         assert_eq!(max.gpu_verifier_max, None);
+        // At max CPU-RAM gives way to the GPU, SSD and chain feeders; balanced shares threads.
+        assert_eq!(max.cpu_ram_nice, MAX_CPU_RAM_NICE);
+        assert_eq!(plan.cpu_ram_nice, 0);
     }
 
     #[test]

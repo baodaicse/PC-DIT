@@ -63,6 +63,26 @@ pub struct Launch {
     pub activity: Option<PathBuf>,
 }
 
+/// `launch` run at `niceness` (coreutils `nice`, which execs it: the watchdog follows the same
+/// process). Zero leaves it as it is.
+#[must_use]
+pub fn niced(launch: Launch, niceness: i32) -> Launch {
+    if niceness == 0 {
+        return launch;
+    }
+    let mut args = words(&["-n"]);
+    args.push(niceness.to_string().into());
+    args.push(launch.program.into_os_string());
+    args.extend(launch.args);
+    Launch {
+        program: PathBuf::from(NICE_PROGRAM),
+        args,
+        ..launch
+    }
+}
+
+const NICE_PROGRAM: &str = "/usr/bin/nice";
+
 fn words(items: &[&str]) -> Vec<OsString> {
     items.iter().map(OsString::from).collect()
 }
@@ -863,6 +883,52 @@ pub fn tree_memory(root: u32) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_niced_launch_runs_the_same_command_through_nice() {
+        let launch = Launch {
+            program: PathBuf::from("/opt/cpu-dit-01/dit-cli"),
+            args: words(&["system-run", "--workers", "24"]),
+            env: vec![("A".to_owned(), "1".to_owned())],
+            current_dir: None,
+            heartbeat: Some(PathBuf::from("/run/x/progress.json")),
+            activity: None,
+        };
+        let mut niced = niced(launch, 10);
+        // Arguments added later (the overlap's negative gate) still reach the engine.
+        niced.args.push("--inject-simd-worker".into());
+        assert_eq!(niced.program, PathBuf::from("/usr/bin/nice"));
+        assert_eq!(
+            niced.args,
+            words(&[
+                "-n",
+                "10",
+                "/opt/cpu-dit-01/dit-cli",
+                "system-run",
+                "--workers",
+                "24",
+                "--inject-simd-worker"
+            ])
+        );
+        assert_eq!(niced.heartbeat, Some(PathBuf::from("/run/x/progress.json")));
+        assert_eq!(niced.env.len(), 1);
+        let plain = niced_or_not(0);
+        assert_eq!(plain.program, PathBuf::from("/opt/cpu-dit-01/dit-cli"));
+    }
+
+    fn niced_or_not(niceness: i32) -> Launch {
+        niced(
+            Launch {
+                program: PathBuf::from("/opt/cpu-dit-01/dit-cli"),
+                args: Vec::new(),
+                env: Vec::new(),
+                current_dir: None,
+                heartbeat: None,
+                activity: None,
+            },
+            niceness,
+        )
+    }
 
     #[test]
     fn several_gpus_are_read_from_their_device_files_not_the_heartbeat() {
