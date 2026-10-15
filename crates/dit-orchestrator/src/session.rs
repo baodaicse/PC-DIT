@@ -9,6 +9,7 @@ use crate::fault_ledger::{CsvCounts, CsvMeta};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -224,25 +225,122 @@ pub enum Claim {
     Taken(String),
 }
 
-/// Where the claim of `run_id` lives: on the results volume when there is one (it outlives the
-/// session), else in the session directory.
+/// Whether the results volume at `results_root` can take writes now. A plain directory (a
+/// development run) counts as a volume. A mount point counts only while the device behind it is
+/// still there: once the USB stick is pulled its mount stays, but every write to it fails. The
+/// image boots into RAM (`toram`) precisely so that the stick can come out at any time; tests
+/// then go on, their results kept in tmpfs.
 #[must_use]
-pub fn claim_path(results_root: &Path, root: &Path, run_id: &str) -> PathBuf {
-    if results_root.is_dir() {
-        results_root.join("claims").join(format!("{run_id}.claim"))
-    } else {
-        root.join(run_id).join("result.claim")
+pub fn volume_alive(results_root: &Path) -> bool {
+    if !results_root.is_dir() {
+        return false;
+    }
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    match mount_entry(&mountinfo, results_root) {
+        // The node must still be there and still be the mounted device: another stick plugged in
+        // later can be given the same name.
+        Some((device, source)) if source.starts_with("/dev/") => {
+            fs::metadata(&source).is_ok_and(|node| {
+                node.file_type().is_block_device() && device_text(node.rdev()) == device
+            })
+        }
+        // Not a mount point (a plain directory), or a source that is not a device node.
+        _ => true,
     }
 }
 
-/// Claims the result of `run_id` for `by`; the first caller wins.
+/// The device (`major:minor`) and source of the mount at `mount_point` in `/proc/self/mountinfo`
+/// text (the last one wins, as a newer mount hides an older one there).
+fn mount_entry(mountinfo: &str, mount_point: &Path) -> Option<(String, String)> {
+    let wanted = mount_point.to_string_lossy();
+    let wanted = wanted.trim_end_matches('/');
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(" - ")?;
+            let mut fields = before.split_whitespace();
+            let device = fields.nth(2)?;
+            let point = fields.nth(1)?;
+            let source = after.split_whitespace().nth(1)?;
+            (unescape_mount(point) == wanted).then(|| (device.to_owned(), unescape_mount(source)))
+        })
+        .next_back()
+}
+
+/// `major:minor` of a device number, as `/proc/self/mountinfo` writes it.
+fn device_text(rdev: u64) -> String {
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+    format!("{major}:{minor}")
+}
+
+/// `/proc/self/mountinfo` writes spaces and the like as `\040` octal escapes.
+fn unescape_mount(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && let Ok(value) = u8::from_str_radix(&text[index + 1..index + 4], 8)
+        {
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The session's own claim, in its tmpfs directory: there for as long as the machine runs,
+/// whatever happens to the results volume.
+fn session_claim_path(root: &Path, run_id: &str) -> PathBuf {
+    root.join(run_id).join("result.claim")
+}
+
+/// The durable copy of the claim on the results volume: it outlives the session, so the next
+/// boot's post-mortem knows the session got its result.
+fn volume_claim_path(results_root: &Path, run_id: &str) -> PathBuf {
+    results_root.join("claims").join(format!("{run_id}.claim"))
+}
+
+/// Claims the result of `run_id` for `by`; the first caller wins. The decision is the session's
+/// tmpfs claim, so a pulled USB stick cannot make every caller lose (a failing write to the stick
+/// once read as "someone else wrote it", and nobody wrote the result). A live volume also gets a
+/// durable copy; a claim already there (written before this boot) wins over this one. A claim
+/// that cannot be written anywhere lets the caller write: a row twice beats no row.
 #[must_use]
 pub fn claim(results_root: &Path, root: &Path, run_id: &str, by: &str) -> Claim {
-    let path = claim_path(results_root, root, run_id);
-    if let Some(parent) = path.parent() {
+    let local = session_claim_path(root, run_id);
+    if let Some(parent) = local.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
+    if let Ok(false) = create_claim(&local, by) {
+        return Claim::Taken(claimed_by(results_root, root, run_id).unwrap_or_default());
+    }
+    if volume_alive(results_root) {
+        let durable = volume_claim_path(results_root, run_id);
+        if let Some(parent) = durable.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(false) = create_claim(&durable, by) {
+            let who = fs::read_to_string(&durable)
+                .ok()
+                .map(|text| text.lines().next().unwrap_or_default().to_owned())
+                .unwrap_or_default();
+            return Claim::Taken(who);
+        }
+        // Any other error: the volume is failing; the session's claim stands.
+    }
+    Claim::Won
+}
+
+/// Creates the claim file `path` for `by`: `Ok(true)` created, `Ok(false)` it already exists,
+/// `Err` it could not be written.
+fn create_claim(path: &Path, by: &str) -> io::Result<bool> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut file) => {
             let _ = writeln!(file, "{by}\n{}", unix_ms());
             let _ = file.sync_all();
@@ -251,16 +349,24 @@ pub fn claim(results_root: &Path, root: &Path, run_id: &str, by: &str) -> Claim 
             {
                 let _ = dir.sync_all();
             }
-            Claim::Won
+            Ok(true)
         }
-        Err(_) => Claim::Taken(claimed_by(results_root, root, run_id).unwrap_or_default()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
-/// Who claimed `run_id`'s result, if anyone.
+/// Who claimed `run_id`'s result, if anyone: the session's claim, else the volume's (a session
+/// of an earlier boot).
 #[must_use]
 pub fn claimed_by(results_root: &Path, root: &Path, run_id: &str) -> Option<String> {
-    let text = fs::read_to_string(claim_path(results_root, root, run_id)).ok()?;
+    let text = fs::read_to_string(session_claim_path(root, run_id))
+        .ok()
+        .or_else(|| {
+            volume_alive(results_root)
+                .then(|| fs::read_to_string(volume_claim_path(results_root, run_id)).ok())
+                .flatten()
+        })?;
     Some(text.lines().next().unwrap_or_default().to_owned())
 }
 
@@ -327,12 +433,63 @@ mod tests {
             Claim::Taken("blackbox".to_owned())
         );
         assert!(results.join("claims/suite-2.claim").is_file());
-        // Without a results volume the claim stays with the session.
+        // The session's own claim decides; without a results volume there is no durable copy.
         assert_eq!(
             claim(&root.join("none"), &root, "suite-3", "app"),
             Claim::Won
         );
         assert!(root.join("suite-3/result.claim").is_file());
+        // A claim the volume kept from an earlier boot wins over a fresh one (the post-mortem).
+        fs::write(results.join("claims/suite-4.claim"), "app\n1\n").unwrap();
+        assert_eq!(
+            claim(&results, &root, "suite-4", "blackbox"),
+            Claim::Taken("app".to_owned())
+        );
+        // No session claim can be made (a post-mortem in a test): the volume's decides.
+        let blocked = root.join("blocked");
+        fs::write(&blocked, "").unwrap();
+        assert_eq!(claim(&results, &blocked, "suite-5", "app"), Claim::Won);
+        assert_eq!(
+            claim(&results, &blocked, "suite-5", "blackbox"),
+            Claim::Taken("app".to_owned())
+        );
+        // Nowhere to write a claim: the result is still written.
+        assert_eq!(
+            claim(&root.join("none"), &blocked, "suite-6", "app"),
+            Claim::Won
+        );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_pulled_stick_is_told_by_its_mount_source() {
+        let mountinfo = "\
+22 1 0:21 / /run rw,nosuid shared:5 - tmpfs tmpfs rw
+96 30 8:3 / /mnt/cpu-dit-results rw,nosuid shared:50 - vfat /dev/sdb3 rw,fmask=0077
+97 30 8:4 / /mnt/with\\040space rw shared:51 - vfat /dev/sdb4 rw";
+        let entry = |point: &str| mount_entry(mountinfo, Path::new(point));
+        let sdb = |device: &str, source: &str| Some((device.to_owned(), source.to_owned()));
+        assert_eq!(entry("/mnt/cpu-dit-results"), sdb("8:3", "/dev/sdb3"));
+        assert_eq!(entry("/mnt/cpu-dit-results/"), sdb("8:3", "/dev/sdb3"));
+        assert_eq!(entry("/mnt/with space"), sdb("8:4", "/dev/sdb4"));
+        assert_eq!(entry("/mnt/other"), None);
+        // sdb3 is 8:19 and the 259 block major (NVMe partitions) goes past 8 bits.
+        assert_eq!(device_text(0x813), "8:19");
+        assert_eq!(device_text((259 << 8) | 5), "259:5");
+        // A mounted device of this machine is alive.
+        let here = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        if let Some(point) = here.lines().find_map(|line| {
+            let point = line.split_whitespace().nth(4)?;
+            let source = line.split_once(" - ")?.1.split_whitespace().nth(1)?;
+            (source.starts_with("/dev/") && Path::new(source).exists())
+                .then(|| unescape_mount(point))
+        }) {
+            assert!(volume_alive(Path::new(&point)), "{point}");
+        }
+        // A plain directory is a volume (development runs); a missing one is not.
+        let dir = temp("volume");
+        assert!(volume_alive(&dir));
+        assert!(!volume_alive(&dir.join("absent")));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

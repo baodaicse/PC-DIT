@@ -71,3 +71,22 @@ fn a_worker_doing_nothing_is_stalled_one_still_working_is_slow() {
     assert_eq!(record["state"], "STARTUP_STALLED");
     std::fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn a_pulled_results_stick_does_not_end_the_test() {
+    let base = std::env::temp_dir().join(format!("dit-marker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    // The marker's folder cannot be made, as on a stick pulled out under its mount point.
+    std::fs::write(base.join("gone"), "").unwrap();
+    let marker = base.join("gone/watchdog/t-cpu-ram.json");
+    let (code, record) = supervise(
+        &base.join("run"),
+        "cpu-ram",
+        &["--recovery-marker", marker.to_str().unwrap()],
+        "touch HB; exit 0",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(record["state"], "PASSED");
+    std::fs::remove_dir_all(base).unwrap();
+}

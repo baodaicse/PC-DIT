@@ -92,6 +92,39 @@ grep -Fq 'if mount_result_partition; then' "$RUNNER"
 grep -Fq 'MENU_ARGS+=(--results-root /mnt/cpu-dit-results)' "$RUNNER"
 grep -Fq 'MENU_ARGS+=(--results-root /run/dit-suite-no-persistent-results)' "$RUNNER"
 
+# --- The USB stick can be pulled at any time (the image runs from RAM) ---
+# A run writes in tmpfs and is copied to the stick when it ends, if the stick is still in.
+REMOUNT="$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/results-remount.sh"
+bash -n "$REMOUNT"
+grep -Fq 'RUN_DIR="/run/cpu-dit-results/$SESSION_ID"' "$RUNNER"
+if grep -Eq '^[[:space:]]*RUN_DIR="/mnt/' "$RUNNER"; then
+    printf 'FAIL: the runner must not write its run on the stick while the test runs\n' >&2
+    exit 1
+fi
+grep -Fq 'results_volume_alive /mnt/cpu-dit-results' "$RUNNER"
+grep -Fq 'echo "Reports saved to: $RESULT_DIR"' "$RUNNER"
+grep -Fq 'MENU_ARGS+=(--results-remount /usr/local/lib/cpu-dit/results-remount.sh)' "$RUNNER"
+grep -Fq 'umount -l /mnt/cpu-dit-results' "$PARTITION_LOOKUP"
+# A stick pulled mid-write is repaired before it is mounted again.
+grep -Fq 'fsck.fat -a -w "$result_device"' "$PARTITION_LOOKUP"
+grep -Fxq '    dosfstools' "$ROOT_DIR/tools/build_boot_image.sh"
+# An unmounted mount point would read as a volume (a plain directory): it is removed.
+[[ "$(grep -c 'rmdir /mnt/cpu-dit-results' "$PARTITION_LOOKUP")" -ge 3 ]]
+grep -Fq 'mount_result_partition' "$REMOUNT"
+grep -Fq 'results-remount.sh' "$ROOT_DIR/tools/build_boot_image.sh"
+grep -Fq 'if results_volume_alive "$WATCHDOG_RESULTS_ROOT"; then' "$UI"
+grep -Fq "saved=\"\$(grep '^Reports saved to: '" "$UI"
+# A plain directory is a volume, a missing one is not, a mounted device is.
+(
+    . "$PARTITION_LOOKUP"
+    probe="$(mktemp -d)"
+    results_volume_alive "$probe"
+    if results_volume_alive "$probe/absent"; then exit 1; fi
+    rmdir "$probe"
+    root_source="$(findmnt -nro SOURCE --mountpoint / 2>/dev/null || true)"
+    if [[ -b "$root_source" ]]; then results_volume_alive /; fi
+)
+
 # --- NVIDIA driver package: install-at-boot alternative to the baked nvidia-image flavor ---
 grep -Fq '. /usr/local/lib/cpu-dit/partition-lookup.sh' "$RUNNER"
 grep -Fq 'find_boot_device()' "$PARTITION_LOOKUP"

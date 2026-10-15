@@ -1758,7 +1758,7 @@ impl Session<'_> {
     /// One row of `fail-summary.csv` on the results volume (in the session directory without it).
     fn append_fail_summary(&self, verdict: &str, report: &Path) -> String {
         let root = &self.menu.results_root;
-        let path = if root.is_dir() {
+        let path = if dit_orchestrator::session::volume_alive(root) {
             root.join("fail-summary.csv")
         } else {
             self.dir.join("fail-summary.csv")
@@ -2223,7 +2223,7 @@ impl Session<'_> {
     /// Copies the session directory once to the results volume (`runs/<id>/combined`).
     fn persist(&self) -> String {
         let root = &self.menu.results_root;
-        if !root.is_dir() {
+        if !dit_orchestrator::session::volume_alive(root) {
             return format!(
                 "Verified result volume unavailable; artifacts remain in {}",
                 self.dir.display()

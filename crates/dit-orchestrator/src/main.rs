@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::fs::{self, OpenOptions, create_dir, create_dir_all};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitCode};
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,6 +156,11 @@ struct MenuArgs {
     watchdog_binary: PathBuf,
     #[arg(long, default_value = "/mnt/cpu-dit-results")]
     results_root: PathBuf,
+    /// Run before each menu screen while the results volume is gone (its USB stick pulled): it
+    /// mounts the volume again once the stick is back. The image runs from RAM, so the stick can
+    /// come out and go back in at any time.
+    #[arg(long)]
+    results_remount: Option<PathBuf>,
     /// Device nodes belonging to the boot/results medium. Forwarded to CPU-SSD inventory.
     #[arg(long = "protected-device")]
     protected_devices: Vec<PathBuf>,
@@ -349,6 +354,7 @@ fn menu(args: &MenuArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Kept for the whole menu session, so a chosen GPU duration/limit survives going back.
     let mut gpu_settings = GpuSettings::default();
     loop {
+        remount_results(args);
         print!(
             "\x1b[H\x1b[2J{}\nSelection > ",
             dit_ui_core::decorate(&render(args))
@@ -356,9 +362,26 @@ fn menu(args: &MenuArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         io::stdout().flush()?;
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
-        if dispatch(args, &mut gpu_settings, choice.trim())? {
-            return Ok(ExitCode::SUCCESS);
+        // A test that could not start or end cleanly (a file it needed gone with a pulled USB
+        // stick) is said and the control center stays: the operator can run it again.
+        match dispatch(args, &mut gpu_settings, choice.trim()) {
+            Ok(true) => return Ok(ExitCode::SUCCESS),
+            Ok(false) => {}
+            Err(error) => pause(&format!("ERROR: {error}"))?,
         }
+    }
+}
+
+/// Mounts the results volume again when it is gone and `--results-remount` says how.
+fn remount_results(args: &MenuArgs) {
+    if let Some(helper) = &args.results_remount
+        && !dit_orchestrator::session::volume_alive(&args.results_root)
+    {
+        let _ = ProcessCommand::new(helper)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1021,7 +1044,7 @@ where
     for path in activity_paths {
         command.arg("--activity-path").arg(path);
     }
-    if args.results_root.is_dir() {
+    if dit_orchestrator::session::volume_alive(&args.results_root) {
         command.arg("--recovery-marker").arg(recovery_marker_path(
             &args.results_root,
             run_id,
@@ -1042,13 +1065,34 @@ fn recovery_marker_path(results_root: &Path, run_id: &str, module: &str) -> Path
 }
 
 fn interrupted_run_notice(results_root: &Path) -> Option<String> {
+    // A pulled stick still shows the marker of the run it left, cached and never closed.
+    if !dit_orchestrator::session::volume_alive(results_root) {
+        return None;
+    }
+    let booted = boot_unix_ms();
     let markers = fs::read_dir(results_root.join("watchdog")).ok()?;
     markers.filter_map(Result::ok).find_map(|entry| {
         let contents = fs::read(entry.path()).ok()?;
         let marker: WatchdogMarker = serde_json::from_slice(&contents).ok()?;
-        matches!(marker.state.as_str(), "STARTING" | "RUNNING" | "STALLED")
+        // The post-mortem closed the open markers at boot; one this boot left open is a run that
+        // ended while its stick was out (its result was on the screen): nothing to recover.
+        let earlier = marker
+            .started_unix_ms
+            .zip(booted)
+            .is_none_or(|(started, booted)| started < booted);
+        (earlier && matches!(marker.state.as_str(), "STARTING" | "RUNNING" | "STALLED"))
             .then(|| format!("{} {} ({})", marker.module, marker.run_id, marker.state))
     })
+}
+
+/// When this boot started (`btime` in `/proc/stat`).
+fn boot_unix_ms() -> Option<u128> {
+    fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|seconds| seconds.trim().parse::<u128>().ok())
+        .map(|seconds| seconds * 1000)
 }
 
 #[derive(serde::Deserialize)]
@@ -1056,6 +1100,8 @@ struct WatchdogMarker {
     module: String,
     run_id: String,
     state: String,
+    #[serde(default)]
+    started_unix_ms: Option<u128>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1158,7 +1204,10 @@ fn persist_run_artifacts(
     let Ok(results_metadata) = results_root.symlink_metadata() else {
         return Ok(None);
     };
-    if !results_metadata.file_type().is_dir() {
+    // A pulled stick: the run keeps its artifacts in tmpfs.
+    if !results_metadata.file_type().is_dir()
+        || !dit_orchestrator::session::volume_alive(results_root)
+    {
         return Ok(None);
     }
     let files = ARTIFACTS
@@ -1691,6 +1740,26 @@ Fail summary row added to /mnt/cpu-dit-results/fail-summary.csv",
         )
         .unwrap();
         assert!(interrupted_run_notice(&root).is_none());
+        // Left open by a run of this boot (its stick was pulled before the end): not shown.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        std::fs::write(
+            &marker,
+            format!(r#"{{"module":"cpu-ram","run_id":"run","state":"STARTING","started_unix_ms":{now}}}"#),
+        )
+        .unwrap();
+        assert!(interrupted_run_notice(&root).is_none());
+        std::fs::write(
+            &marker,
+            r#"{"module":"cpu-ram","run_id":"run","state":"STARTING","started_unix_ms":1000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            interrupted_run_notice(&root).as_deref(),
+            Some("cpu-ram run (STARTING)")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -166,6 +166,8 @@ if [[ "$PROFILE" == menu ]]; then
         # live telemetry in /run and copies the closed report bundle here once.
         if mount_result_partition; then
             MENU_ARGS+=(--results-root /mnt/cpu-dit-results)
+            # The stick can be pulled and put back: the menu mounts it again before each screen.
+            MENU_ARGS+=(--results-remount /usr/local/lib/cpu-dit/results-remount.sh)
             # FC3b (docs/FAULT_CATCH_ROADMAP.md): a session the last boot left without a result
             # (the whole machine died) gets it now, from its black box journal, the board's
             # reset reason and pstore; the menu shows what was found.
@@ -197,19 +199,36 @@ if [[ "$PROFILE" == menu ]]; then
 fi
 IMAGE_ID="$(</etc/cpu-dit/image-id)"
 SESSION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(cat /proc/sys/kernel/random/uuid)"
-TMP_RESULTS="/run/cpu-dit-results/$SESSION_ID"
-mkdir -p "$TMP_RESULTS"
-RUN_DIR="$TMP_RESULTS"
+# The run writes in tmpfs and its directory is copied to the USB stick once it ends: the image
+# runs from RAM, so the stick can be pulled at any time and a write to its dead mount would fail
+# the test.
+RUN_DIR="/run/cpu-dit-results/$SESSION_ID"
+mkdir -p "$RUN_DIR"
+RESULT_DIR=""
 
 if mount_result_partition; then
-    RUN_DIR="/mnt/cpu-dit-results/runs/$SESSION_ID"
-    mkdir -p "$RUN_DIR"
+    RESULT_DIR="/mnt/cpu-dit-results/runs/$SESSION_ID"
     echo "Result target: verified USB sibling partition"
     echo "Result device: $(findmnt -nro SOURCE /mnt/cpu-dit-results)"
 else
     echo "WARNING: verified USB result partition unavailable."
     echo "Reports will stay in tmpfs only; no internal disk fallback is allowed."
 fi
+
+# Copies the run's directory to the results volume when its stick is still in, then says where
+# the reports are: `Reports:` (tmpfs, read by the UI) and `Reports saved to:` on the stick.
+persist_run_dir() {
+    if [[ -n "$RESULT_DIR" ]] && results_volume_alive /mnt/cpu-dit-results \
+        && mkdir -p "$RESULT_DIR" \
+        && timeout --kill-after=10s 120s cp -R -- "$RUN_DIR/." "$RESULT_DIR/" 2>/dev/null \
+        && timeout --kill-after=10s 60s sync -f "$RESULT_DIR" 2>/dev/null; then
+        echo "Reports saved to: $RESULT_DIR"
+    else
+        [[ -n "$RESULT_DIR" ]] \
+            && echo "WARNING: verified USB result partition unavailable (stick pulled?); reports remain in tmpfs."
+    fi
+    echo "Reports: $RUN_DIR"
+}
 
 echo "Image ID: $IMAGE_ID" | tee "$RUN_DIR/session.txt"
 echo "Profile: $PROFILE" | tee -a "$RUN_DIR/session.txt"
@@ -253,7 +272,7 @@ fi
 
 if [[ "$PROFILE" == shell ]]; then
     echo "Shell-only profile selected; no DIT load was started."
-    sync /mnt/cpu-dit-results 2>/dev/null || true
+    persist_run_dir
     if [[ "${CPU_DIT_RETURN_TO_UI:-0}" == 1 ]]; then
         exit 0
     fi
@@ -294,9 +313,8 @@ if [[ "$PROFILE" == power || "$PROFILE" == power-sweep || "$PROFILE" == power-ca
         echo "power_exit=$POWER_EXIT"
         echo "overall_exit=$POWER_EXIT"
     } | tee "$RUN_DIR/summary.txt"
-    echo "Reports: $RUN_DIR"
+    persist_run_dir
     echo "CPU-DIT BOOT TEST COMPLETE overall_exit=$POWER_EXIT"
-    sync "$RUN_DIR" 2>/dev/null || true
     exit "$POWER_EXIT"
 fi
 
@@ -402,7 +420,7 @@ case "$PROFILE" in
         ;;
     *)
         echo "Unknown cpu_dit_profile '$PROFILE'; refusing to guess." | tee "$RUN_DIR/invalid-profile.txt"
-        sync /mnt/cpu-dit-results 2>/dev/null || true
+        persist_run_dir
         if [[ "${CPU_DIT_RETURN_TO_UI:-0}" == 1 ]]; then
             exit 3
         fi
@@ -479,10 +497,9 @@ fi
     echo "utc_end=$(date -u --iso-8601=seconds)"
 } | tee "$RUN_DIR/summary.txt"
 
-sync /mnt/cpu-dit-results 2>/dev/null || true
 echo
+persist_run_dir
 echo "CPU-DIT BOOT TEST COMPLETE overall_exit=$OVERALL_EXIT"
-echo "Reports: $RUN_DIR"
 if [[ "${CPU_DIT_RETURN_TO_UI:-0}" == 1 ]]; then
     exit "$OVERALL_EXIT"
 fi

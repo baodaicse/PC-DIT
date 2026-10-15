@@ -59,8 +59,28 @@ find_result_partition() {
     return 1
 }
 
+# Whether the results volume at $1 can take writes (dit_orchestrator::session::volume_alive).
+# The image runs from RAM, so the USB stick can be pulled at any time: its mount then stays,
+# every write to it fails, and `mountpoint` / `-d` still say yes. A mount counts only while its
+# device is still the node it names; a plain directory (a development run) counts.
+results_volume_alive() {
+    local root="${1:-/mnt/cpu-dit-results}" source device
+    [[ -d "$root" ]] || return 1
+    mountpoint -q "$root" 2>/dev/null || return 0
+    read -r source device < <(findmnt -nro SOURCE,MAJ:MIN --mountpoint "$root" 2>/dev/null | tail -n 1)
+    [[ "$source" == /dev/* ]] || return 0
+    [[ -b "$source" && "$(stat -Lc '%Hr:%Lr' "$source" 2>/dev/null)" == "$device" ]]
+}
+
+# The mount point exists only while DIT-RESULTS is mounted on it: left as a plain directory (in
+# RAM) it would read as a results volume, and reports "saved" there would be lost at power off.
 mount_result_partition() {
     local result_device expected_id actual_id
+    # A stick pulled out (and maybe put back): its dead mount goes first.
+    if mountpoint -q /mnt/cpu-dit-results && ! results_volume_alive /mnt/cpu-dit-results; then
+        umount -l /mnt/cpu-dit-results 2>/dev/null || true
+        rmdir /mnt/cpu-dit-results 2>/dev/null || true
+    fi
     result_device="$(find_result_partition || true)"
     [[ -n "$result_device" ]] || return 1
     mkdir -p /mnt/cpu-dit-results
@@ -69,13 +89,22 @@ mount_result_partition() {
         mounted_device="$(findmnt -nro SOURCE /mnt/cpu-dit-results 2>/dev/null || true)"
         [[ "$(readlink -f "$mounted_device")" == "$(readlink -f "$result_device")" ]] || return 1
     else
-        mount -o rw,nosuid,nodev,noexec,umask=0077 "$result_device" /mnt/cpu-dit-results \
-            || return 1
+        # A stick pulled out mid-write leaves the FAT half-updated: the first write to it then
+        # fails and the kernel sets the volume read-only. fsck.fat repairs it first (-a: no
+        # questions; it leaves a clean volume as it is).
+        if command -v fsck.fat >/dev/null 2>&1; then
+            timeout --kill-after=5s 60s fsck.fat -a -w "$result_device" >/dev/null 2>&1 || true
+        fi
+        if ! mount -o rw,nosuid,nodev,noexec,umask=0077 "$result_device" /mnt/cpu-dit-results; then
+            rmdir /mnt/cpu-dit-results 2>/dev/null || true
+            return 1
+        fi
     fi
     expected_id="$(</etc/cpu-dit/image-id)"
     actual_id="$(cat /mnt/cpu-dit-results/CPU-DIT-RESULTS.ID 2>/dev/null || true)"
     if [[ -z "$expected_id" || "$actual_id" != "$expected_id" ]]; then
         umount /mnt/cpu-dit-results
+        rmdir /mnt/cpu-dit-results 2>/dev/null || true
         return 1
     fi
     return 0

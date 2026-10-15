@@ -158,7 +158,7 @@ pub fn write_for(
     } else {
         "INVALID"
     };
-    let volume = info.results_root.is_dir();
+    let volume = session::volume_alive(&info.results_root);
     let report = if volume {
         info.results_root
             .join(by)

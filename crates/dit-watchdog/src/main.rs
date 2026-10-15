@@ -269,6 +269,8 @@ struct Supervisor<'a> {
     liveness: Liveness,
     started: SystemTime,
     last_slow_record: Option<SystemTime>,
+    /// The recovery marker could not be written once (the results stick was pulled).
+    marker_lost: std::cell::Cell<bool>,
 }
 
 /// FC2: watches memory while the worker runs and says when to stop it.
@@ -447,6 +449,7 @@ fn supervise(args: &SuperviseArgs) -> Result<ExitCode, Box<dyn std::error::Error
         liveness: Liveness::new(child_id, args.module.ends_with("nvme")),
         started: SystemTime::now(),
         last_slow_record: None,
+        marker_lost: std::cell::Cell::new(false),
     };
     supervisor.write_record(WatchdogState::Starting, None, "worker spawned")?;
     supervisor.write_record(WatchdogState::Running, None, "worker supervision active")?;
@@ -728,13 +731,20 @@ impl Supervisor<'_> {
         // The durable marker is written when the run starts and when it ends, not at every sign
         // of life: rewriting a file on a FAT stick every second left empty markers after a power
         // loss. The black box's append-only journal follows the run in between (FC3a).
+        // The stick may be pulled while the test runs (the image runs from RAM): a marker that
+        // cannot be written is said once and the worker stays supervised.
         if let Some(marker) = &self.args.recovery_marker
             && !matches!(
                 state,
                 WatchdogState::Running | WatchdogState::Stalled | WatchdogState::SlowIo
             )
+            && let Err(error) = write_json_atomic(marker, &record)
+            && !self.marker_lost.replace(true)
         {
-            write_json_atomic(marker, &record)?;
+            eprintln!(
+                "DIT WATCHDOG WARNING: recovery marker {} not written ({error}); the results volume is gone, supervision goes on.",
+                marker.display()
+            );
         }
         Ok(())
     }

@@ -51,6 +51,9 @@ DIAGNOSTIC_PACKAGES=(
     ntfs-3g
     fdisk
     e2fsprogs
+    # fsck.fat: DIT-RESULTS is repaired before it is mounted, as a stick pulled out mid-write
+    # (the image runs from RAM, so that is allowed) leaves its FAT half-updated.
+    dosfstools
     dmidecode
     ethtool
 )
@@ -387,6 +390,8 @@ configure_rootfs() {
         "$ROOTFS/usr/local/lib/cpu-dit/driver-probe.sh"
     sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/partition-lookup.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/partition-lookup.sh"
+    sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/results-remount.sh" \
+        "$ROOTFS/usr/local/lib/cpu-dit/results-remount.sh"
     sudo install -D -m 0644 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-flavor.sh" \
         "$ROOTFS/usr/local/lib/cpu-dit/nvidia-flavor.sh"
     sudo install -D -m 0755 "$ROOT_DIR/image/rootfs/usr/local/lib/cpu-dit/nvidia-driver-install.sh" \

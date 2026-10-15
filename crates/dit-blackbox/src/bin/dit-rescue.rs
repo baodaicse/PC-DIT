@@ -338,7 +338,7 @@ fn save_diagnostics(args: &Args, view: &View) -> String {
     let stamp = outcome::utc_timestamp(session::unix_ms() / 1000)
         .replace([' ', ':'], "-")
         .replace("-+0000", "Z");
-    let dir = if results.is_dir() {
+    let dir = if session::volume_alive(&results) {
         results.join("rescue").join(stamp)
     } else {
         Path::new("/run/dit-rescue").join(stamp)

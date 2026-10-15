@@ -1,8 +1,9 @@
 //! The black box's journal of a session (`docs/FAULT_CATCH_ROADMAP.md`, `FC3a`, `FC3b`): one JSON
-//! line about every 10 s and at every change, appended and synced, never rewritten. A power loss
+//! line every 60 s (10 s while the machine is strained) and at every change that matters,
+//! appended and synced, never rewritten. A power loss
 //! can cut the last line short; readers skip it. The next boot reads a journal that has no
 //! closing line to say how the session ended (`FC3b`).
-use dit_orchestrator::session::SessionInfo;
+use dit_orchestrator::session::{self, SessionInfo};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -16,10 +17,10 @@ pub struct Journal {
     file: Option<File>,
 }
 
-/// The journal of `run_id`: on the results volume when there is one.
+/// The journal of `run_id`: on the results volume when there is one (and its stick is still in).
 #[must_use]
 pub fn path(results_root: &Path, run_id: &str) -> PathBuf {
-    let dir = if results_root.is_dir() {
+    let dir = if session::volume_alive(results_root) {
         results_root.join("blackbox")
     } else {
         PathBuf::from(RUNTIME_DIR)

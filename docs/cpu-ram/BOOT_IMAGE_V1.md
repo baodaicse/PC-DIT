@@ -71,11 +71,26 @@ lần rút USB giữa chừng (hoặc cổng USB lỏng/chập chờn) sẽ làm
 `toram`, sau khi copy xong, toàn bộ hệ điều hành và `dit-cli` chạy hoàn toàn từ
 RAM, không phụ thuộc USB còn cắm hay không trong suốt phần CPU/RAM stress.
 
-`DIT-RESULTS` (nơi ghi report cuối) vẫn là một partition thật trên USB — muốn
-lưu report cần USB vẫn cắm tại các thời điểm ghi (đầu và cuối phiên, xem
-`boot-runner.sh`). Nếu USB bị rút hẳn, phiên test vẫn chạy xong bình thường
-(không crash) nhưng report chỉ còn trong tmpfs và mất khi tắt máy — không có
-fallback sang ổ nội bộ.
+`DIT-RESULTS` (nơi ghi report cuối) vẫn là một partition thật trên USB. USB có
+thể rút ra bất kỳ lúc nào, kể cả giữa lúc test đang chạy:
+
+- Mỗi test ghi report vào tmpfs (`/run/cpu-dit-results/<session>`,
+  `/run/dit-suite/...`), rồi chép một lần sang `DIT-RESULTS/runs/<session>` khi
+  kết thúc, nếu USB vẫn còn cắm. Màn hình kết quả ghi `Reports saved to:` (đã lưu
+  vào USB), hoặc `reports remain in tmpfs` (USB đã rút; report mất khi tắt máy,
+  không fallback sang ổ nội bộ).
+- Khi USB bị rút, mount cũ vẫn còn đó, `-d` và `mountpoint` vẫn báo có, nhưng mọi
+  lần ghi đều lỗi EIO. Vì vậy mọi kiểm tra "có ổ kết quả không" đều đi qua
+  `volume_alive` (Rust, `dit_orchestrator::session`) hoặc `results_volume_alive`
+  (shell, `partition-lookup.sh`): mount chỉ được tính khi node `/dev` mà nó trỏ
+  tới vẫn còn và vẫn là đúng thiết bị (`major:minor`).
+- Các bước ghi lên USB trong lúc test chạy (marker của watchdog, journal hộp đen,
+  claim kết quả, dòng `fail-summary.csv`) đều không làm test thất bại khi ghi
+  lỗi. Claim kết quả quyết định bằng file trong tmpfs, còn bản trên USB chỉ là
+  bản sao.
+- Cắm USB lại: trước mỗi màn hình menu, `dit-suite --results-remount` gỡ mount
+  cũ đã chết rồi mount lại đúng `DIT-RESULTS` (vẫn xác nhận theo Image ID). Từ đó
+  các test sau lại lưu được report lên USB.
 
 `toram` tiêu tốn thêm RAM đúng bằng dung lượng `DIT-BOOT` đã dùng (khoảng 900
 MiB ở image hiện tại) trong suốt phiên; trên máy test thật (16–64+ GiB RAM) mức

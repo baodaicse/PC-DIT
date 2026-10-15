@@ -34,6 +34,14 @@ shared_prompt() {
     printf '%s%s%s' "$c_cyan" "$1" "$c_reset"
 }
 WATCHDOG_RESULTS_ROOT="${CPU_DIT_WATCHDOG_RESULTS_ROOT:-/mnt/cpu-dit-results}"
+# results_volume_alive: whether the results volume still has its USB stick (it can be pulled at
+# any time; the image runs from RAM).
+PARTITION_LOOKUP="${CPU_DIT_PARTITION_LOOKUP:-/usr/local/lib/cpu-dit/partition-lookup.sh}"
+if [[ -r "$PARTITION_LOOKUP" ]]; then
+    . "$PARTITION_LOOKUP"
+else
+    results_volume_alive() { [[ -d "$1" ]]; }
+fi
 AUTO_SECONDS="${CPU_DIT_UI_AUTOSTART_SECONDS:-10}"
 PROFILE_CONFIG="${CPU_DIT_PROFILE_CONFIG:-/etc/cpu-dit/profiles.conf}"
 UI_RUN_DIR="${CPU_DIT_UI_RUN_DIR:-/run}"
@@ -1098,15 +1106,19 @@ show_result() {
 # last screen (verdict and where the reports went, under the progress); otherwise the result
 # screen. Uses run_profile's shared_view, final_frame and run_log.
 run_result() {
-    local verdict="$1" text="$2" color="$3" reports report_row line
+    local verdict="$1" text="$2" color="$3" reports saved report_row line
     local -a rows=() ledger_rows=() csv_rows=() ledger_args=()
     if (( ${shared_view:-0} )) && [[ -s "${final_frame:-}" ]]; then
+        # The runner writes in tmpfs (`Reports:`) and copies there to the stick when it is still
+        # in (`Reports saved to:`).
         reports="$(grep '^Reports: ' "$run_log" 2>/dev/null | tail -n 1)"
         reports="${reports#Reports: }"
-        if grep -q 'verified USB result partition unavailable' "$run_log" 2>/dev/null; then
-            report_row="REPORT   Verified result volume unavailable; reports remain in tmpfs: ${reports:-unknown}"
+        saved="$(grep '^Reports saved to: ' "$run_log" 2>/dev/null | tail -n 1)"
+        saved="${saved#Reports saved to: }"
+        if [[ -n "$saved" ]]; then
+            report_row="REPORT   Reports saved to: $saved"
         else
-            report_row="REPORT   Reports saved to: ${reports:-unknown}"
+            report_row="REPORT   Verified result volume unavailable; reports remain in tmpfs: ${reports:-unknown}"
         fi
         # CPU-RAM: the failures on their component cells and the fail-summary row, as the other
         # tests show them.
@@ -1176,7 +1188,7 @@ run_profile() {
     watchdog_dir="$UI_RUN_DIR/dit-suite/$run_id/$module"
     heartbeat="$watchdog_dir/watchdog-heartbeat.json"
     mkdir -p "$watchdog_dir"
-    if [[ -d "$WATCHDOG_RESULTS_ROOT" ]]; then
+    if results_volume_alive "$WATCHDOG_RESULTS_ROOT"; then
         watchdog_marker=(--recovery-marker "$WATCHDOG_RESULTS_ROOT/watchdog/$run_id-$module.json")
     fi
     # FC2: CPU-RAM holds most of the memory; the watchdog stops it before the machine stalls.

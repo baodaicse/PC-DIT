@@ -71,8 +71,26 @@ struct WatchArgs {
     no_switch: bool,
 }
 
-/// A journal line at least this often while nothing changes.
-const LINE_EVERY: Duration = Duration::from_secs(10);
+/// A journal line at least this often while nothing changes. Each line is synced to the USB
+/// stick: a line every few seconds (each round's `RAM_WRITE` / `RAM_VERIFY`) kept the stick writing,
+/// and hot, for the whole test.
+const LINE_EVERY: Duration = Duration::from_secs(60);
+/// ... and this often while the machine is strained (`strained`): the post-mortem reads the
+/// last line before a hang.
+const LINE_EVERY_STRAINED: Duration = Duration::from_secs(10);
+
+/// Late heartbeat, little memory left or memory pressure: short of the post-mortem's own limits
+/// (60 s, 256 MiB, 20 %), so the journal follows the run into a hang at 10 s. 384 MiB lies under
+/// the 512 MiB a Full test leaves free and over the memory guard's 256 MiB.
+fn strained(
+    heartbeat_age_s: Option<u64>,
+    memory: host::Memory,
+    pressure: Option<host::Pressure>,
+) -> bool {
+    heartbeat_age_s.is_some_and(|age| age >= 20)
+        || (memory.total_bytes > 0 && memory.available_bytes < 384 * 1024 * 1024)
+        || pressure.is_some_and(|pressure| pressure.full_avg10 >= 5.0)
+}
 
 /// A session the black box follows.
 struct Watched {
@@ -357,25 +375,33 @@ fn follow(
         "kernel": session.unjournaled.iter().map(|e| json!({"event": e, "said": e.describe()})).collect::<Vec<_>>(),
         "meters": meters(&status),
     });
-    // A line on every change, else every 10 s.
-    // The phase without its running clock (`PHASE 6/6 OVERLAP (00:01:20 / ...)`): a line a
-    // second would wear the stick for nothing.
+    // A line at once on a change that matters (state, failures, the app, a layer's watchdog,
+    // the machine becoming strained), else every 60 s (10 s while strained). The phase is in
+    // every line but changes nothing: CPU-RAM flips RAM_WRITE / RAM_VERIFY every round.
+    let strained = strained(
+        (status.heartbeat_unix_ms > 0).then(|| now.saturating_sub(status.heartbeat_unix_ms) / 1000),
+        memory,
+        pressure,
+    );
     let digest = format!(
         "{}|{}|{}|{}|{:?}",
-        status.phase.split(" (").next().unwrap_or(""),
         status.state,
         status.failures,
         seen.app_alive,
+        strained,
         seen.layers
             .iter()
             .map(|l| (l.name.clone(), l.watchdog_state.clone()))
             .collect::<Vec<_>>()
     );
+    let every = if strained {
+        LINE_EVERY_STRAINED
+    } else {
+        LINE_EVERY
+    };
     if digest != session.last_digest
         || !session.unjournaled.is_empty()
-        || session
-            .last_line
-            .is_none_or(|at| at.elapsed() >= LINE_EVERY)
+        || session.last_line.is_none_or(|at| at.elapsed() >= every)
     {
         session.journal.write(&line);
         session.unjournaled.clear();
@@ -575,7 +601,7 @@ fn close_markers(results_root: &std::path::Path, handled: &[String], notices: &m
 /// `FC3b`: each session the previous boot left with an open journal gets its result from the
 /// journal's last line, the board's reset reason and pstore.
 fn post_mortem(args: &PostMortemArgs) -> ExitCode {
-    if !args.results_root.is_dir() {
+    if !session::volume_alive(&args.results_root) {
         return ExitCode::SUCCESS;
     }
     let kernel: Vec<String> = KernelLog::open(&args.kmsg)
@@ -663,5 +689,42 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Mode::Watch(args) => watch(&args),
         Mode::PostMortem(args) => post_mortem(&args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_journal_speeds_up_only_while_the_machine_is_strained() {
+        let gib = 1024 * 1024 * 1024;
+        let plenty = host::Memory {
+            total_bytes: 32 * gib,
+            available_bytes: 20 * gib,
+        };
+        let calm = Some(host::Pressure::default());
+        assert!(!strained(Some(1), plenty, calm));
+        // No heartbeat yet (the session just opened) is not a late one.
+        assert!(!strained(None, plenty, calm));
+        assert!(strained(Some(20), plenty, calm));
+        // What a Full test leaves free (its 512 MiB reserve) is not strained; under 384 MiB is.
+        let full_test = host::Memory {
+            available_bytes: 512 * 1024 * 1024,
+            ..plenty
+        };
+        assert!(!strained(Some(1), full_test, calm));
+        let short = host::Memory {
+            available_bytes: 300 * 1024 * 1024,
+            ..plenty
+        };
+        assert!(strained(Some(1), short, calm));
+        let pressed = Some(host::Pressure {
+            some_avg10: 30.0,
+            full_avg10: 5.0,
+        });
+        assert!(strained(Some(1), plenty, pressed));
+        // /proc/meminfo unreadable: no reading, not strained.
+        assert!(!strained(Some(1), host::Memory::default(), None));
     }
 }

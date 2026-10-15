@@ -160,7 +160,7 @@ pub const fn pending_cells(module: SingleModule) -> &'static [&'static str] {
 }
 
 fn csv_path(results_root: &Path, run_dir: &Path) -> std::path::PathBuf {
-    if results_root.is_dir() {
+    if dit_orchestrator::session::volume_alive(results_root) {
         results_root.join("fail-summary.csv")
     } else {
         run_dir.join("fail-summary.csv")
