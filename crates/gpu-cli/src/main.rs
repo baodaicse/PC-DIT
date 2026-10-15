@@ -1787,10 +1787,20 @@ fn suggested_compute_rounds(duration_seconds: u64) -> u32 {
         .min(MAX_AUTO_COMPUTE_ROUNDS)
 }
 
-/// Explicit `--compute-rounds` always wins; otherwise derive from duration.
+/// Explicit `--compute-rounds` always wins; otherwise derive from duration, a multiple of 32
+/// when the mix has the INT8 tensor GEMM (its K must be; doubling by the adaptive shape keeps it).
 fn resolved_compute_rounds(args: &RunArgs) -> u32 {
-    args.compute_rounds
-        .unwrap_or_else(|| suggested_compute_rounds(args.duration_seconds))
+    args.compute_rounds.unwrap_or_else(|| {
+        let suggested = suggested_compute_rounds(args.duration_seconds);
+        if matches!(
+            args.compute_mix,
+            Some(ComputeMixArg::Int8 | ComputeMixArg::All)
+        ) {
+            (suggested / 32 * 32).max(32)
+        } else {
+            suggested
+        }
+    })
 }
 
 /// Async defaults to checkpoint hashing; the sequential path keeps hashing every output so
@@ -1883,6 +1893,13 @@ fn async_config(args: &RunArgs) -> gpu_cuda::AsyncConfig {
         share.verifier_workers
     };
     config.corpus_threads = args.corpus_threads.unwrap_or(share.helper_threads);
+    // K given (`--matrix-inner`): it stays. Otherwise it may grow while the CPU checks set the
+    // pace, halving the jobs, up to the largest K the kernels take (gpu_engine::shape).
+    config.inner_max = if args.compute_rounds.is_some() {
+        0
+    } else {
+        gpu_engine::gemm::MAX_K
+    };
     if let Some(n) = args.corpus_rotate_batches {
         config.rotate_every_batches = n;
     }
@@ -2219,21 +2236,19 @@ struct ScorecardInputs<'a> {
 #[allow(clippy::cast_precision_loss)]
 fn build_scorecard(i: &ScorecardInputs<'_>) -> hwhealth::DetectionScorecard {
     let seconds = i.elapsed_seconds.max(f64::EPSILON);
-    // ops = 2 * jobs * N * N * K and results = jobs * N * N, so ops = results * 2K.
+    // ops = 2 * jobs * N * N * K and results = jobs * N * N, so ops = results * 2K. The
+    // sequential path runs the u32 GEMM only, at one K; the async one counts each arithmetic,
+    // each cell with its own corpus's K (the adaptive shape changes K between corpora).
     let cumulative = i.async_report.map(|r| &r.cumulative);
-    // The sequential path runs the u32 GEMM only; the async one counts each arithmetic.
-    let (u32_results, f32_results, i8_results) =
-        cumulative.map_or((i.results_verified, 0, 0), |c| {
-            (
-                c.u32_results_verified,
-                c.f32_results_verified,
-                c.i8_results_verified,
-            )
-        });
-    let per_result = 2 * u64::from(i.compute_inner);
-    let ops = u32_results.saturating_mul(per_result);
-    let flops = f32_results.saturating_mul(per_result);
-    let tensor_ops = i8_results.saturating_mul(per_result);
+    let (ops, flops, tensor_ops) = cumulative.map_or(
+        (
+            i.results_verified
+                .saturating_mul(2 * u64::from(i.compute_inner)),
+            0,
+            0,
+        ),
+        |c| (c.u32_ops_verified, c.f32_flops_verified, c.i8_ops_verified),
+    );
     let sweep = i.async_report.and_then(|r| r.sweep.as_ref());
     hwhealth::DetectionScorecard {
         version: 1,
@@ -2396,13 +2411,19 @@ fn sweep_note(report: &gpu_cuda::SweepReport, elapsed: Duration) -> String {
 fn mix_note(args: &RunArgs, backend: Option<&Backend>, elapsed: Duration) -> Option<String> {
     args.compute_mix?;
     let cumulative = backend.and_then(Backend::async_report)?.cumulative;
-    let per_result = 2.0 * f64::from(resolved_compute_rounds(args));
     let seconds = elapsed.as_secs_f64().max(1e-9);
+    // K grows while the CPU checks set the pace (adaptive shape): the starting K and where it is.
+    let start = resolved_compute_rounds(args);
+    let inner = match cumulative.inner_now {
+        0 => start.to_string(),
+        now if now == start => now.to_string(),
+        now => format!("{start}->{now}"),
+    };
     Some(format!(
-        "u32 {:.1} Gop/s | fp32 {:.1} GFLOP/s | int8 tensor {:.1} TOPS (verified, whole run)",
-        cumulative.u32_results_verified as f64 * per_result / seconds / 1e9,
-        cumulative.f32_results_verified as f64 * per_result / seconds / 1e9,
-        cumulative.i8_results_verified as f64 * per_result / seconds / 1e12
+        "u32 {:.1} Gop/s | fp32 {:.1} GFLOP/s | int8 tensor {:.1} TOPS (verified, whole run) | K {inner}",
+        cumulative.u32_ops_verified as f64 / seconds / 1e9,
+        cumulative.f32_flops_verified as f64 / seconds / 1e9,
+        cumulative.i8_ops_verified as f64 / seconds / 1e12
     ))
 }
 
@@ -4217,6 +4238,18 @@ mod tests {
         );
         args.compute_rounds = Some(7);
         assert_eq!(resolved_compute_rounds(&args), 7);
+        // With the INT8 tensor GEMM in the mix a derived K is a multiple of 32 (120 s: 316 -> 288),
+        // and the adaptive shape may grow it unless K was given.
+        args.compute_rounds = None;
+        args.duration_seconds = 120;
+        assert_eq!(suggested_compute_rounds(120), 316);
+        assert_eq!(resolved_compute_rounds(&args), 316);
+        args.compute_mix = Some(ComputeMixArg::All);
+        assert_eq!(resolved_compute_rounds(&args), 288);
+        assert_eq!(async_config(&args).inner_max, gpu_engine::gemm::MAX_K);
+        args.compute_rounds = Some(1024);
+        assert_eq!(resolved_compute_rounds(&args), 1024);
+        assert_eq!(async_config(&args).inner_max, 0);
     }
 
     #[test]

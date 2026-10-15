@@ -175,6 +175,15 @@ pub struct Cumulative {
     pub u32_results_verified: u64,
     pub f32_results_verified: u64,
     pub i8_results_verified: u64,
+    /// Operations behind those cells: 2K each, K of the cell's own corpus (the adaptive shape
+    /// changes K between corpora, [`crate::shape`]).
+    pub u32_ops_verified: u64,
+    pub f32_flops_verified: u64,
+    pub i8_ops_verified: u64,
+    /// K of the corpus in use.
+    pub inner_now: u32,
+    /// Steps the adaptive shape took (none when K was given or could not grow).
+    pub shape_steps: Vec<crate::shape::ShapeStep>,
     pub bursts: u64,
     pub empty_bursts: u64,
     pub totals: Totals,

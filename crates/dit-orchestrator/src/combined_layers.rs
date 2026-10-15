@@ -253,7 +253,7 @@ pub fn gpu(menu: &MenuArgs, dir: &Path, seconds: u64, options: &GpuOptions) -> L
         "--vram-max",
         "--vram-sweep",
         "--compute-mix",
-        "alternate",
+        "all",
     ]));
     if options.temp_limit {
         args.extend(words(&["--temp-limit-celsius", "90"]));

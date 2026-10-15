@@ -22,6 +22,7 @@ use gpu_engine::{
     lane::LaneConfig,
     pressure::{PressureConfig, PressureSampler},
     schedule::{ScalerObservation, WorkerScaler},
+    shape::{Shape, ShapeDecision, ShapeLadder, ShapeStep, ShapeWindow},
     verifier::{HashPolicy, default_helper_threads},
 };
 use gpu_vulkan::{
@@ -82,6 +83,9 @@ pub struct AsyncConfig {
     /// GPU, its VRAM or the host. Off: nothing of it runs and the report is unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub boundary_checks: bool,
+    /// Adaptive shape ([`gpu_engine::shape`]): while the CPU verifiers set the pace, each next
+    /// corpus may double K (halving the jobs) up to this. 0 or the starting K: K stays.
+    pub inner_max: u32,
 }
 impl Default for AsyncConfig {
     fn default() -> Self {
@@ -104,6 +108,7 @@ impl Default for AsyncConfig {
             sweep: SweepConfig::default(),
             arith: ArithMix::U32,
             boundary_checks: false,
+            inner_max: 0,
         }
     }
 }
@@ -126,6 +131,7 @@ impl AsyncConfig {
             || self.sweep.validate().is_err()
             || (self.sweep.enabled && (!self.lane.active() || self.lane.vram_local))
             || (self.arith.alternates() && self.rotate_every_batches == 0)
+            || self.inner_max > gemm::MAX_K
         {
             return Err(Error::Request("async configuration"));
         }
@@ -471,8 +477,10 @@ pub(crate) struct Pipeline {
     rotation: u64,
     batches_on_corpus: u64,
     prefetch: Option<Prefetch>,
+    /// Shape of the corpus in use (it changes only at a rotation, between bursts).
     jobs: usize,
     inner: u32,
+    shape: AdaptiveShape,
     config: AsyncConfig,
     controller: LoadController,
     scaler: WorkerScaler,
@@ -509,9 +517,32 @@ pub(crate) struct Pipeline {
 }
 
 /// A corpus being built on a helper thread for the next rotation.
+/// Adaptive shape of the pipeline: the ladder (none when K is fixed), the level in use, the level
+/// of the next corpus, the bursts since the last decision and what that decision saw.
+struct AdaptiveShape {
+    ladder: Option<ShapeLadder>,
+    level: u32,
+    next_level: u32,
+    window: ShapeWindow,
+    step_percent: u64,
+}
+
+impl AdaptiveShape {
+    fn new(jobs: usize, inner: u32, inner_max: u32) -> Self {
+        Self {
+            ladder: ShapeLadder::new(Shape { jobs, inner }, inner_max),
+            level: 0,
+            next_level: 0,
+            window: ShapeWindow::default(),
+            step_percent: 0,
+        }
+    }
+}
+
 struct Prefetch {
     seed: u64,
     arith: Arith,
+    shape: Shape,
     handle: thread::JoinHandle<std::result::Result<Corpus, &'static str>>,
 }
 
@@ -676,6 +707,7 @@ impl Pipeline {
             prefetch: None,
             jobs,
             inner,
+            shape: AdaptiveShape::new(jobs, inner, config.inner_max),
             config,
             controller: LoadController::new(control_config(config)),
             scaler: WorkerScaler::new(config.workers, config.workers_max),
@@ -832,12 +864,14 @@ impl Pipeline {
         if self.external || self.config.rotate_every_batches == 0 || self.prefetch.is_some() {
             return;
         }
+        self.decide_shape();
         let seed = derive_corpus_seed(base, self.rotation + 1);
         let arith = self
             .config
             .arith
             .for_rotation(self.rotation + 1, self.tensor);
-        let (jobs, inner, threads) = (self.jobs, self.inner, self.config.threads());
+        let shape = self.next_shape();
+        let (jobs, inner, threads) = (shape.jobs, shape.inner, self.config.threads());
         self.prefetch = thread::Builder::new()
             .name("gpu-corpus-prefetch".into())
             .spawn(move || Corpus::new_arith(arith, seed, jobs, inner, threads))
@@ -845,8 +879,58 @@ impl Pipeline {
             .map(|handle| Prefetch {
                 seed,
                 arith,
+                shape,
                 handle,
             });
+    }
+
+    /// Adaptive shape: the bursts since the last decision choose the shape of the next corpus,
+    /// whose build starts now.
+    fn decide_shape(&mut self) {
+        let shape = &mut self.shape;
+        let Some(ladder) = shape.ladder else {
+            return;
+        };
+        if shape.next_level != shape.level {
+            return;
+        }
+        match ladder.decide(shape.level, &shape.window) {
+            ShapeDecision::Wait => {}
+            ShapeDecision::Keep => shape.window = ShapeWindow::default(),
+            ShapeDecision::StepUp => {
+                shape.next_level = shape.level + 1;
+                shape.step_percent = shape.window.verifier_percent();
+                shape.window = ShapeWindow::default();
+            }
+        }
+    }
+
+    fn next_shape(&self) -> Shape {
+        self.shape.ladder.map_or(
+            Shape {
+                jobs: self.jobs,
+                inner: self.inner,
+            },
+            |ladder| ladder.shape(self.shape.next_level),
+        )
+    }
+
+    /// At a rotation: the shape decided for this corpus takes over, nothing being in flight.
+    fn apply_shape(&mut self) {
+        if self.shape.next_level == self.shape.level {
+            return;
+        }
+        self.shape.level = self.shape.next_level;
+        let shape = self.next_shape();
+        self.jobs = shape.jobs;
+        self.inner = shape.inner;
+        self.cumulative.shape_steps.push(ShapeStep {
+            at_seconds: self.epoch.elapsed().as_secs(),
+            rotation: self.rotation,
+            jobs: shape.jobs,
+            inner: shape.inner,
+            verifier_bound_percent: self.shape.step_percent,
+        });
     }
 
     /// Chooses the corpus for the next burst: reuse, a prefetched rotation, or a
@@ -884,6 +968,7 @@ impl Pipeline {
             self.rotation += 1;
             self.batches_on_corpus = 0;
             rotated = true;
+            self.apply_shape();
         }
         let seed = derive_corpus_seed(base, self.rotation);
         let arith = self.config.arith.for_rotation(self.rotation, self.tensor);
@@ -903,10 +988,20 @@ impl Pipeline {
         }
         let waited = Instant::now();
         let (corpus, prefetch_hit) = match self.prefetch.take() {
-            Some(p) if p.seed == seed && p.arith == arith => match p.handle.join() {
-                Ok(built) => (built.map_err(Error::Request)?, true),
-                Err(_) => return Err(Error::Request("corpus prefetch panicked")),
-            },
+            Some(p)
+                if p.seed == seed
+                    && p.arith == arith
+                    && p.shape
+                        == (Shape {
+                            jobs: self.jobs,
+                            inner: self.inner,
+                        }) =>
+            {
+                match p.handle.join() {
+                    Ok(built) => (built.map_err(Error::Request)?, true),
+                    Err(_) => return Err(Error::Request("corpus prefetch panicked")),
+                }
+            }
             _ => {
                 // A cold build starts from nothing: free the old corpus first so the peak is one
                 // corpus plus staging, not two.
@@ -1869,11 +1964,25 @@ impl Pipeline {
             failure = failure.map(|e| format!("{e} {tag}"));
         }
         self.cumulative.add_burst(burst.clone());
-        let cells = burst.totals.verified * (self.jobs * corpus.n * corpus.n) as u64;
+        self.shape.window.observe(regime);
+        let cells = burst.totals.verified * (corpus.jobs * corpus.n * corpus.n) as u64;
+        // Each cell is 2K operations, K of this burst's corpus (the adaptive shape changes K).
+        let operations = cells.saturating_mul(2 * corpus.k as u64);
+        let c = &mut self.cumulative;
+        c.inner_now = u32::try_from(corpus.k).unwrap_or(u32::MAX);
         match corpus.arith {
-            Arith::U32 => self.cumulative.u32_results_verified += cells,
-            Arith::F32 => self.cumulative.f32_results_verified += cells,
-            Arith::I8 => self.cumulative.i8_results_verified += cells,
+            Arith::U32 => {
+                c.u32_results_verified += cells;
+                c.u32_ops_verified += operations;
+            }
+            Arith::F32 => {
+                c.f32_results_verified += cells;
+                c.f32_flops_verified += operations;
+            }
+            Arith::I8 => {
+                c.i8_results_verified += cells;
+                c.i8_ops_verified += operations;
+            }
         }
         // The next burst may use more verifier workers, but only while verifiers are the limit
         // and only if the last extra worker measurably helped.

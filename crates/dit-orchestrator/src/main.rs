@@ -610,8 +610,9 @@ fn launch_cpu_nvme(args: &MenuArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// (build/gpu-async-menu-20260924-131640). The bottleneck log lands in the run directory, so it is
 /// persisted with the report. Async-only options are dropped for sequential devices. `--vram-max`
 /// holds VRAM up to what the driver reports free minus a small margin on discrete CUDA GPUs;
-/// `--compute-mix alternate` switches the GEMM between the integer ALU and the FP32 FMA pipes at
-/// each corpus rotation (both bit-exact against the CPU oracle); `--vram-sweep` adds the GPU-DRAM
+/// `--compute-mix all` switches the GEMM between the integer ALU, the FP32 FMA pipes and the INT8
+/// tensor cores at each corpus rotation (all bit-exact against the CPU oracle; INT8 only where the
+/// GPU has the tensor path, compute capability 8.0+); `--vram-sweep` adds the GPU-DRAM
 /// sweep (device-verified at DRAM bandwidth for a quarter of the
 /// device's time, trading pool halves with the transfer lane so CPU-verified coverage still
 /// spans the whole pool).
@@ -630,11 +631,11 @@ fn gpu_run_arguments(
         "--async-auto".into(),
     ];
     match profile {
-        GpuProfile::Full | GpuProfile::AllArithmetic => {
+        GpuProfile::Full | GpuProfile::NoTensor => {
             let mix = if profile == GpuProfile::Full {
-                "alternate"
-            } else {
                 "all"
+            } else {
+                "alternate"
             };
             words.extend(["--vram-max", "--vram-sweep", "--compute-mix", mix].map(Into::into));
             words.extend([
@@ -693,13 +694,15 @@ impl Default for GpuSettings {
 /// What GPU-VRAM runs when chosen in the control center.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GpuProfile {
-    /// The full DIT: u32 + FP32 GEMM in turn, DRAM sweep, VRAM held to the limit.
+    /// The full DIT: u32, FP32 and INT8 tensor-core GEMM in turn (INT8 skipped without tensor
+    /// cores), DRAM sweep, VRAM held to the limit. INT8 joined it once an RTX 5060 Ti (compute
+    /// capability 12.0) had run it 30 minutes against the CPU oracle, 2.9e11 results, no mismatch.
     Full,
     /// Two minutes of the INT8 tensor-core GEMM only (compute capability 8.0+), to confirm it
-    /// matches the CPU oracle on this card before it joins the full test.
+    /// matches the CPU oracle on a kind of card not seen yet.
     TensorCheck,
-    /// The full DIT with the INT8 tensor-core GEMM in the rotation (skipped without tensor cores).
-    AllArithmetic,
+    /// The full DIT without INT8: u32 + FP32 in turn, for a card whose INT8 path is in doubt.
+    NoTensor,
 }
 
 /// One answer to the profile prompt.
@@ -717,7 +720,7 @@ impl ProfileChoice {
         match choice.trim().to_ascii_lowercase().as_str() {
             "" | "1" => Self::Run(GpuProfile::Full),
             "2" => Self::Run(GpuProfile::TensorCheck),
-            "3" => Self::Run(GpuProfile::AllArithmetic),
+            "3" => Self::Run(GpuProfile::NoTensor),
             "d" => Self::Duration,
             "t" => Self::TempLimit,
             "b" | "q" => Self::Back,
@@ -737,11 +740,11 @@ fn render_gpu_profile_menu(settings: GpuSettings) -> String {
         "DIT GPU-VRAM // TEST PROFILE",
         &[
             rows(vec![
-                " [1] Full DIT (default, Enter)  u32 + FP32 GEMM in turn, GPU DRAM sweep, VRAM held to the limit".into(),
-                " [2] Tensor INT8 check          2 minutes of the INT8 tensor-core GEMM only (compute capability 8.0+,".into(),
-                "                                RTX 30/40/50); confirms it matches the CPU oracle bit for bit".into(),
-                " [3] Full DIT + INT8 tensor     profile 1 with the INT8 tensor GEMM in the rotation; use once".into(),
-                "                                profile 2 has passed on this kind of card".into(),
+                " [1] Full DIT (default, Enter)  u32 + FP32 + INT8 tensor GEMM in turn (INT8 on RTX 30/40/50),".into(),
+                "                                GPU DRAM sweep, VRAM held to the limit".into(),
+                " [2] Tensor INT8 check          2 minutes of the INT8 tensor-core GEMM only (compute capability 8.0+);".into(),
+                "                                confirms it matches the CPU oracle bit for bit on a new kind of card".into(),
+                " [3] Full DIT without INT8      profile 1 with u32 + FP32 only, for a card whose INT8 check failed".into(),
             ]),
             rows(vec![
                 format!(
@@ -1146,11 +1149,11 @@ fn tensor_check_verdict(report: &GpuReportView) -> String {
         .any(|f| f.detail.contains("compute capability 8.0"));
     match report.verdict {
         Verdict::Pass if tensor_ops > 0 => format!(
-            "TENSOR CHECK PASSED: {tensor_ops} INT8 tensor-core operations matched the CPU oracle bit for bit. Profile 3 (Full DIT + INT8 tensor) can be used on this card."
+            "TENSOR CHECK PASSED: {tensor_ops} INT8 tensor-core operations matched the CPU oracle bit for bit. Profile 1 (Full DIT) runs them on this card."
         ),
         Verdict::Pass => "TENSOR CHECK NOT RUN: no CUDA GPU with the tensor path was tested (an Intel/AMD GPU runs without it).".to_owned(),
         _ if refused => "TENSOR CHECK NOT AVAILABLE: this GPU has no INT8 tensor-core path (compute capability below 8.0). Use profile 1.".to_owned(),
-        Verdict::Fail => "TENSOR CHECK FAILED: INT8 tensor-core results differed from the CPU oracle. If every batch failed from the start, and on more than one card, suspect the tensor kernel's software rather than this GPU; keep report.json.".to_owned(),
+        Verdict::Fail => "TENSOR CHECK FAILED: INT8 tensor-core results differed from the CPU oracle. If every batch failed from the start, and on more than one card, suspect the tensor kernel's software rather than this GPU; keep report.json and use profile 3 (without INT8).".to_owned(),
         _ => "TENSOR CHECK INCOMPLETE: the run did not finish; see report.json.".to_owned(),
     }
 }
@@ -1513,8 +1516,8 @@ mod tests {
         let mix = words.iter().position(|w| *w == "--compute-mix");
         assert_eq!(
             mix.and_then(|at| words.get(at + 1)),
-            Some(&"alternate"),
-            "the menu runs the integer and the FP32 GEMM in turn"
+            Some(&"all"),
+            "the menu runs the integer, FP32 and INT8 tensor GEMM in turn"
         );
         // Never the CUDA-only flag: an Intel/AMD GPU would be refused instead of run sequentially.
         assert!(!words.contains(&"--async-compute"));
@@ -1553,8 +1556,12 @@ mod tests {
             !tensor.contains(&"--vram-sweep".to_owned()),
             "the check runs the GEMM alone"
         );
-        assert_eq!(mix(&words(GpuProfile::AllArithmetic)), "all");
-        assert_eq!(mix(&words(GpuProfile::Full)), "alternate");
+        assert_eq!(mix(&words(GpuProfile::Full)), "all");
+        assert_eq!(mix(&words(GpuProfile::NoTensor)), "alternate");
+        assert_eq!(
+            ProfileChoice::parse("3"),
+            ProfileChoice::Run(GpuProfile::NoTensor)
+        );
         assert_eq!(
             ProfileChoice::parse("\n"),
             ProfileChoice::Run(GpuProfile::Full)
@@ -1610,7 +1617,7 @@ mod tests {
             duration_minutes: 10,
             temp_limit: true,
         };
-        let full = run(GpuProfile::AllArithmetic, chosen);
+        let full = run(GpuProfile::NoTensor, chosen);
         assert_eq!(value(&full, "--duration-seconds").as_deref(), Some("600"));
         assert_eq!(value(&full, "--temp-limit-celsius").as_deref(), Some("90"));
         let tensor = run(GpuProfile::TensorCheck, chosen);

@@ -116,11 +116,27 @@ bit-by-bit, không cần sai số cho phép như số thực. Nguồn: kernel `d
 | Tham số | Giá trị |
 |---|---|
 | Kích thước mỗi job | A (N×K) × B (K×N), N = 63, 64 hoặc 65 (theo seed) |
-| K (chiều trong) | 1024 ở menu (256 cho lần chạy < 60 s, tăng 1 mỗi giây sau đó, trần 1024; `--matrix-inner` đặt tay, tối đa 4096) |
+| K (chiều trong) | khởi đầu 1024 ở menu (256 cho lần chạy < 60 s, tăng 1 mỗi giây sau đó, trần 1024; bội số của 32 khi có INT8), rồi **tự tăng** (xem dưới); `--matrix-inner` đặt tay thì giữ nguyên, tối đa 4096 |
 | Số job mỗi lần gửi | 512 ở async (`--async-auto` trên CUDA), 64 ở tuần tự; `--matrix-jobs` đặt tay |
 | Phép tính mỗi job | 2·N²·K ≈ 8,4 triệu phép tính số nguyên (N=64, K=1024) |
 | Output mỗi job | (N²+4) word ≈ 16 KB |
 | Kernel | tile 16×16 trong shared memory, một thread một ô output |
+
+**K tự tăng (v1.2.018, đường async).** Chi phí kiểm của CPU tỉ lệ với số word output, còn mỗi word chứa 2·K phép tính
+của GPU. Khi CPU kiểm không kịp (≥ 2/3 số burst kể từ lần quyết định trước, tối thiểu 4 burst, ở trạng thái
+`VERIFIER_BOUND`), corpus kế tiếp được dựng với K gấp đôi và số job một nửa, tới K tối đa 4096. Nguồn:
+[shape.rs](../../crates/gpu-engine/src/shape.rs).
+
+- **Chuẩn kiểm không đổi:** vẫn cùng GEMM, cùng oracle độc lập, CPU vẫn so **toàn bộ** từng word; chỉ mỗi word mang
+  nhiều phép tính hơn. jobs × K giữ nguyên nên VRAM của corpus và công dựng oracle không đổi.
+- **Chỉ tăng, không giảm:** ở cỡ mới CPU đã theo kịp, nên lùi một bậc sẽ lại nghẽn ở CPU.
+- **Cái giá:** kernel dài hơn chiếm thời gian GPU lâu hơn, nên lane CPU-verified và bộ quét DRAM được ít thời gian hơn
+  (GTX 960, K 1024 → 4096: lane −15 %, sweep −45 %). Vì vậy K chỉ tăng khi CPU kiểm là giới hạn.
+- **Báo cáo:** `async_compute.inner_now` (K đang dùng), `async_compute.shape_steps` (thời điểm, lượt xoay corpus, jobs,
+  K, % burst nghẽn ở CPU kiểm); số phép tính đã xác thực cộng theo K của từng corpus (`u32_ops_verified`,
+  `f32_flops_verified`, `i8_ops_verified`). Dòng `COMPUTE MIX` hiện `K <đầu>-><hiện tại>`.
+- Đo trên GTX 960 (90 s, chạy cạnh CPU-RAM 12 + 4 luồng): K 286 → 572 → 1144 → 2288 trong 11 s đầu, khoảng 152 G phép
+  tính được kiểm/s so với ~80 G khi K cố định 256 cùng điều kiện; PASS, không mismatch.
 
 ### 3.2 Corpus và oracle
 
@@ -161,13 +177,14 @@ Cùng bố cục, cùng cách gắn tag và cùng bộ xác thực như GEMM u32
 |---|---|---|---|
 | `u32` | ALU số nguyên | cộng/nhân lấy dư 2³² là phép chính xác | như mục 3.1 |
 | `fp32` | pipe FP32 FMA | mỗi bước là **một** phép fused multiply-add IEEE-754 (làm tròn đúng một lần), cộng dồn theo đúng thứ tự k tăng dần ở cả kernel (`__fmaf_rn`) lẫn oracle CPU (`f32::mul_add`); đầu vào là số thực đủ 23 bit mantissa, có dấu, trong [0.5, 4) nên không tràn/không subnormal | **đã kiểm trên GTX 960**: khớp từng bit qua nhiều corpus, lỗi chèn bị bắt |
-| `int8` | Tensor core (`mma.sync.m16n8k32 .s8.s8.s32`, compute capability ≥ 8.0) | nhân int8 cộng dồn int32; \|tổng\| ≤ 128²·4096 < 2³¹ nên không tràn | **chưa kiểm trên phần cứng** (GTX 960 không có Tensor core); cách tính địa chỉ khớp bố cục fragment của PTX ISA theo mô phỏng CPU ([tensor_layout.rs](../../crates/gpu-cuda/tests/tensor_layout.rs)) |
+| `int8` | Tensor core (`mma.sync.m16n8k32 .s8.s8.s32`, compute capability ≥ 8.0) | nhân int8 cộng dồn int32; \|tổng\| ≤ 128²·4096 < 2³¹ nên không tràn | **đã kiểm trên RTX 5060 Ti** (CC 12.0, 2026-10-08): chế độ 3 cũ chạy 30 phút, 2,9·10¹¹ kết quả INT8 khớp oracle CPU từng bit, PASS; chưa có lần chạy trên CC 8.x (RTX 30/40). Cách tính địa chỉ theo bố cục fragment của PTX ISA, giống nhau từ `sm_80` ([tensor_layout.rs](../../crates/gpu-cuda/tests/tensor_layout.rs)) |
 
 - FP16/BF16 trên Tensor core **không** được dùng: thứ tự cộng bên trong Tensor core không được đặc tả, nên
   không so từng bit được.
 - `--compute-mix`: `u32` (mặc định CLI), `fp32`, `int8`, `alternate` (u32 và fp32 luân phiên mỗi lần xoay
-  corpus), `all` (u32 → fp32 → int8; bỏ int8 nếu GPU không có Tensor core). **Menu dùng `alternate`.** `int8`
-  và `all` để opt-in cho tới khi được xác nhận trên phần cứng có Tensor core (xem mục 7).
+  corpus), `all` (u32 → fp32 → int8; bỏ int8 nếu GPU không có Tensor core). **Menu (chế độ 1) và COMBINED dùng
+  `all` từ v1.2.018**, sau khi INT8 đã khớp oracle trên RTX 5060 Ti; chế độ 3 chạy `alternate` (không INT8) cho card
+  mà INT8 bị nghi lỗi phần mềm (xem mục 7).
 - Corpus INT8 dùng N = 64 cố định (tile Tensor là 16×8) và cần K chia hết cho 32. Module Tensor là một PTX
   riêng build cho `compute_80`, chỉ nạp trên GPU hỗ trợ.
 - Report tách: `detection.compute.verified_integer_ops`, `verified_fp32_flops`, `verified_int8_tensor_ops`
@@ -224,8 +241,9 @@ Những gì nằm ngoài phạm vi:
 
 - **VRAM không được kiểm:** biên 128 MiB của `--vram-max` và phần driver hoặc chương trình khác đang giữ.
   Vùng chứa corpus và output chỉ được kiểm gián tiếp qua kết quả GEMM.
-- **Tensor core chưa được kiểm trên phần cứng** và không bật ở menu. Kernel GEMM (u32 và FP32) là loại tile
-  cơ bản, chỉ đạt một phần nhỏ công suất đỉnh.
+- **Tensor core mới được kiểm trên RTX 5060 Ti (CC 12.0)**, chưa trên CC 8.x; menu bật INT8 cho mọi GPU từ CC 8.0
+  vì bố cục `mma.sync` do PTX ISA quy định, giống nhau giữa các thế hệ. Kernel GEMM (u32 và FP32) là loại tile cơ
+  bản, chỉ đạt một phần nhỏ công suất đỉnh.
 - **Device-verified là GPU tự kiểm chính nó.** Checkpoint CPU theo mẫu chứng minh bộ tự kiểm đúng, nhưng không
   phải mọi byte device-verified đều được CPU so. Hai con số luôn được báo tách riêng.
 - Workload `--vram-local` của H6 vẫn có nhưng không bật ở menu: trên GTX 960 nó hạ độ phủ đã xác thực xuống
@@ -264,22 +282,24 @@ Chạy thẳng từ menu: **Control center → 3 (GPU-VRAM) → 2 (Tensor INT8 c
 
 | Chế độ | Chạy gì |
 |---|---|
-| 1 (mặc định, Enter) | test đầy đủ: u32 + FP32 luân phiên, quét DRAM, giữ VRAM tới giới hạn |
-| 2 Tensor INT8 check | chỉ GEMM INT8 Tensor core trong 2 phút (`--compute-mix int8 --matrix-inner 1024 --duration-seconds 120`) |
-| 3 Full DIT + INT8 tensor | như chế độ 1, thêm INT8 vào vòng luân phiên (`--compute-mix all`) |
+| 1 (mặc định, Enter) | test đầy đủ: u32 + FP32 + INT8 Tensor luân phiên (`--compute-mix all`; INT8 chỉ trên CC ≥ 8.0), quét DRAM, giữ VRAM tới giới hạn |
+| 2 Tensor INT8 check | chỉ GEMM INT8 Tensor core trong 2 phút (`--compute-mix int8 --matrix-inner 1024 --duration-seconds 120`); dùng cho dòng card chưa từng chạy INT8 |
+| 3 Full DIT without INT8 | như chế độ 1 nhưng chỉ u32 + FP32 (`--compute-mix alternate`), cho card mà chế độ 2 báo FAILED |
 | D | thời lượng cho chế độ 1 và 3: 10 / 30 (mặc định) / 60 / 120 phút hoặc tự nhập 1–1440 |
 | T | giới hạn nhiệt GPU: tắt (mặc định, nhiệt vẫn được ghi) hoặc bật ở 90 °C (`--temp-limit-celsius 90`) |
 
 Kết thúc chế độ 2, menu in một dòng diễn giải:
 
-- `TENSOR CHECK PASSED`: có N phép tính INT8 khớp oracle CPU từng bit. Từ đó dùng được chế độ 3 trên loại card này.
+- `TENSOR CHECK PASSED`: có N phép tính INT8 khớp oracle CPU từng bit; chế độ 1 chạy INT8 trên loại card này.
 - `TENSOR CHECK NOT AVAILABLE`: GPU không có đường INT8 Tensor này (compute capability dưới 8.0, gồm cả
   Volta/Turing). Run kết thúc ngay, report `INVALID` ghi lý do. Dùng chế độ 1.
 - `TENSOR CHECK FAILED`: kết quả khác oracle. Nếu **mọi** batch sai ngay từ đầu, và sai trên nhiều card, nhiều khả
   năng là lỗi phần mềm trong cách sắp xếp fragment, **không** kết luận là lỗi phần cứng; giữ lại `report.json`.
-  Lỗi phần cứng thật thường thưa, ngẫu nhiên và chỉ trên một card.
+  Lỗi phần cứng thật thường thưa, ngẫu nhiên và chỉ trên một card. Trong lúc chờ, dùng chế độ 3 (không INT8).
 - `TENSOR CHECK NOT RUN`: không có GPU CUDA nào chạy đường Tensor (ví dụ chỉ có GPU Intel/AMD).
 
 Report và `bottleneck.jsonl` được lưu vào `DIT-RESULTS/runs/<run>/gpu-vram/` như mọi lần chạy khác. Đã thử trên GTX 960
 (CC 5.2): chế độ 2 kết thúc ngay với `INVALID` và lý do "needs compute capability 8.0", menu in `NOT AVAILABLE`.
-Chưa có lần chạy trên GPU có Tensor core.
+Trên RTX 5060 Ti (CC 12.0, 2026-10-08, máy B760M): chế độ "Full DIT + INT8" cũ (nay là chế độ 1) chạy 30 phút,
+2,9·10¹¹ kết quả INT8 khớp oracle, PASS (`Result/1/runs/suite-gpu-vram-1791460766558-762/`). Chưa có lần chạy trên
+CC 8.x (RTX 30/40): nên chạy chế độ 2 một lần khi có máy.

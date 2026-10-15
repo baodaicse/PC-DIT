@@ -18,6 +18,7 @@ pub mod plan;
 pub mod pressure;
 pub mod queue;
 pub mod schedule;
+pub mod shape;
 pub mod sweep;
 pub mod verifier;
 
