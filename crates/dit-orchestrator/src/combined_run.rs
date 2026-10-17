@@ -387,6 +387,25 @@ struct Session<'a> {
     notes: Vec<(&'static str, String)>,
 }
 
+/// Where the overlap's RAM worker count comes from (v1.2 C12), for the THREADS row.
+fn ram_split_note(split: Option<combined::RamSplit>) -> String {
+    match split {
+        Some(split) if split.source == combined::RamSplitSource::Probe => format!(
+            " (probe {} of {} GB/s)",
+            gb_per_second(split.chosen_bytes_per_second),
+            gb_per_second(split.peak_bytes_per_second)
+        ),
+        Some(_) => " (1 per 8 thr)".to_owned(),
+        None => String::new(),
+    }
+}
+
+/// Bytes/s as GB/s with one decimal, in integers.
+fn gb_per_second(bytes_per_second: u64) -> String {
+    let tenths = bytes_per_second / 100_000_000;
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
 /// Mark of a result from the Fault Attribution boot entry (`fail-summary.csv` test column).
 pub(super) const fn attribution_suffix(attribution: bool) -> &'static str {
     if attribution { " +ATTRIBUTION" } else { "" }
@@ -1454,6 +1473,10 @@ impl Session<'_> {
         if matches!(record.phase, PhaseKind::Baseline(_)) {
             self.peaks.insert(ended.layer, ended.peak_bytes);
         }
+        // v1.2 C12: the split probe of the CPU-RAM baseline sets the overlap's RAM workers.
+        if record.phase == PhaseKind::Baseline(Layer::CpuRam) && ended.layer == Layer::CpuRam {
+            combined::split_overlap_ram(&mut self.threads, &layers::split_probe_steps(&ended.dir));
+        }
         self.attribute(&ended, outcome, &record.label);
         // FC2: the memory guard stopped CPU-RAM; the other layers go on no further.
         if outcome == LayerOutcome::Invalid && detail.starts_with("memory guard") {
@@ -1932,8 +1955,9 @@ impl Session<'_> {
     fn plan_rows(&self) -> Vec<String> {
         let t = &self.threads;
         let mut rows = vec![format!(
-            "THREADS: RAM {} / ORACLE {} / GPU {} / SSD {} / CHAIN {} / OS {}",
+            "THREADS: RAM {}{} / ORACLE {} / GPU {} / SSD {} / CHAIN {} / OS {}",
             t.cpu_ram_workers,
+            ram_split_note(t.ram_split),
             t.cpu_oracle_workers,
             t.gpu_verifier_max
                 .map_or_else(|| "auto".to_owned(), |v| v.to_string()),
@@ -2187,8 +2211,8 @@ impl Session<'_> {
             combined::session_verdict(&outcomes, completed)
         };
         let report = CombinedReport {
-            // v2: dit_version. v3: threads.cpu_ram_nice.
-            schema_version: 3,
+            // v2: dit_version. v3: threads.cpu_ram_nice. v4: threads.ram_split (C12).
+            schema_version: 4,
             dit_version: dit_contracts::DIT_VERSION,
             module_id: combined::COMBINED_MODULE_ID,
             run_id: &self.run_id,
@@ -2295,4 +2319,30 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<usize> {
         }
     }
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gb_per_second, ram_split_note};
+    use dit_orchestrator::combined::{RamSplit, RamSplitSource};
+
+    #[test]
+    fn the_threads_row_says_where_the_ram_workers_come_from() {
+        assert_eq!(gb_per_second(6_437_667_071), "6.4");
+        assert_eq!(gb_per_second(21_328_710_113), "21.3");
+        assert_eq!(gb_per_second(40_000_000_000), "40.0");
+        let probe = RamSplit {
+            source: RamSplitSource::Probe,
+            peak_bytes_per_second: 21_328_710_113,
+            target_bytes_per_second: 7_109_570_037,
+            chosen_bytes_per_second: 6_437_667_071,
+        };
+        assert_eq!(ram_split_note(Some(probe)), " (probe 6.4 of 21.3 GB/s)");
+        let per_threads = RamSplit {
+            source: RamSplitSource::PerThreads,
+            ..probe
+        };
+        assert_eq!(ram_split_note(Some(per_threads)), " (1 per 8 thr)");
+        assert_eq!(ram_split_note(None), "");
+    }
 }

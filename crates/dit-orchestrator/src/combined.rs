@@ -354,10 +354,60 @@ pub struct ThreadPlan {
     /// others leave, so the CPU stays fully loaded. `balanced` gives each layer its own threads.
     #[serde(default)]
     pub cpu_ram_nice: i32,
+    /// How the CPU-RAM threads were split between RAM workers and the compute oracle (v1.2
+    /// C12); absent before v1.2.021.
+    #[serde(default)]
+    pub ram_split: Option<RamSplit>,
 }
 
 /// [`ThreadPlan::cpu_ram_nice`] at `max`.
 pub const MAX_CPU_RAM_NICE: i32 = 10;
+
+/// v1.2 C12: in the overlap the RAM workers aim at this share of the memory bus the CPU-RAM
+/// baseline measured (numerator, denominator); every other CPU-RAM thread runs the compute
+/// oracle. Since C1 a RAM worker verifies 6–7 times faster and about ten fill the bus of a
+/// 9950X3D: the 24 that `n − n/4` gave kept it full, and the GPU test's CPU side lost it (RTX
+/// 5060 Ti: verified operations 46 % of its baseline, CPU-verified VRAM lane 15 %) while the
+/// oracle had 8 threads. A third of the bus is about v1.1's RAM rate.
+pub const OVERLAP_RAM_BUS_SHARE: (u64, u64) = (1, 3);
+/// Before the baseline's probe, or without one: one RAM worker for this many threads (a C1
+/// worker against 6–7 of v1.1's, so v1.1's rate again).
+const THREADS_PER_RAM_WORKER: usize = 8;
+
+/// How the overlap's RAM workers were chosen (v1.2 C12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RamSplit {
+    pub source: RamSplitSource,
+    /// Best verify rate of the baseline's split probe, bytes/s (0 without the probe).
+    pub peak_bytes_per_second: u64,
+    /// The [`OVERLAP_RAM_BUS_SHARE`] of it.
+    pub target_bytes_per_second: u64,
+    /// What the probe measured with the RAM workers chosen.
+    pub chosen_bytes_per_second: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RamSplitSource {
+    /// One RAM worker per [`THREADS_PER_RAM_WORKER`] threads: the plan before the baseline,
+    /// kept when the baseline left no probe (a crash, a fixed split).
+    PerThreads,
+    /// The step of the CPU-RAM baseline's probe (`worker_split.steps` of its report) nearest
+    /// the target.
+    Probe,
+}
+
+/// RAM workers among `pool` CPU-RAM threads before any probe.
+fn ram_workers_per_threads(logical: usize, pool: usize) -> usize {
+    (logical / THREADS_PER_RAM_WORKER).clamp(1, pool.max(1))
+}
+
+const PER_THREADS: RamSplit = RamSplit {
+    source: RamSplitSource::PerThreads,
+    peak_bytes_per_second: 0,
+    target_bytes_per_second: 0,
+    chosen_bytes_per_second: 0,
+};
 
 #[must_use]
 pub fn plan_threads(logical: usize, intensity: Intensity, available: Available) -> ThreadPlan {
@@ -365,16 +415,18 @@ pub fn plan_threads(logical: usize, intensity: Intensity, available: Available) 
     let chain = usize::from(available.chain);
     match intensity {
         Intensity::Max => {
-            // Every engine takes its own default and the OS shares the CPUs out.
-            let oracle = if n >= 2 { (n / 4).max(1) } else { 0 };
+            // Every engine takes its own default and the OS shares the CPUs out; CPU-RAM's
+            // threads are RAM workers and the compute oracle (C12).
+            let ram = ram_workers_per_threads(n, n);
             ThreadPlan {
-                cpu_ram_workers: n.saturating_sub(oracle).max(1),
-                cpu_oracle_workers: oracle,
+                cpu_ram_workers: ram,
+                cpu_oracle_workers: n - ram,
                 gpu_verifier_max: None,
                 ssd_workers: None,
                 chain_threads: chain,
                 os_threads: 0,
                 cpu_ram_nice: MAX_CPU_RAM_NICE,
+                ram_split: Some(PER_THREADS),
             }
         }
         Intensity::Balanced => {
@@ -390,19 +442,53 @@ pub fn plan_threads(logical: usize, intensity: Intensity, available: Available) 
             } else {
                 0
             };
-            let oracle = if n >= 8 { n / 8 } else { 0 };
-            let cpu_ram = n.saturating_sub(os + chain + gpu + ssd + oracle).max(1);
+            let pool = n.saturating_sub(os + chain + gpu + ssd).max(1);
+            let ram = ram_workers_per_threads(n, pool);
             ThreadPlan {
-                cpu_ram_workers: cpu_ram,
-                cpu_oracle_workers: oracle,
+                cpu_ram_workers: ram,
+                cpu_oracle_workers: pool - ram,
                 gpu_verifier_max: available.gpu.then_some(gpu),
                 ssd_workers: available.ssd.then_some(ssd),
                 chain_threads: chain,
                 os_threads: os,
                 cpu_ram_nice: 0,
+                ram_split: Some(PER_THREADS),
             }
         }
     }
+}
+
+/// v1.2 C12: the overlap's RAM workers from the CPU-RAM baseline's split probe, `steps` being
+/// `(RAM workers, verify bytes/s)`: the step whose rate is nearest [`OVERLAP_RAM_BUS_SHARE`]
+/// of the best rate, the fewer workers on a tie. Nearest rather than the fewest reaching it:
+/// a step measures 300 ms and the counts jump 4 → 6, so on a 3700X four workers at 8.5 GB/s
+/// against a target of 8.6 would have given six (51 % of the bus) in one session and four in
+/// the next. CPU-RAM keeps its threads; the ones the RAM side gives up run the compute oracle.
+/// No steps (no probe): the plan stays as it is.
+pub fn split_overlap_ram(plan: &mut ThreadPlan, steps: &[(usize, u64)]) {
+    let peak = steps.iter().map(|&(_, rate)| rate).max().unwrap_or(0);
+    if peak == 0 {
+        return;
+    }
+    let (numerator, denominator) = OVERLAP_RAM_BUS_SHARE;
+    let target = peak / denominator * numerator;
+    let Some(&(workers, rate)) = steps
+        .iter()
+        .filter(|&&(workers, _)| workers > 0)
+        .min_by_key(|&&(workers, rate)| (rate.abs_diff(target), workers))
+    else {
+        return;
+    };
+    let pool = (plan.cpu_ram_workers + plan.cpu_oracle_workers).max(1);
+    let ram = workers.min(pool);
+    plan.cpu_ram_workers = ram;
+    plan.cpu_oracle_workers = pool - ram;
+    plan.ram_split = Some(RamSplit {
+        source: RamSplitSource::Probe,
+        peak_bytes_per_second: peak,
+        target_bytes_per_second: target,
+        chosen_bytes_per_second: rate,
+    });
 }
 
 /// Host-memory ceiling handed to each GPU (`DIT_GPU_HOST_BUDGET_BYTES`), which is also its
@@ -736,7 +822,7 @@ mod tests {
                 plan.chain_threads,
                 plan.os_threads
             ),
-            (7, 2, Some(3), Some(2), 1, 1)
+            (2, 7, Some(3), Some(2), 1, 1)
         );
         for n in [1, 2, 4, 8, 32, 64, 128] {
             let plan = plan_threads(n, Intensity::Balanced, ALL);
@@ -752,11 +838,98 @@ mod tests {
             }
         }
         let max = plan_threads(16, Intensity::Max, ALL);
-        assert_eq!((max.cpu_ram_workers, max.cpu_oracle_workers), (12, 4));
+        assert_eq!((max.cpu_ram_workers, max.cpu_oracle_workers), (2, 14));
         assert_eq!(max.gpu_verifier_max, None);
         // At max CPU-RAM gives way to the GPU, SSD and chain feeders; balanced shares threads.
         assert_eq!(max.cpu_ram_nice, MAX_CPU_RAM_NICE);
         assert_eq!(plan.cpu_ram_nice, 0);
+    }
+
+    #[test]
+    fn the_overlap_keeps_a_third_of_the_bus_and_the_oracle_takes_the_rest() {
+        // Before the probe: one RAM worker per eight threads, every other one computes.
+        for (n, ram) in [(1, 1), (2, 1), (8, 1), (16, 2), (32, 4), (64, 8)] {
+            let plan = plan_threads(n, Intensity::Max, ALL);
+            assert_eq!(plan.cpu_ram_workers, ram, "{n} threads");
+            assert_eq!(plan.cpu_ram_workers + plan.cpu_oracle_workers, n);
+            assert_eq!(plan.ram_split.unwrap().source, RamSplitSource::PerThreads);
+        }
+        // The probe of the CPU-RAM baseline on the MAG X870E 9950X3D (2026-10-16), MB/s.
+        let probe: Vec<(usize, u64)> = [
+            (2, 10_800),
+            (3, 15_400),
+            (4, 20_800),
+            (6, 29_900),
+            (8, 37_700),
+            (10, 40_300),
+            (12, 40_000),
+            (16, 39_100),
+        ]
+        .iter()
+        .map(|&(workers, mb)| (workers, mb * 1_000_000))
+        .collect();
+        let mut max = plan_threads(32, Intensity::Max, ALL);
+        split_overlap_ram(&mut max, &probe);
+        // A third of 40.3 GB/s is 13.4: three workers (15.4) are nearest, two (10.8) further.
+        assert_eq!((max.cpu_ram_workers, max.cpu_oracle_workers), (3, 29));
+        let split = max.ram_split.unwrap();
+        assert_eq!(split.source, RamSplitSource::Probe);
+        assert_eq!(split.peak_bytes_per_second, 40_300_000_000);
+        assert_eq!(split.target_bytes_per_second, 13_433_333_333);
+        assert_eq!(split.chosen_bytes_per_second, 15_400_000_000);
+        assert_eq!(max.cpu_ram_nice, MAX_CPU_RAM_NICE);
+        // Balanced: the same RAM workers, CPU-RAM's other threads to the oracle, the GPU, SSD,
+        // chain and OS threads untouched.
+        let before = plan_threads(32, Intensity::Balanced, ALL);
+        let mut balanced = before;
+        split_overlap_ram(&mut balanced, &probe);
+        assert_eq!(balanced.cpu_ram_workers, 3);
+        assert_eq!(
+            balanced.cpu_ram_workers + balanced.cpu_oracle_workers,
+            before.cpu_ram_workers + before.cpu_oracle_workers
+        );
+        assert_eq!(
+            (
+                balanced.gpu_verifier_max,
+                balanced.ssd_workers,
+                balanced.os_threads
+            ),
+            (
+                before.gpu_verifier_max,
+                before.ssd_workers,
+                before.os_threads
+            )
+        );
+        // A small CPU-RAM pool caps the RAM workers.
+        let mut small = plan_threads(4, Intensity::Balanced, ALL);
+        split_overlap_ram(&mut small, &probe);
+        assert_eq!((small.cpu_ram_workers, small.cpu_oracle_workers), (1, 0));
+        // A probe with noise at the target (3700X, 2026-10-17, MB/s): four workers just under a
+        // third of 25.7 GB/s are nearer than six well over it.
+        let noisy: Vec<(usize, u64)> = [
+            (2, 4_400),
+            (3, 6_400),
+            (4, 8_500),
+            (6, 13_200),
+            (8, 16_800),
+            (10, 21_100),
+            (12, 25_700),
+        ]
+        .iter()
+        .map(|&(workers, mb)| (workers, mb * 1_000_000))
+        .collect();
+        let mut dev = plan_threads(16, Intensity::Max, ALL);
+        split_overlap_ram(&mut dev, &noisy);
+        assert_eq!((dev.cpu_ram_workers, dev.cpu_oracle_workers), (4, 12));
+        // On a tie the fewer RAM workers: more threads for the oracle.
+        let mut tie = plan_threads(16, Intensity::Max, ALL);
+        // Target 4 (a third of 12): two workers at 3 and three at 5 are both 1 away.
+        split_overlap_ram(&mut tie, &[(2, 3), (3, 5), (6, 12)]);
+        assert_eq!(tie.cpu_ram_workers, 2);
+        // No probe (a fixed split, no report): the plan stays.
+        let mut unprobed = plan_threads(32, Intensity::Max, ALL);
+        split_overlap_ram(&mut unprobed, &[]);
+        assert_eq!(unprobed, plan_threads(32, Intensity::Max, ALL));
     }
 
     #[test]

@@ -256,9 +256,22 @@ phần RAM do GPU/SSD/chuỗi giữ được kiểm bằng oracle của chúng t
 
 ### 6.3 Luồng CPU (chỉ khác nhau giữa `balanced` và `max`)
 
-Ví dụ 16 luồng, `balanced`: CPU-RAM 6, compute-oracle 2, verifier GPU 3–4, pool SSD 2–3, `dit-chain` 1, OS/UI 1. Ở
-`max`, mỗi engine lấy mặc định của nó và để hệ điều hành chia; riêng lớp CPU-RAM trong overlap chạy `nice 10`
-(`ThreadPlan.cpu_ram_nice`, từ v1.2.017). Lý do: CPU-RAM chiếm đủ mọi luồng, và từ v1.2 C1 mỗi worker đọc/ghi RAM
+Ví dụ 16 luồng, `balanced`: CPU-RAM 9 luồng (worker RAM + compute-oracle, xem dưới), verifier GPU 3, pool SSD 2,
+`dit-chain` 1, OS/UI 1. Ở `max`, CPU-RAM nhận mọi luồng, các engine khác lấy mặc định của chúng và để hệ điều hành chia.
+
+**Worker RAM trong overlap (v1.2 C12, từ v1.2.021).** Luồng của CPU-RAM chia giữa worker RAM và compute-oracle như
+sau: số worker RAM là bước của phép đo C2b ở baseline CPU-RAM (`worker_split.steps`) có tốc độ **gần 1/3 băng thông
+kiểm cao nhất** nhất (hòa thì lấy ít worker hơn), khoảng nhịp RAM của v1.1; **mọi luồng còn lại của CPU-RAM chạy
+compute-oracle** (kernel có kiểm của C3/C5), không luồng nào nghỉ. Lấy bước gần nhất chứ không lấy số nhỏ nhất vượt
+1/3: mỗi bước chỉ đo 300 ms và số bước nhảy 4 → 6, nên trên 3700X cùng một máy từng ra 6 worker ở phiên này, 4 ở phiên
+kia. Trước baseline, hoặc khi report baseline không có phép đo, dùng 1 worker RAM cho 8 luồng. Áp dụng cho cả `max` và `balanced`; chỉ overlap, còn baseline CPU-RAM và menu [1] vẫn để C2b lấp đầy bus. Lý do
+(MAG X870E 9950X3D + RTX 5060 Ti, v1.2.019): bus RAM đầy ở 10 worker, nhưng overlap `max` chia cố định n − n/4 = 24
+worker RAM + 8 oracle; GPU chỉ còn 46 % phép tính đã kiểm và 15 % lane VRAM do CPU kiểm so với baseline của nó, trong
+khi ở pha xoay B (không có tải RAM) cùng GPU đạt 81 % và 90 %. Report: `threads.ram_split` (`source` `probe` hoặc
+`per_threads`, đỉnh, mức đích, tốc độ đo được của số worker đã chọn); dòng `THREADS` trên màn hình ghi nguồn của con số.
+
+Lớp CPU-RAM trong overlap `max` chạy `nice 10` (`ThreadPlan.cpu_ram_nice`, từ v1.2.017). Lý do: CPU-RAM chiếm
+đủ mọi luồng, và từ v1.2 C1 mỗi worker đọc/ghi RAM
 liên tục (nhanh gấp ~3,4 lần), nên ở cùng độ ưu tiên các luồng CPU kiểm kết quả của GPU bị tụt lại và GPU phải chờ.
 Đo trên 3700X + GTX 960 (overlap kiểu `max`, 60 s): ưu tiên ngang nhau GPU bận 60 %, 66 W, 157 M phép ma trận được
 kiểm/s; CPU-RAM `nice 10` thì 79 %, 86 W, 246 M/s, còn CPU-RAM chỉ ít hơn 6 % số round và vẫn lấp mọi chu kỳ còn

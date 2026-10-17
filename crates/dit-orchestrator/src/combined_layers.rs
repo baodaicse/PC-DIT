@@ -740,6 +740,26 @@ pub fn report_json(layer: Layer, dir: &Path) -> Option<serde_json::Value> {
     json(&dir.join(name))
 }
 
+/// The split probe of a CPU-RAM report (`worker_split.steps`, v1.2 C2b) as `(RAM workers,
+/// verify bytes/s)`; empty without a report or with a fixed split.
+#[must_use]
+pub fn split_probe_steps(dir: &Path) -> Vec<(usize, u64)> {
+    let Some(report) = report_json(Layer::CpuRam, dir) else {
+        return Vec::new();
+    };
+    report["worker_split"]["steps"]
+        .as_array()
+        .map_or_else(Vec::new, |steps| {
+            steps
+                .iter()
+                .filter_map(|step| {
+                    let workers = usize::try_from(step["ram_workers"].as_u64()?).ok()?;
+                    Some((workers, step["bytes_per_second"].as_u64()?))
+                })
+                .collect()
+        })
+}
+
 /// Final outcome of a layer from its report; `Crashed` when there is none.
 #[must_use]
 pub fn outcome(layer: Layer, dir: &Path) -> (LayerOutcome, String) {
@@ -914,6 +934,33 @@ mod tests {
         assert_eq!(niced.env.len(), 1);
         let plain = niced_or_not(0);
         assert_eq!(plain.program, PathBuf::from("/opt/cpu-dit-01/dit-cli"));
+    }
+
+    #[test]
+    fn the_split_probe_is_read_from_the_cpu_ram_report() {
+        let dir = std::env::temp_dir().join(format!("dit-combined-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(split_probe_steps(&dir).is_empty(), "no report");
+        std::fs::write(
+            dir.join("system-report.json"),
+            r#"{"worker_split":{"mode":"measured","steps":[
+                {"ram_workers":2,"bytes_per_second":10800000000},
+                {"ram_workers":3,"bytes_per_second":15400000000}],
+                "ram_workers":3,"compute_workers":29}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            split_probe_steps(&dir),
+            [(2, 10_800_000_000), (3, 15_400_000_000)]
+        );
+        std::fs::write(
+            dir.join("system-report.json"),
+            r#"{"worker_split":{"mode":"fixed","steps":[]}}"#,
+        )
+        .unwrap();
+        assert!(split_probe_steps(&dir).is_empty(), "a fixed split");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn niced_or_not(niceness: i32) -> Launch {

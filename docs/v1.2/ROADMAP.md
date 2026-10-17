@@ -56,7 +56,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word | `planned` (thảo luận) |
 | C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
 | C11 | Cân bằng tải GPU / CPU-RAM trong pha chạy chồng: đo tỉ lệ cân bằng, ngân sách băng thông RAM, điều phối | `parked` (phức tạp) |
-| C12 | Nhịp RAM như trước v1.2: không ép kịch bus RAM, trả CPU và băng thông cho GPU | `discussing` |
+| C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -586,7 +586,7 @@ oracle tính gấp đôi, CPU vẫn bận 100 %.
   GPU/RAM; L8 nới trần 4 luồng kiểm.
 - Thử nhanh không cần code: COMBINED BOUNDED `max`, `balanced`, `max` + `dit_isa=v3` trên cùng một máy thực địa.
 
-### C12 — Nhịp RAM như trước v1.2 (`discussing`, 2026-10-16)
+### C12 — Nhịp RAM như trước v1.2 (`done`, v1.2.021)
 
 Hướng thay thế, đơn giản hơn C11: **bỏ mục tiêu ép kịch bus RAM**, đưa phần RAM của CPU-RAM về khoảng nhịp của v1.1,
 giữ mọi cải tiến khác của v1.2 (C2–C8, `nice 10`). Lý do: v1.1 đã PASS nhiều phiên DEEP `max` trên chính máy MAG;
@@ -596,7 +596,7 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
 |---|---|---|---|
 | R1 gỡ C1/C4 cho đường RAM | về mã v1.1: sinh từng byte, kiểm 4 lượt | đúng hệt v1.1 | phí CPU vào việc thừa; gỡ ngược nhiều commit (schema, cấu trúc kiểm); không khuyến nghị |
 | R2 giữ mã C1, giới hạn nhịp từng worker | mỗi worker RAM giữ một tốc độ trần (ví dụ ngang mức v1.1), nghỉ xen giữa các khối 64 KiB | số worker, phân arena, độ phủ mỗi round như cũ; một hằng số | thêm một cơ chế nhịp trong engine; luồng nghỉ thì CPU bớt bận, trừ khi oracle lấp |
-| R3 giữ mã C1, bớt worker RAM | chọn số worker RAM cho ra băng thông ngang v1.1 (một worker C1 ≈ 6–7 worker cũ), các luồng còn lại chạy oracle | chỉ đổi cách chia luồng, không đụng engine; CPU vẫn 100 % | luồng còn lại chạy FMA thì CPU nóng và tốn điện hơn v1.1 (cần chọn kernel cho các luồng này) |
+| R3 giữ mã C1, bớt worker RAM | chọn số worker RAM cho ra băng thông ngang v1.1 (một worker C1 ≈ 6–7 worker cũ), các luồng còn lại chạy oracle | chỉ đổi cách chia luồng, không đụng engine; CPU vẫn 100 %, các luồng còn lại chạy thêm oracle có kiểm | CPU nóng và tốn điện hơn v1.1; không phải lý do bớt tải (throttle chỉ là thông tin) |
 
 - Máy dev, cùng bài với C11: 2 worker RAM + 14 oracle cho RAM ghi + kiểm 2,3 GiB/s (v1.1: 2,6), GPU bận 90 %, K giữ
   256, PCIe đã kiểm khoảng 2,3 GiB/s (pha chạy chồng v1.1: khoảng 2,0), oracle 345 GFLOP/s.
@@ -604,8 +604,40 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
   nay có `nice 10` và K tự tăng, nên kỳ vọng tốt hơn cả v1.1 lẫn v1.2.019. Cần một phiên thực địa để xác nhận.
 - Cái mất: RAM ghi + kiểm mỗi giờ về mức v1.1 (khoảng 1/3,6 hiện nay), ép bộ điều khiển bộ nhớ ít hơn. Cái được thêm:
   thời gian mỗi byte nằm yên giữa ghi và kiểm dài lại khoảng 3,4 lần (nhạy hơn với lỗi lưu giữ), RAM bớt nóng.
-- **Cần chốt:** R2 hay R3; áp dụng chỉ trong pha chạy chồng của COMBINED hay cả menu [1] CPU + RAM (ở đó C2b đang
-  chọn số worker để lấp đầy bus); các luồng được giải phóng chạy oracle FMA, kernel nhẹ hơn hay để nghỉ.
+- **Đã rõ (2026-10-16):** các luồng được giải phóng chạy oracle (kernel có kiểm của C3/C5), không để nghỉ, không đổi
+  sang kernel nhẹ: combined nhằm chạy được nhiều thuật toán có kiểm nhất cùng lúc.
+- **Đã chốt (2026-10-17):** R3, chỉ trong pha chạy chồng của COMBINED. Baseline CPU-RAM và menu [1] CPU + RAM giữ C2b
+  lấp đầy bus.
+
+**Đã làm (v1.2.021).**
+
+- **Quy tắc** (`combined::split_overlap_ram`): khi lớp CPU-RAM của baseline kết thúc, combined đọc các bước đo C2b trong
+  report của nó (`worker_split.steps`) và chọn số worker RAM có tốc độ đo **gần 1/3 đỉnh nhất** (`OVERLAP_RAM_BUS_SHARE`;
+  hòa thì lấy ít worker hơn). Mọi luồng còn lại của CPU-RAM chạy compute-oracle; tổng số luồng của CPU-RAM không đổi.
+  Áp dụng cho cả `max` (CPU-RAM nhận mọi luồng, `nice 10` như cũ) và `balanced` (luồng của GPU, SSD, chain, OS giữ nguyên).
+  Trước baseline, hoặc khi report không có phép đo (crash, chia cố định): 1 worker RAM cho 8 luồng.
+- **Lấy bước gần nhất, không lấy số nhỏ nhất vượt 1/3:** mỗi bước đo chỉ 300 ms và số bước nhảy 4 → 6. Trên 3700X, quy
+  tắc "nhỏ nhất vượt 1/3" cho 6 worker (4 worker đo 8,5 GB/s, đích 8,6) ở một phiên và 4 ở phiên khác; quy tắc gần nhất
+  cho 4 ở cả ba phiên đã chạy. Với phép đo của máy MAG (đỉnh 40,3 GB/s, đích 13,4) cả hai quy tắc đều ra 3.
+- **Ví dụ:** MAG X870E 9950X3D, 32 luồng: 3 RAM + 29 oracle (trước: 24 + 8). 3700X, 16 luồng: 4 + 12 (trước: 12 + 4).
+- **Report:** `combined-report.json` schema 4, `threads.ram_split`: `source` (`probe` hoặc `per_threads`), đỉnh, mức đích,
+  tốc độ đo được của số worker đã chọn. Dòng `THREADS` trên màn hình: `RAM 4 (probe 6.4 of 21.3 GB/s) / ORACLE 12 / ...`.
+- **Đo trên máy dev** (3700X + GTX 960, COMBINED BOUNDED `max` thu nhỏ 20 %, pha chạy chồng khoảng 56 s, cùng máy, hai
+  bản build liền nhau):
+
+| Pha chạy chồng | v1.2.020 (12 RAM + 4 oracle) | v1.2.021 (4 RAM + 12 oracle) |
+|---|---|---|
+| GPU, phép tính đã kiểm | 172 G/s, K phải tăng tới 4096 vì CPU kiểm không kịp | 171 G/s ở K 256 (bằng baseline GPU cùng K) |
+| Lane VRAM/PCIe do CPU kiểm | 1018 MiB/s (55 % baseline) | 1173 MiB/s (64 %) |
+| Sweep DRAM GPU tự kiểm | 6,97 GiB/s (91 %) | 7,62 GiB/s (99 %) |
+| GPU bận, công suất | 86 %, 96 W | 89 %, 99 W |
+| Compute-oracle | 69 GFLOP/s | 156 GFLOP/s |
+| RAM ghi + kiểm | 9,3 GiB/s | 4,2 GiB/s |
+| Kết quả | PASS | PASS |
+
+  Máy dev không tái hiện được tình trạng GPU bị bỏ đói của máy thực địa (GPU vẫn bận khoảng 86–89 % ở cả hai bản), nên
+  phần GPU cần một phiên COMBINED trên máy MAG để xác nhận: so với v1.2.019 (GPU 46 % phép tính, lane 15 % baseline) và
+  với pha xoay B của cùng phiên (81 %, 90 %).
 
 ## Quyết định
 
@@ -625,7 +657,7 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
 | C7 | K tự tăng khi CPU kiểm là giới hạn, chỉ tăng, jobs × K giữ nguyên, tối đa 4096 | đã chốt (2026-10-15) |
 | C8 | INT8 Tensor vào chế độ 1 và COMBINED sau bằng chứng RTX 5060 Ti; chế độ 3 = không INT8 | đã chốt (2026-10-15) |
 | C11 | Gác lại: cân bằng tải bằng đo tỉ lệ + ngân sách băng thông + điều phối là hướng đúng nhưng phức tạp | gác (2026-10-16) |
-| C12 | Đang bàn: quay về nhịp RAM khoảng v1.1, giữ các cải tiến khác của v1.2 | đang bàn (2026-10-16) |
+| C12 | R3 trong pha chạy chồng của COMBINED (`max` và `balanced`): worker RAM theo phép đo C2b của baseline, gần 1/3 đỉnh; mọi luồng còn lại của CPU-RAM chạy oracle, không nghỉ, không đổi kernel nhẹ. Baseline và menu [1] giữ C2b lấp đầy bus | đã chốt (2026-10-17) |
 | C9, C10 | Giữ chuẩn: CPU-verified chỉ khi CPU so toàn bộ với oracle độc lập; device-verified báo riêng. Không dùng tổng kiểm tra kiểu ABFT/Freivalds, FP16/BF16 hay thuật toán không có đáp án chính xác từng bit | đã chốt hướng (2026-10-15), chi tiết cần thảo luận |
 | V0b | Version trong report và `fail-summary.csv`; file cũ không chuyển đổi, thiếu `dit_version` (trước 2026-10-13) là v1.1; CSV dạng cũ đổi tên `fail-summary-v1.1.csv` | đã chốt (2026-10-13) |
 
@@ -639,7 +671,8 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
 6. C6: xoay từng lõi (`done`, v1.2.012). B không cần sửa lớp GPU (đã đo).
 7. C7 + C8: K tự tăng, INT8 trong test đầy đủ (`done`, v1.2.018).
 8. Đo COMBINED v1.2.018 trên máy thật, rồi C9 → C10 sau khi thảo luận.
-9. C12 (nhịp RAM như v1.1) sau khi chốt R2/R3 và phạm vi; C11 gác lại.
+9. C12: R3 trong pha chạy chồng (`done`, v1.2.021); C11 gác lại. Kế tiếp: một phiên COMBINED trên máy MAG để xác
+   nhận phần GPU, rồi C9 → C10.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.
