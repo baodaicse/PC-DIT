@@ -622,20 +622,38 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
 - **Ví dụ:** MAG X870E 9950X3D, 32 luồng: 3 RAM + 29 oracle (trước: 24 + 8). 3700X, 16 luồng: 4 + 12 (trước: 12 + 4).
 - **Report:** `combined-report.json` schema 4, `threads.ram_split`: `source` (`probe` hoặc `per_threads`), đỉnh, mức đích,
   tốc độ đo được của số worker đã chọn. Dòng `THREADS` trên màn hình: `RAM 4 (probe 6.4 of 21.3 GB/s) / ORACLE 12 / ...`.
-- **Đo trên máy dev** (3700X + GTX 960, COMBINED BOUNDED `max` thu nhỏ 20 %, pha chạy chồng khoảng 56 s, cùng máy, hai
-  bản build liền nhau):
+- **Đo trên máy dev** (3700X + GTX 960, COMBINED BOUNDED `max` thu nhỏ 20 %, pha chạy chồng khoảng 56 s, cùng máy).
+  Chạy liền nhau theo cặp: v1.2.020 với v1.2.021 (a), v1.1 (commit `1c8c520`) với v1.2.021 (b). Số worker RAM của
+  v1.2.021 là 4 ở lần (a) và 3 ở lần (b): mỗi phiên tự đo đầu phiên và chọn bước gần 1/3 đỉnh nhất. Phần trăm so với
+  baseline GPU của chính phiên đó.
 
-| Pha chạy chồng | v1.2.020 (12 RAM + 4 oracle) | v1.2.021 (4 RAM + 12 oracle) |
+| Pha chạy chồng | v1.1 | v1.2.020 | v1.2.021 (a) | v1.2.021 (b) |
+|---|---|---|---|---|
+| Chia luồng RAM + oracle | 12 + 4 | 12 + 4 | 4 + 12 | 3 + 13 |
+| GPU, phép tính đã kiểm | 157 G/s (95 %) | 172 G/s (102 %), K phải tăng tới 4096 vì CPU kiểm không kịp | 171 G/s (99 %), K 256 | 172 G/s (100 %), K 256 |
+| Lane VRAM/PCIe do CPU kiểm | 906 MiB/s (50 %) | 1018 MiB/s (55 %) | 1173 MiB/s (64 %) | 1231 MiB/s (67 %) |
+| Sweep DRAM GPU tự kiểm | 7,07 GiB/s (94 %) | 6,97 GiB/s (91 %) | 7,62 GiB/s (99 %) | 7,77 GiB/s (98 %) |
+| GPU bận, công suất | 85 %, 94 W | 86 %, 96 W | 89 %, 99 W | 90 %, 100 W |
+| Compute-oracle | 7 GFLOP/s (kernel một chuỗi) | 69 GFLOP/s | 156 GFLOP/s | 165 GFLOP/s |
+| RAM ghi + kiểm | 2,5 GiB/s | 9,3 GiB/s | 4,2 GiB/s | 3,3 GiB/s |
+| Một round (arena 8–9 GiB) | 7,0 s | 1,7 s | 3,9 s | 5,7 s |
+| Kết quả | PASS | PASS | PASS | PASS |
+
+  So với v1.1, RAM ghi + kiểm của C12 cao hơn khoảng 30 % và thời gian một round gần như cũ (5,7 so với 7,0 s), nên độ
+  nhạy với lỗi lưu giữ giữ được. Khác ở cách đọc: v1.1 đọc mỗi arena 4 lượt khi kiểm (so sánh, hai reduction, SHA-256),
+  v1.2 đọc 1 lượt và băm 4 round một lần; con số "RAM ghi + kiểm" ở cả hai bản đều đếm mỗi byte một lần, nên lưu lượng
+  thật qua bus của v1.1 cao hơn con số trong bảng (chưa đo trực tiếp). Cùng pattern `CPU-DIT-PATTERN-v1`, round nào cũng
+  so đủ từng byte.
+
+- **Thực địa, MAG X870E 9950X3D + RTX 5060 Ti** (COMBINED DEEP `max`, cùng máy, arena khoảng 16 GiB):
+
+| Pha chạy chồng | RAM ghi + kiểm | Một round |
 |---|---|---|
-| GPU, phép tính đã kiểm | 172 G/s, K phải tăng tới 4096 vì CPU kiểm không kịp | 171 G/s ở K 256 (bằng baseline GPU cùng K) |
-| Lane VRAM/PCIe do CPU kiểm | 1018 MiB/s (55 % baseline) | 1173 MiB/s (64 %) |
-| Sweep DRAM GPU tự kiểm | 6,97 GiB/s (91 %) | 7,62 GiB/s (99 %) |
-| GPU bận, công suất | 86 %, 96 W | 89 %, 99 W |
-| Compute-oracle | 69 GFLOP/s | 156 GFLOP/s |
-| RAM ghi + kiểm | 9,3 GiB/s | 4,2 GiB/s |
-| Kết quả | PASS | PASS |
+| v1.1, 5 phiên PASS (2026-10-07 … 10-08) | 5,6–7,5 GiB/s | 4,3–5,7 s |
+| v1.2.019 (2026-10-16) | 14,6 GiB/s | 2,1 s |
+| v1.2.021, 3 RAM + 29 oracle | chưa đo; ước tính 6–8 GiB/s từ phép đo đầu phiên | chưa đo |
 
-  Máy dev không tái hiện được tình trạng GPU bị bỏ đói của máy thực địa (GPU vẫn bận khoảng 86–89 % ở cả hai bản), nên
+  Máy dev không tái hiện được tình trạng GPU bị bỏ đói của máy thực địa (GPU vẫn bận khoảng 85–90 % ở mọi bản), nên
   phần GPU cần một phiên COMBINED trên máy MAG để xác nhận: so với v1.2.019 (GPU 46 % phép tính, lane 15 % baseline) và
   với pha xoay B của cùng phiên (81 %, 90 %).
 
