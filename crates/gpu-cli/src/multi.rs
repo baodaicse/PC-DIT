@@ -622,6 +622,7 @@ fn initial_snapshot(info: &VulkanDeviceInfo) -> GpuProgressSnapshot {
         memory_clock_mhz: None,
         telemetry_source: "waiting for worker telemetry".to_owned(),
         hardware_note: None,
+        loop_profile: None,
     }
 }
 

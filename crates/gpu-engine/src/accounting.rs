@@ -108,6 +108,20 @@ pub struct Timing {
     pub corpus_wait_seconds: f64,
     /// Wall time spent proving the host copy of the corpus unchanged.
     pub integrity_check_seconds: f64,
+    /// v1.2.023, a pipeline call as the owner thread sees it. From the call to the burst loop:
+    /// the corpus (wait, upload), the device clock origin, lane and sweep set-up.
+    pub prepare_seconds: f64,
+    /// Part of `prepare_seconds`: uploading a new corpus to VRAM.
+    pub corpus_install_seconds: f64,
+    /// Part of `prepare_seconds`: stamping the device clock origin (waits for the stream).
+    pub origin_sync_seconds: f64,
+    /// Part of `prepare_seconds`: binding the lane and setting up the sweep.
+    pub setup_seconds: f64,
+    /// The burst loop: submit, poll, hand outputs to the verifiers, until the queue closes.
+    pub loop_seconds: f64,
+    /// From the loop's end to the burst's accounting: sweep drain, last hash, boundary and corpus
+    /// integrity checks.
+    pub after_loop_seconds: f64,
 }
 
 impl Timing {
@@ -125,6 +139,12 @@ impl Timing {
         self.burst_wall_seconds += o.burst_wall_seconds;
         self.corpus_wait_seconds += o.corpus_wait_seconds;
         self.integrity_check_seconds += o.integrity_check_seconds;
+        self.prepare_seconds += o.prepare_seconds;
+        self.corpus_install_seconds += o.corpus_install_seconds;
+        self.origin_sync_seconds += o.origin_sync_seconds;
+        self.setup_seconds += o.setup_seconds;
+        self.loop_seconds += o.loop_seconds;
+        self.after_loop_seconds += o.after_loop_seconds;
     }
     #[must_use]
     pub fn verify_core_seconds(&self) -> f64 {

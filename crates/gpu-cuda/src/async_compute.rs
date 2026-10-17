@@ -554,6 +554,8 @@ struct Prepared {
     rotated: bool,
     prefetch_hit: bool,
     wait_seconds: f64,
+    /// Uploading a corpus to VRAM (a new one, or the one in use again after a boundary check).
+    install_seconds: f64,
 }
 
 impl Drop for Pipeline {
@@ -936,10 +938,13 @@ impl Pipeline {
     /// Chooses the corpus for the next burst: reuse, a prefetched rotation, or a
     /// cold build. Only ever called with no batch outstanding.
     fn prepare(&mut self, backend: &CudaBackend, base: u64) -> Result<Prepared> {
+        let mut install_seconds = 0.0;
         if self.reupload
             && let Some(corpus) = self.corpus.clone()
         {
+            let installing = Instant::now();
             self.install(backend, &corpus)?;
+            install_seconds += installing.elapsed().as_secs_f64();
         }
         if self.external {
             let seed = self
@@ -953,6 +958,7 @@ impl Pipeline {
                 rotated: false,
                 prefetch_hit: false,
                 wait_seconds: 0.0,
+                install_seconds,
             });
         }
         if self.base_seed != Some(base) {
@@ -984,6 +990,7 @@ impl Pipeline {
                 rotated: false,
                 prefetch_hit: false,
                 wait_seconds: 0.0,
+                install_seconds,
             });
         }
         let waited = Instant::now();
@@ -1016,7 +1023,9 @@ impl Pipeline {
         let wait_seconds = waited.elapsed().as_secs_f64();
         // No outstanding batches cross this boundary. Drop old corpus before replacement.
         self.corpus.take();
+        let installing = Instant::now();
         let installed = self.install(backend, &Arc::new(corpus));
+        install_seconds += installing.elapsed().as_secs_f64();
         self.start_prefetch(base);
         installed?;
         Ok(Prepared {
@@ -1025,6 +1034,7 @@ impl Pipeline {
             rotated,
             prefetch_hit,
             wait_seconds,
+            install_seconds,
         })
     }
 
@@ -1261,11 +1271,14 @@ impl Pipeline {
                 .ok_or(Error::Request("corpus missing"))?,
         );
         // Stream events share one device clock; stamp a common origin while idle.
+        let syncing = Instant::now();
         check("async origin", unsafe {
             (backend.context.driver.event_record)(self.origin, backend.stream)
         })?;
         wait_stream(backend, "async origin")?;
+        let origin_sync_seconds = syncing.elapsed().as_secs_f64();
         let origin = self.origin;
+        let setting_up = Instant::now();
         if let Some(lane) = self.lane.as_mut() {
             lane.bind(backend)?;
         }
@@ -1280,7 +1293,9 @@ impl Pipeline {
             self.sweeper = Some(sweeper);
             self.last_swap = Instant::now();
         }
+        let setup_seconds = setting_up.elapsed().as_secs_f64();
         let loop_started = Instant::now();
+        let prepare_seconds = loop_started.duration_since(started).as_secs_f64();
         let output_bytes = (corpus.n * corpus.n + 4) * self.jobs * 4;
         // The byte cap is the host queue: one pinned slot per host slot.
         let queue_cap = output_bytes as u64 * self.config.host_slots as u64;
@@ -1757,6 +1772,8 @@ impl Pipeline {
             // Workers do bounded in-memory comparison only, no driver calls or external waits.
             queue.close();
         });
+        let loop_ended = Instant::now();
+        let loop_seconds = loop_ended.duration_since(loop_started).as_secs_f64();
         let served = queue.stats();
         drop(queue);
         self.fairness.add(&served);
@@ -1878,6 +1895,7 @@ impl Pipeline {
             }
         }
         let end_seconds = backend.epoch.elapsed().as_secs_f64();
+        let after_loop_seconds = loop_ended.elapsed().as_secs_f64();
         let busy_wall = interval_union(&mut intervals);
         let burst_wall = loop_started.elapsed().as_secs_f64();
         #[allow(clippy::cast_precision_loss)]
@@ -1928,6 +1946,12 @@ impl Pipeline {
                 burst_wall_seconds: burst_wall,
                 corpus_wait_seconds: prepared.wait_seconds,
                 integrity_check_seconds: integrity_seconds,
+                prepare_seconds,
+                corpus_install_seconds: prepared.install_seconds,
+                origin_sync_seconds,
+                setup_seconds,
+                loop_seconds,
+                after_loop_seconds,
             },
             mismatch_words,
             mismatch_samples,

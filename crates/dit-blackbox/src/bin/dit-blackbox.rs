@@ -139,6 +139,42 @@ fn layer_json(layer: &LayerSeen, now_ms: u64) -> Value {
     })
 }
 
+/// The GPU test's loop totals (v1.2.023, `loop` in its progress file), one entry per GPU (a
+/// worker's `device-N/progress.json` with several): where its time went, the pipeline call
+/// against everything around it, so a session that never writes its report still tells.
+fn gpu_loops(layers: &[session::LayerStatus]) -> Vec<Value> {
+    let mut loops = Vec::new();
+    for layer in layers.iter().filter(|layer| layer.name == "gpu-vram") {
+        let mut files = vec![(None, layer.run_dir.join("progress.json"))];
+        let mut devices: Vec<String> = std::fs::read_dir(&layer.run_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.starts_with("device-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        devices.sort();
+        files.extend(devices.into_iter().map(|device| {
+            let path = layer.run_dir.join(&device).join("progress.json");
+            (Some(device), path)
+        }));
+        for (device, path) in files {
+            let Some(profile) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .map(|progress| progress["loop"].clone())
+                .filter(|profile| !profile.is_null())
+            else {
+                continue;
+            };
+            loops.push(json!({ "layer": layer.name, "device": device, "loop": profile }));
+        }
+    }
+    loops
+}
+
 /// The live readings of the app's screen (temperatures, power, usage), when it has one.
 fn meters(status: &SessionStatus) -> Value {
     status
@@ -358,7 +394,7 @@ fn follow(
         kernel: session.kernel.clone(),
     };
     let decision = session.tracker.step(&session.info, &seen, limits);
-    let line = json!({
+    let mut line = json!({
         "kind": "beat",
         "t": now,
         "phase": status.phase,
@@ -375,6 +411,10 @@ fn follow(
         "kernel": session.unjournaled.iter().map(|e| json!({"event": e, "said": e.describe()})).collect::<Vec<_>>(),
         "meters": meters(&status),
     });
+    let loops = gpu_loops(&status.layers);
+    if !loops.is_empty() {
+        line["gpu_loops"] = Value::Array(loops);
+    }
     // A line at once on a change that matters (state, failures, the app, a layer's watchdog,
     // the machine becoming strained), else every 60 s (10 s while strained). The phase is in
     // every line but changes nothing: CPU-RAM flips RAM_WRITE / RAM_VERIFY every round.
@@ -726,5 +766,54 @@ mod tests {
         assert!(strained(Some(1), plenty, pressed));
         // /proc/meminfo unreadable: no reading, not strained.
         assert!(!strained(Some(1), host::Memory::default(), None));
+    }
+
+    fn layer(name: &str, run_dir: PathBuf) -> session::LayerStatus {
+        session::LayerStatus {
+            name: name.to_owned(),
+            watchdog_pid: None,
+            run_dir,
+            progress_paths: Vec::new(),
+            cgroup: None,
+            state: "RUNNING".to_owned(),
+            ended: false,
+        }
+    }
+
+    #[test]
+    fn the_journal_carries_the_gpu_loop_totals_of_each_gpu() {
+        let root = std::env::temp_dir().join(format!("dit-blackbox-loops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let one = root.join("p07-gpu-vram");
+        let several = root.join("p08-gpu-vram");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(several.join("device-2")).unwrap();
+        std::fs::create_dir_all(several.join("device-1")).unwrap();
+        let progress = |pipeline: f64| {
+            json!({"state": "RUNNING", "loop": {"generations": 4, "wall_seconds": 2.0,
+                "steps": {"pipeline": {"seconds": pipeline, "calls": 4, "max_seconds": 0.5}},
+                "other_seconds": 0.1}})
+            .to_string()
+        };
+        std::fs::write(one.join("progress.json"), progress(1.0)).unwrap();
+        // The parent of several GPUs writes no loop; each worker does.
+        std::fs::write(several.join("progress.json"), r#"{"state":"RUNNING"}"#).unwrap();
+        std::fs::write(several.join("device-1/progress.json"), progress(1.5)).unwrap();
+        std::fs::write(several.join("device-2/progress.json"), progress(0.5)).unwrap();
+        let layers = [
+            layer("cpu-ram", root.join("p07-cpu-ram")),
+            layer("gpu-vram", one),
+            layer("gpu-vram", several),
+        ];
+        let loops = gpu_loops(&layers);
+        assert_eq!(loops.len(), 3, "{loops:?}");
+        assert_eq!(loops[0]["device"], Value::Null);
+        assert_eq!(loops[0]["loop"]["steps"]["pipeline"]["seconds"], 1.0);
+        assert_eq!(loops[1]["device"], "device-1");
+        assert_eq!(loops[1]["loop"]["steps"]["pipeline"]["seconds"], 1.5);
+        assert_eq!(loops[2]["device"], "device-2");
+        // No GPU layer, or one that wrote no loop yet (before v1.2.023): nothing.
+        assert!(gpu_loops(&layers[..1]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

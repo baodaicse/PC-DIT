@@ -472,6 +472,25 @@ bốn thay đổi. Chi tiết trong từng commit.
   507 MiB/s. Đo trên 3700X + GTX 960: GPU bận 60 → 79 %, công suất 66 → 86 W, CPU-RAM ít hơn 6 % số round.
 - **v1.2.018:** C7 và C8 bên dưới.
 
+### Kết quả thực địa của C12 và đo vòng lặp GPU (v1.2.023, 2026-10-18)
+
+- **C12 trên hai máy mới** (v1.2.022, COMBINED DEEP `max`, so với pha nền GPU của chính phiên):
+  - B760M i5-14400F + RTX 5060: 4 RAM + 12 oracle; GPU 136 % phép tính, lane 45 %;
+  - Z890M Ultra 7 265K + RTX 5070 Ti: 6 RAM + 14 oracle; GPU 96 % phép tính, lane 58 %.
+
+  Để so: máy MAG ở v1.2.019 chỉ đạt 46 % và 15 %. Chưa có phiên cũ trên hai máy này nên chưa so cùng máy được.
+- **TUF Z790 i9-14900K + RTX 5080 kém hơn v1.1 trên chính máy đó:** pha chạy chồng đạt 0,60 T/s và lane 755 MiB/s,
+  so với 0,9 T/s và 1180 MiB/s ở v1.1. Bài thử `balanced` (7 luồng kiểm riêng cho GPU, 14 luồng không bị CPU-RAM
+  chiếm) cho kết quả gần như y hệt, nên nguyên nhân không phải thiếu luồng CPU. Triệu chứng đo được: vòng lặp của
+  `gpu-vram-dit` nằm ngoài pipeline tính toán 47–56 % thời gian ở pha chạy chồng và pha xoay B (100–130 ms mỗi burst),
+  so với 2 ms ở pha nền và 12 ms ở v1.1 cùng máy; pha B hầu như không có tải CPU-RAM mà vẫn bị. Link Gen5 x16 ổn định,
+  không có AER, log kernel sạch. Khác biệt so với các lần v1.1 chạy tốt trên máy này: SSD mới (Patriot P410 thay Apacer)
+  và mức ghi HEAVY.
+- **v1.2.023 đo từng bước của vòng lặp** và ghi vào report, `bottleneck.jsonl` và journal hộp đen
+  ([GPU_BOTTLENECK_LOG.md](../gpu-vram/GPU_BOTTLENECK_LOG.md), mục "Thời gian của vòng lặp generation"). Chỉ thêm số
+  đo, không đổi cách test. Bước tiếp theo: một phiên COMBINED trên TUF với bản này để biết bước nào chiếm phần thời gian
+  ngoài pipeline, rồi mới bàn cách sửa.
+
 ### C7 — K của GEMM tự tăng (`done`, v1.2.018)
 
 Mỗi word output mà CPU so chứa 2·K phép tính của GPU. Khi ≥ 2/3 số burst (tối thiểu 4) kể từ lần quyết định trước

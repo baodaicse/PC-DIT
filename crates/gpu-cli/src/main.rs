@@ -69,8 +69,10 @@ static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 mod backend;
 mod hwhealth;
+mod loop_profile;
 mod multi;
 use backend::Backend;
+use loop_profile::{LoopProfile, LoopWindow, PipelineParts, Step};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -532,6 +534,9 @@ struct BottleneckLogLine<'a> {
     workers_max: usize,
     memory_pressure_hits: u64,
     lane_fill: Option<f64>,
+    /// The generation loop since the previous line: the pipeline call and the rest (v1.2.023).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loop_window: Option<LoopWindow>,
 }
 
 fn append_bottleneck_log(
@@ -593,6 +598,7 @@ fn sample_bottleneck(
         workers_max: report.config.workers_max,
         memory_pressure_hits: report.memory_pressure_hits,
         lane_fill,
+        loop_window: None,
     };
     Some((cause, line))
 }
@@ -617,6 +623,10 @@ struct GpuReport {
     /// Async only: seconds spent under each bottleneck cause, sampled once a second.
     #[serde(skip_serializing_if = "Option::is_none")]
     bottleneck_summary: Option<BottleneckSummary>,
+    /// Where the generation loop's time went: the pipeline call, every step around it, and the
+    /// pipeline call split up (v1.2.023). Absent without a hardware run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loop_profile: Option<LoopProfile>,
     /// CPU cores this GPU process may use for verifiers and corpus helpers (async runs).
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_share: Option<gpu_engine::plan::CpuShare>,
@@ -739,6 +749,10 @@ struct GpuProgressSnapshot {
     /// so a flagged PASS is read from here. Absent in progress files written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hardware_note: Option<String>,
+    /// Running totals of the generation loop (v1.2.023): the black box copies them into its
+    /// journal, so a session that never writes its report still says where the loop's time went.
+    #[serde(rename = "loop", default, skip_serializing_if = "Option::is_none")]
+    loop_profile: Option<LoopProfile>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -870,6 +884,11 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut last_log_poll = Instant::now();
     let mut hardware_note: Option<String> = None;
     let mut bottleneck_summary = BottleneckSummary::default();
+    let mut loop_profile = LoopProfile::default();
+    let mut loop_at_last_sample = LoopProfile::default();
+    // The totals as of the last finished generation: what the progress file carries, so its
+    // step times never run ahead of its wall time.
+    let mut loop_closed = LoopProfile::default();
     let mut bottleneck_log_file = args
         .bottleneck_log
         .as_deref()
@@ -1149,6 +1168,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             };
             break;
         }
+        let generation_started = Instant::now();
         let seed_index = if args.generations.is_some() {
             generation
         } else {
@@ -1303,18 +1323,23 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             if let Some(scheduler) = coverage.as_mut() {
                 scheduler.observe_transfers(plan.pairs, pairs_started.elapsed().as_secs_f64());
             }
-            if !compute_enabled
-                && lane_active
-                && let Err(error) = backend.run_lane_slice(
+            if plan.pairs > 0 {
+                loop_profile.record(Step::Transfers, pairs_started.elapsed());
+            }
+            if !compute_enabled && lane_active {
+                let slice_started = Instant::now();
+                let sliced = backend.run_lane_slice(
                     seed,
                     &|| {
                         CANCELLED.load(Ordering::Relaxed)
                             || should_stop(args, generation, started.elapsed())
                     },
                     Duration::from_millis(500),
-                )
-            {
-                failures.push(failure(generation, seed, "transfer-lane", error));
+                );
+                loop_profile.record(Step::Pipeline, slice_started.elapsed());
+                if let Err(error) = sliced {
+                    failures.push(failure(generation, seed, "transfer-lane", error));
+                }
             }
             if compute_enabled {
                 let burst_started = Instant::now();
@@ -1350,6 +1375,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         resolved_compute_rounds(args),
                     )
                 };
+                loop_profile.record(Step::Pipeline, burst_started.elapsed());
                 // An empty async burst reports no profile; keep the last real attempt.
                 let attempt = backend.last_compute_profile();
                 if let Some(profile) = &attempt {
@@ -1386,8 +1412,10 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 }
             }
             if lane_active {
+                let collecting = Instant::now();
                 collect_lane_failures(backend, &mut failures);
                 lane_now = LaneTotals::from_report(backend.lane_report().as_ref());
+                loop_profile.record(Step::LaneCollect, collecting.elapsed());
             }
         } else {
             let fault = (generation == 0)
@@ -1411,7 +1439,9 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         generation = generation.saturating_add(1);
         if let Some((link, window, _, _)) = instruments.as_mut() {
+            let sampling = Instant::now();
             link.sample();
+            loop_profile.record(Step::LinkSample, sampling.elapsed());
             // Grade the kernel log while the run goes on, so a corrected or fatal hardware event
             // shows on the dashboard when it happens rather than only in the final report.
             if last_log_poll.elapsed() >= LOG_POLL_INTERVAL {
@@ -1420,6 +1450,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 let findings =
                     window.findings_so_far(selected_pci.as_deref(), link.upstream_port.as_deref());
                 hardware_note = live_hardware_note(&findings);
+                loop_profile.record(Step::KernelLog, last_log_poll.elapsed());
             }
         }
         if first_failure.is_none() && !failures.is_empty() {
@@ -1429,6 +1460,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             });
         }
         if last_telemetry.elapsed() >= Duration::from_secs(1) {
+            let sampling = Instant::now();
             // Sampled on its own thread: a stuck nvidia-smi does not freeze this loop (FC0).
             let latest = gpu_feed.samples();
             if !latest.is_empty() {
@@ -1442,6 +1474,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 selected.as_ref().and_then(|i| i.pci_address.as_deref()),
                 started.elapsed(),
             );
+            loop_profile.record(Step::Telemetry, sampling.elapsed());
             if let Some(limit) = args.temp_limit_celsius
                 && telemetry
                     .iter()
@@ -1461,20 +1494,29 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         if args.async_compute && last_bottleneck_sample.elapsed() >= Duration::from_secs(1) {
             let elapsed = last_bottleneck_sample.elapsed().as_secs_f64();
             last_bottleneck_sample = Instant::now();
-            if let Some(report) = vulkan.as_ref().and_then(Backend::async_report)
-                && let Some((cause, line)) =
+            if let Some(report) = vulkan.as_ref().and_then(Backend::async_report) {
+                loop_profile.pipeline = Some(PipelineParts::from_timing(&report.cumulative.timing));
+                if let Some((cause, mut line)) =
                     sample_bottleneck(&report, started.elapsed().as_secs_f64())
-            {
-                bottleneck_summary.record(cause, elapsed);
-                if let Some(file) = bottleneck_log_file.as_mut() {
-                    append_bottleneck_log(file, &line)?;
+                {
+                    bottleneck_summary.record(cause, elapsed);
+                    line.loop_window = Some(loop_profile.window_since(&loop_at_last_sample));
+                    if let Some(file) = bottleneck_log_file.as_mut() {
+                        append_bottleneck_log(file, &line)?;
+                    }
                 }
             }
+            loop_at_last_sample = loop_profile.clone();
+            loop_profile.record(Step::BottleneckSample, last_bottleneck_sample.elapsed());
         }
         if renderer.is_some() || args.progress_file.is_some() {
+            let sampling = Instant::now();
+            let live = host.sample();
+            loop_profile.record(Step::HostSample, sampling.elapsed());
+            let building = Instant::now();
             let mut state = ui_state(
                 &system,
-                host.sample(),
+                live,
                 &devices,
                 &telemetry,
                 args,
@@ -1509,13 +1551,21 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .and_then(Backend::sweep_report)
                 .map(|s| sweep_note(&s, started.elapsed()));
             state.mix_note = mix_note(args, vulkan.as_ref(), started.elapsed());
+            loop_profile.record(Step::UiState, building.elapsed());
             if let Some(path) = args.progress_file.as_deref() {
-                write_progress(path, &progress_snapshot(&state))?;
+                let writing = Instant::now();
+                let mut snapshot = progress_snapshot(&state);
+                snapshot.loop_profile = vulkan.is_some().then(|| loop_closed.clone());
+                write_progress(path, &snapshot)?;
+                loop_profile.record(Step::ProgressWrite, writing.elapsed());
             }
             if let Some(renderer) = renderer.as_mut() {
+                let drawing = Instant::now();
                 renderer.render_frame(&render_gpu_ui(&state, TerminalSize::current(), true))?;
+                loop_profile.record(Step::Render, drawing.elapsed());
             }
         }
+        let emitting = Instant::now();
         emit_faults(
             &fault_writer,
             &failures,
@@ -1523,11 +1573,23 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             selected_pci.as_deref(),
             vulkan.as_ref(),
         );
+        loop_profile.record(Step::FaultEvents, emitting.elapsed());
+        loop_profile.end_generation(generation_started.elapsed());
+        loop_closed.clone_from(&loop_profile);
         if args.stop_on_error && !failures.is_empty() {
             completion_reason = "stop_on_error".to_owned();
             break;
         }
     }
+    // The loop's totals with the pipeline call split up, for the report and the last progress.
+    let final_loop_profile = vulkan.is_some().then(|| {
+        let mut profile = loop_profile.clone();
+        profile.pipeline = vulkan
+            .as_ref()
+            .and_then(Backend::async_report)
+            .map(|r| PipelineParts::from_timing(&r.cumulative.timing));
+        profile
+    });
 
     if lane_active && let Some(backend) = vulkan.as_ref() {
         // Every region still waiting for its re-read or checkpoint is verified before the report.
@@ -1666,7 +1728,10 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             .map(|s| sweep_note(&s, elapsed));
         state.mix_note = mix_note(args, vulkan.as_ref(), elapsed);
         if let Some(path) = args.progress_file.as_deref() {
-            write_progress(path, &progress_snapshot(&state))?;
+            // The final totals stay in the last progress the black box reads.
+            let mut snapshot = progress_snapshot(&state);
+            snapshot.loop_profile.clone_from(&final_loop_profile);
+            write_progress(path, &snapshot)?;
         }
         if let Some(renderer) = renderer.as_mut() {
             renderer.render_frame(&render_gpu_ui(&state, TerminalSize::current(), true))?;
@@ -1681,6 +1746,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         cpu_share: args.async_compute.then(|| async_cpu_share(args)),
         coverage_schedule: coverage.as_ref().map(CoverageScheduler::report),
         bottleneck_summary: args.async_compute.then_some(bottleneck_summary),
+        loop_profile: final_loop_profile,
         workload: args.async_compute.then(|| WorkloadReport {
             profile: match profile {
                 ProfileArg::Combined => "combined",
@@ -2586,6 +2652,7 @@ fn progress_snapshot(state: &GpuUiState) -> GpuProgressSnapshot {
             |sample| sample.source.clone(),
         ),
         hardware_note: state.hardware_note.clone(),
+        loop_profile: None,
     }
 }
 
@@ -3281,6 +3348,7 @@ fn invalid_report(
         cpu_share: None,
         coverage_schedule: None,
         bottleneck_summary: None,
+        loop_profile: None,
         schema_version: SCHEMA_VERSION,
         dit_version: dit_contracts::DIT_VERSION,
         module_id: MODULE_ID.to_owned(),

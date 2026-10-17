@@ -78,6 +78,51 @@ tail -f bottleneck.jsonl
 jq .bottleneck_summary out/report.json
 ```
 
+## Thời gian của vòng lặp generation (v1.2.023)
+
+**Vì sao.** Phiên COMBINED DEEP `max` v1.2.022 trên TUF Z790 (i9-14900K, RTX 5080) cho thấy vòng lặp của
+`gpu-vram-dit` nằm **ngoài** pipeline tính toán khoảng một nửa thời gian của pha chạy chồng và pha xoay B: 100–130 ms
+mỗi burst, so với 2 ms ở pha nền GPU và 12 ms ở v1.1 trên cùng máy. Trong lúc đó GPU không được giao việc nên đứng yên.
+Hai máy khác chạy v1.2.022 (B760M, Z890M) không bị. Report cũ không nói vòng lặp làm gì giữa các burst, nên giờ mọi bước
+đều được bấm giờ. Nguồn: [loop_profile.rs](../../crates/gpu-cli/src/loop_profile.rs).
+
+**Các bước của một generation:** `pipeline` (lời gọi burst hoặc lát transfer), `transfers` (cặp transfer/retention
+tuần tự, khi không có lane), `lane_collect`, `link_sample` (link PCIe và AER qua sysfs), `kernel_log` (`journalctl -k`,
+10 s một lần), `telemetry`, `bottleneck_sample`, `host_sample` (CPU, RAM, cảm biến cho màn hình và progress),
+`ui_state`, `progress_write`, `render`, `fault_events`. Phần không bước nào phủ là `other_seconds`. Mỗi bước có tổng
+giây, số lần và lần lâu nhất (`max_seconds`).
+
+**Trong lời gọi pipeline** (đường CUDA async, `async_compute.timing`):
+
+| Trường | Gồm |
+|---|---|
+| `prepare_seconds` | từ đầu lời gọi đến vòng burst; gồm bốn trường dưới |
+| `corpus_wait_seconds` | chờ corpus dựng sẵn chưa xong |
+| `corpus_install_seconds` | nạp corpus mới lên VRAM |
+| `origin_sync_seconds` | đóng mốc đồng hồ thiết bị (chờ stream) |
+| `setup_seconds` | gắn lane, dựng bộ quét DRAM |
+| `loop_seconds` | vòng burst: gửi batch, chờ, giao output cho luồng kiểm |
+| `after_loop_seconds` | sau vòng: drain bộ quét, hash cuối, kiểm biên, kiểm toàn vẹn corpus (`integrity_check_seconds`) |
+
+Thời gian `pipeline` của CLI trừ `prepare + loop + after_loop` là phần đuôi của lời gọi (cộng sổ, dựng report).
+
+**Ở đâu:**
+
+- `report.json`: `loop_profile` (tổng cả lần chạy, kèm `pipeline` là phần chia trên).
+- `bottleneck.jsonl`: mỗi dòng có `loop_window`, tức những gì xảy ra kể từ dòng trước: số generation, giây, giây trong
+  pipeline, các bước khác từ 1 ms trở lên, `other_seconds`.
+- `progress.json`: `loop` là tổng tính tới generation vừa xong. Hộp đen chép nó vào mỗi dòng journal (`gpu_loops`, một
+  mục cho mỗi GPU, máy nhiều GPU lấy từ `device-N/progress.json`), nên phiên bị sập vẫn còn số liệu. Lấy hiệu giữa hai
+  dòng journal để có tỉ lệ của từng khoảng.
+
+**Đọc thế nào:** tỉ lệ `pipeline / wall_seconds` khoảng 95 % là bình thường (máy dev và hai máy thực địa trên). Nếu thấp,
+bước nào chiếm phần còn lại thì đó là chỗ kẹt; nếu chính `pipeline` dài mà GPU vẫn rảnh, xem phần chia trong pipeline.
+
+**Kiểm trên máy dev** (3700X + GTX 960, COMBINED BOUNDED `max` thu nhỏ 20 %, có hộp đen chạy kèm): pha chạy chồng 60 s,
+309 generation, `pipeline` 57,1 s (96 %), `host_sample` 2,3 s (lần lâu nhất 93 ms), `progress_write` 0,17 s,
+`kernel_log` 0,10 s; trong pipeline `loop` 54,4 s, `prepare` 1,1 s (nạp corpus 0,54 s), `after_loop` 1,7 s (kiểm toàn
+vẹn corpus 0,85 s). Journal có `gpu_loops` ở mọi dòng của pha có GPU.
+
 ## Chưa làm
 
 - Chỉ có ở đường CUDA async; đường tuần tự và Vulkan không có (không có controller/regime để phân
