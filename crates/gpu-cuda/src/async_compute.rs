@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     ffi::c_void,
     ptr,
     rc::Rc,
@@ -68,6 +69,10 @@ pub struct AsyncConfig {
     pub rotate_every_batches: u64,
     /// Helper threads for corpus/oracle builds (0 = automatic, at most a quarter of the cores).
     pub corpus_threads: usize,
+    /// Corpora kept besides the one in use (v1.2 C13 G2). A rotation that finds the next corpus
+    /// not built yet takes one of these (or keeps the one in use) instead of waiting for it; each
+    /// is still verified word for word against its own oracle. 0: wait, as before.
+    pub corpus_pool: usize,
     /// Re-hash the host copy of the corpus every this many batches, and always after a
     /// failed batch, to tell host-memory damage from a device fault (0 = failures only).
     pub integrity_every_batches: u64,
@@ -103,6 +108,7 @@ impl Default for AsyncConfig {
             },
             rotate_every_batches: 256,
             corpus_threads: 0,
+            corpus_pool: 3,
             integrity_every_batches: 512,
             lane: LaneConfig::default(),
             sweep: SweepConfig::default(),
@@ -123,6 +129,7 @@ impl AsyncConfig {
             || !(1..=3_600_000).contains(&self.quarantine_max_age_ms)
             || self.rotate_every_batches > 1_000_000
             || self.corpus_threads > 16
+            || self.corpus_pool > 16
             || self.integrity_every_batches > 100_000_000
             || self.workers_max < self.workers
             || self.workers_max > 32
@@ -477,6 +484,8 @@ pub(crate) struct Pipeline {
     rotation: u64,
     batches_on_corpus: u64,
     prefetch: Option<Prefetch>,
+    /// Built corpora kept besides the one in use, oldest first (C13 G2); all of the current shape.
+    pool: VecDeque<Arc<Corpus>>,
     /// Shape of the corpus in use (it changes only at a rotation, between bursts).
     jobs: usize,
     inner: u32,
@@ -547,6 +556,7 @@ struct Prefetch {
 }
 
 /// What `prepare` did, for the burst's accounting.
+#[allow(clippy::struct_excessive_bools)] // Independent facts about one corpus choice, not a state.
 struct Prepared {
     reused: bool,
     /// Seed of the corpus actually in use (derived from the run's base seed).
@@ -556,6 +566,10 @@ struct Prepared {
     wait_seconds: f64,
     /// Uploading a corpus to VRAM (a new one, or the one in use again after a boundary check).
     install_seconds: f64,
+    /// A rotation was due and no new corpus was ready: one from the pool, or the one in use.
+    pool_served: bool,
+    /// The corpus was built for this burst (its oracle and input time belong to it).
+    fresh: bool,
 }
 
 impl Drop for Pipeline {
@@ -707,6 +721,7 @@ impl Pipeline {
             rotation: 0,
             batches_on_corpus: 0,
             prefetch: None,
+            pool: VecDeque::new(),
             jobs,
             inner,
             shape: AdaptiveShape::new(jobs, inner, config.inner_max),
@@ -811,6 +826,7 @@ impl Pipeline {
             return Err(Error::Request("external corpus exceeds the input buffer"));
         }
         self.prefetch = None;
+        self.pool.clear();
         self.corpus.take();
         let corpus = Arc::new(corpus);
         self.base_seed = Some(corpus.seed);
@@ -938,14 +954,7 @@ impl Pipeline {
     /// Chooses the corpus for the next burst: reuse, a prefetched rotation, or a
     /// cold build. Only ever called with no batch outstanding.
     fn prepare(&mut self, backend: &CudaBackend, base: u64) -> Result<Prepared> {
-        let mut install_seconds = 0.0;
-        if self.reupload
-            && let Some(corpus) = self.corpus.clone()
-        {
-            let installing = Instant::now();
-            self.install(backend, &corpus)?;
-            install_seconds += installing.elapsed().as_secs_f64();
-        }
+        let mut install_seconds = self.reinstall_if_broken(backend)?;
         if self.external {
             let seed = self
                 .corpus
@@ -959,7 +968,12 @@ impl Pipeline {
                 prefetch_hit: false,
                 wait_seconds: 0.0,
                 install_seconds,
+                pool_served: false,
+                fresh: false,
             });
+        }
+        if self.config.corpus_pool > 0 {
+            return self.prepare_pooled(backend, base, install_seconds);
         }
         if self.base_seed != Some(base) {
             // A new run seed restarts the rotation sequence; a stale prefetch is dropped.
@@ -991,6 +1005,8 @@ impl Pipeline {
                 prefetch_hit: false,
                 wait_seconds: 0.0,
                 install_seconds,
+                pool_served: false,
+                fresh: false,
             });
         }
         let waited = Instant::now();
@@ -1035,6 +1051,166 @@ impl Pipeline {
             prefetch_hit,
             wait_seconds,
             install_seconds,
+            pool_served: false,
+            fresh: true,
+        })
+    }
+
+    /// C13 G2: the corpus of the next burst, never waiting for one being built but the very first
+    /// (and the first of a new shape, which nothing else fits). A due rotation takes the new
+    /// corpus when its build is done, else the oldest one in the pool (the one in use goes to the
+    /// back), else keeps the one in use. Each still has its own oracle and is verified word for
+    /// word against it. Only ever called with no batch outstanding.
+    fn prepare_pooled(
+        &mut self,
+        backend: &CudaBackend,
+        base: u64,
+        mut install_seconds: f64,
+    ) -> Result<Prepared> {
+        if self.base_seed != Some(base) {
+            // A new run seed starts a new line of corpora; what is built or kept stays valid.
+            self.base_seed = Some(base);
+            self.rotation = 0;
+        }
+        let current_fits = self
+            .corpus
+            .as_ref()
+            .is_some_and(|c| c.jobs == self.jobs && c.k == self.inner as usize);
+        let every = self.config.rotate_every_batches;
+        let due = every > 0 && self.batches_on_corpus >= every;
+        let in_use_seed = |pipeline: &Self| pipeline.corpus.as_ref().map_or(0, |c| c.seed);
+        if current_fits && !due {
+            self.start_prefetch(base);
+            return Ok(Prepared {
+                reused: true,
+                seed: in_use_seed(self),
+                rotated: false,
+                prefetch_hit: false,
+                wait_seconds: 0.0,
+                install_seconds,
+                pool_served: false,
+                fresh: false,
+            });
+        }
+        let built = self
+            .prefetch
+            .as_ref()
+            .is_some_and(|prefetch| prefetch.handle.is_finished());
+        if current_fits && !built {
+            return self.serve_from_pool(backend, base, install_seconds);
+        }
+        // A new corpus: its build is done, or nothing fits to run on (the first corpus).
+        let waited = Instant::now();
+        let shape_now = |pipeline: &Self| Shape {
+            jobs: pipeline.jobs,
+            inner: pipeline.inner,
+        };
+        let mut prefetched = None;
+        if let Some(prefetch) = self.prefetch.take() {
+            if prefetch.shape != shape_now(self) {
+                // The adaptive shape stepped: the new corpus is of the next shape, which nothing
+                // kept fits.
+                self.apply_shape();
+                self.pool.clear();
+                self.corpus.take();
+            }
+            let shape = prefetch.shape;
+            let built = match prefetch.handle.join() {
+                Ok(built) => built.map_err(Error::Request)?,
+                Err(_) => return Err(Error::Request("corpus prefetch panicked")),
+            };
+            // Never upload a corpus of another shape than the kernels will run.
+            if shape == shape_now(self) {
+                prefetched = Some(built);
+            }
+        }
+        let prefetch_hit = prefetched.is_some();
+        let corpus = if let Some(corpus) = prefetched {
+            corpus
+        } else {
+            let seed = derive_corpus_seed(base, self.rotation);
+            let arith = self.config.arith.for_rotation(self.rotation, self.tensor);
+            Corpus::new_arith(arith, seed, self.jobs, self.inner, self.config.threads())
+                .map_err(Error::Request)?
+        };
+        let wait_seconds = waited.elapsed().as_secs_f64();
+        let rotated = prefetch_hit && self.corpus.is_some();
+        if prefetch_hit {
+            self.rotation += 1;
+        }
+        // The one in use joins the pool; the oldest beyond the pool's size goes.
+        if let Some(current) = self.corpus.take()
+            && current.jobs == self.jobs
+            && current.k == self.inner as usize
+        {
+            self.pool.push_back(current);
+        }
+        while self.pool.len() > self.config.corpus_pool {
+            self.pool.pop_front();
+        }
+        self.batches_on_corpus = 0;
+        let seed = corpus.seed;
+        let installing = Instant::now();
+        let installed = self.install(backend, &Arc::new(corpus));
+        install_seconds += installing.elapsed().as_secs_f64();
+        self.start_prefetch(base);
+        installed?;
+        Ok(Prepared {
+            reused: false,
+            seed,
+            rotated,
+            prefetch_hit,
+            wait_seconds,
+            install_seconds,
+            pool_served: false,
+            fresh: true,
+        })
+    }
+
+    /// The corpus on the device is known wrong (a check found it changed): upload it again.
+    /// Returns the seconds the upload took.
+    fn reinstall_if_broken(&mut self, backend: &CudaBackend) -> Result<f64> {
+        if !self.reupload {
+            return Ok(0.0);
+        }
+        let Some(corpus) = self.corpus.clone() else {
+            return Ok(0.0);
+        };
+        let installing = Instant::now();
+        self.install(backend, &corpus)?;
+        Ok(installing.elapsed().as_secs_f64())
+    }
+
+    /// A due rotation with the next corpus not built yet (C13 G2): the pool's oldest corpus
+    /// (the one in use goes to the back), or the one in use again when the pool is empty.
+    fn serve_from_pool(
+        &mut self,
+        backend: &CudaBackend,
+        base: u64,
+        mut install_seconds: f64,
+    ) -> Result<Prepared> {
+        self.batches_on_corpus = 0;
+        let mut reused = true;
+        if let Some(next) = self.pool.pop_front() {
+            if let Some(current) = self.corpus.take() {
+                self.pool.push_back(current);
+            }
+            let installing = Instant::now();
+            let installed = self.install(backend, &next);
+            install_seconds += installing.elapsed().as_secs_f64();
+            installed?;
+            reused = false;
+        }
+        self.start_prefetch(base);
+        Ok(Prepared {
+            reused,
+            seed: self.corpus.as_ref().map_or(0, |c| c.seed),
+            rotated: false,
+            prefetch_hit: false,
+            wait_seconds: 0.0,
+            install_seconds,
+            pool_served: true,
+            fresh: false,
         })
     }
 
@@ -1929,11 +2105,15 @@ impl Pipeline {
         let burst = BurstSummary {
             totals: ledger.totals.clone(),
             timing: Timing {
-                oracle_seconds: if reused { 0.0 } else { corpus.oracle_seconds },
-                input_generation_seconds: if reused {
-                    0.0
+                oracle_seconds: if prepared.fresh {
+                    corpus.oracle_seconds
                 } else {
+                    0.0
+                },
+                input_generation_seconds: if prepared.fresh {
                     corpus.generation_seconds
+                } else {
+                    0.0
                 },
                 corpus_prepare_wall_seconds: prepare_wall,
                 verify_compare_core_seconds: compare_core,
@@ -1958,7 +2138,8 @@ impl Pipeline {
             failure_hashes,
             corpus_rotations: u64::from(prepared.rotated),
             corpus_prefetch_hits: u64::from(prepared.prefetch_hit),
-            corpus_cold_builds: u64::from(!reused && !prepared.prefetch_hit),
+            corpus_cold_builds: u64::from(prepared.fresh && !prepared.prefetch_hit),
+            corpus_pool_serves: u64::from(prepared.pool_served),
             device_in_flight_peak: ledger.peak_device_in_flight(),
             host_slots_used_peak: ledger.peak_host_used(),
             hashes_computed,

@@ -371,6 +371,7 @@ fn run_multi(
             ),
             ("--async-batches", args.async_batches),
             ("--corpus-threads", args.corpus_threads.map(|n| n as u64)),
+            ("--corpus-pool", args.corpus_pool.map(|n| n as u64)),
             (
                 "--quarantine-slots",
                 args.quarantine_slots.map(|n| n as u64),
@@ -1358,6 +1359,7 @@ mod tests {
             lane: crate::LaneArgs::default(),
             async_batches: None,
             corpus_threads: None,
+            corpus_pool: None,
             quarantine_slots: None,
             blocks_per_generation: 1,
             seed: 1,
@@ -1427,6 +1429,7 @@ mod tests {
             lane: crate::LaneArgs::default(),
             async_batches: None,
             corpus_threads: None,
+            corpus_pool: None,
             quarantine_slots: None,
             blocks_per_generation: 1,
             seed: 1,

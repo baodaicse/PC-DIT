@@ -31,7 +31,8 @@ chặt hơn và ít phải giảm jobs. Dưới áp lực bộ nhớ, thang back
 **độ sâu hàng đợi → số device slot → jobs**, không bao giờ tăng gì, và báo lỗi thay vì cố tăng queue khi ngay
 cả kế hoạch nhỏ nhất không đủ. Một corpus nguội giờ giải phóng corpus cũ trước khi dựng (đỉnh RAM là 1 corpus
 + staging, không phải 2). Báo cáo có `async_device_slots/async_host_slots`, `pinned_queue_bytes`,
-`corpus_prefetch_bytes` thực tế sau backoff.
+`corpus_prefetch_bytes` thực tế sau backoff. Từ v1.2.025 (C13 G2) ngân sách còn tính kho corpus (`--corpus-pool`,
+mỗi corpus một input + đáp án) và bỏ kho trước bậc backoff đầu tiên; báo cáo ghi `corpus_pool`/`corpus_pool_bytes`.
 
 **Rollback khi cấp phát lỗi.** Mọi tài nguyên của pipeline là RAII cho tới khi pipeline tồn tại (event gốc, vốn là
 handle thô, được tạo cuối cùng; trước H3 nó bị rò nếu cấp phát sau đó lỗi). Hết bộ nhớ (thật hoặc mô phỏng)

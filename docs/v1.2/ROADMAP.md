@@ -721,6 +721,30 @@ cài `gpu-vram-dit-v3` / `-v4` (khoảng 3,9 MiB mỗi bản) và hash chúng tr
 128 × K 4096, giữa bản cơ bản và các bản máy chạy được: trùng hết trên 3700X (v4 chỉ kiểm được trên máy có AVX-512).
 Lệnh ẩn `gpu-vram-dit corpus-digest` phục vụ phép so này. Report GPU ghi `cpu_isa`.
 
+**G2 đã làm (v1.2.025).** `--corpus-pool N` (chỉ async, mặc định 3, tối đa 16): ngoài corpus đang dùng, pipeline giữ
+N corpus đã dựng. Đến lượt đổi mà corpus dựng nền chưa xong thì lấy corpus cũ nhất trong kho (đẩy cái đang dùng vào
+cuối kho) thay vì đứng chờ; corpus mới xong thì vào dùng và cái vừa thay vào kho, kho đầy thì bỏ cái cũ nhất. Kho
+không đổi chuẩn kiểm: corpus nào cũng giữ input, đáp án oracle và SHA-256 lúc dựng, mỗi batch trộn generation riêng
+và so toàn bộ output với đáp án như mọi batch khác (mỗi corpus vốn đã được tính lại 256 batch). Đổi hình dạng (C7 tăng
+K) thì xóa kho, và một corpus dựng sẵn sai hình dạng không bao giờ được nạp (dựng nguội lại). Ngân sách RAM của GPU
+tính kho (`corpus_pool`, `corpus_pool_bytes` trong `workspace_budget`) và bỏ kho trước tiên khi thiếu RAM, trước mọi
+bậc backoff khác. Report có `async_compute.corpus_pool_serves` (số lần đổi sang corpus trong kho: lớn nghĩa là CPU
+dựng không kịp GPU); thời gian oracle và sinh input chỉ cộng cho corpus mới dựng. Đo trên máy dev (GTX 960, 3700X,
+40 s, `--compute-mix alternate`, 128 job × K 4096, đổi corpus mỗi 2 batch để CPU chắc chắn không kịp):
+
+| | Không kho (`--corpus-pool 0`) | Kho 3 corpus |
+|---|---|---|
+| Phép tính đã kiểm | 128 G/s | 223 G/s (+74 %) |
+| Chờ CPU dựng corpus | 17,1 s (43 %) | 0,2 s (1 %) |
+| Nạp corpus lên VRAM | 1,6 s | 2,7 s (nạp nhiều lần hơn: việc của G3) |
+| Vòng burst | 19,7 s (49 %) | 35,4 s (88 %) |
+| Corpus mới dựng / lấy từ kho | 37 / 0 | 32 / 33 |
+| RAM của kho | — | 786 MiB |
+| Verdict | PASS | PASS |
+
+Lỗi chèn khi có kho vẫn FAIL đúng. Các test phần cứng đếm số lần xoay theo lịch (`fp32.rs`, `tensor.rs`) chạy với
+`corpus_pool: 0`.
+
 **Ước tính** (kiểm lại bằng phiên thực địa): GPU bận trên cả pha TUF 29 % → khoảng 53 %, MAG 52 % → khoảng 78 %; phép
 tính đã kiểm ×1,5–1,8; CPU cho dựng corpus 0,83 → khoảng 0,35–0,40 lõi (lõi-giây mỗi corpus −73 %), phần trả lại về
 oracle CPU-RAM. **Cái giá:** image thêm khoảng 7,4 MiB; kho corpus khoảng 270 MiB mỗi corpus ở K 4096 (0,5–1 GiB) lấy từ

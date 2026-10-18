@@ -15,6 +15,10 @@ fn prepared(arith: ArithMix, rotate_every_batches: u64) -> CudaBackend {
             batches: 8,
             rotate_every_batches,
             arith,
+            // Every due rotation takes a new corpus (waiting for its build): these gates count
+            // rotations and arithmetics. With a pool (C13 G2) a rotation keeps a built corpus
+            // when the next one is not ready, which a fast burst here always outruns.
+            corpus_pool: 0,
             ..AsyncConfig::default()
         })
         .unwrap();

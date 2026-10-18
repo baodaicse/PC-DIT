@@ -151,6 +151,12 @@ của GPU. Khi CPU kiểm không kịp (≥ 2/3 số burst kể từ lần quy�
   đổi (0,2 s). Report ghi `cpu_isa`.
 - Corpus nằm sẵn trong VRAM; GPU tính lại nhiều lần với generation khác nhau. Ở async, cứ 256 batch thì đổi
   sang corpus mới (seed dẫn xuất, dựng sẵn ở nền).
+- **Kho corpus (v1.2.025, C13 G2):** ngoài corpus đang dùng, pipeline giữ `--corpus-pool` corpus đã dựng (mặc định 3).
+  Đến lượt đổi mà corpus dựng nền chưa xong thì GPU chuyển sang corpus cũ nhất trong kho thay vì chờ CPU; mỗi corpus
+  trong kho vẫn có input, đáp án oracle và SHA-256 riêng, nên mỗi batch vẫn so toàn bộ output với đáp án. Kho tính vào
+  ngân sách RAM và bị bỏ trước tiên khi thiếu RAM; đổi K (C7) thì xóa kho. Report: `async_compute.corpus_pool_serves`
+  (số lần lấy từ kho), `workspace_budget.corpus_pool`/`corpus_pool_bytes`. Máy dev, CPU cố ý không kịp: phép tính đã
+  kiểm 128 → 223 G/s, thời gian chờ corpus 43 % → 1 %.
 - Cứ 512 batch, CPU băm lại corpus phía host và so với SHA-256 lúc dựng. Nếu RAM máy làm hỏng đáp án thì lỗi
   đó không bị đổ oan cho GPU.
 

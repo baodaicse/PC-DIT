@@ -19,6 +19,8 @@ fn configure(backend: &mut CudaBackend, arith: ArithMix, rotate_every_batches: u
             batches: 8,
             rotate_every_batches,
             arith,
+            // Every due rotation takes a new corpus: the gate counts rotations (see fp32.rs).
+            corpus_pool: 0,
             ..AsyncConfig::default()
         })
         .unwrap();

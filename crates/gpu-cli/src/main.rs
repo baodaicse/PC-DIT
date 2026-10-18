@@ -415,6 +415,10 @@ struct RunArgs {
     /// Async only: helper threads for corpus builds (default from the CPU share).
     #[arg(long)]
     corpus_threads: Option<usize>,
+    /// Async only: built corpora kept besides the one in use (default 3, fewer when host RAM is
+    /// short), so a rotation never waits for the next one to be built (v1.2 C13); 0 waits.
+    #[arg(long)]
+    corpus_pool: Option<usize>,
     /// Async only: failed batches held for confirmation at most (default 1).
     #[arg(long)]
     quarantine_slots: Option<usize>,
@@ -1039,7 +1043,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 let plan = if args.async_compute {
                     let config = async_config(args);
                     let prefetch = config.rotate_every_batches > 0;
-                    let mut plan = gpu_vulkan::WorkspaceBudget::plan_async(
+                    let mut plan = gpu_vulkan::WorkspaceBudget::plan_async_pooled(
                         device,
                         host,
                         allocation_target,
@@ -1052,6 +1056,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         },
                         prefetch,
                         config.lane.pinned_bytes(),
+                        if prefetch { config.corpus_pool } else { 0 },
                     )?;
                     // The plan may have shed queue depth, overlap or jobs; configure what fits.
                     let (device_slots, host_slots) = (
@@ -1063,6 +1068,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         host_slots,
                         workers: config.workers.min(host_slots),
                         quarantine_slots: config.quarantine_slots.min(host_slots - 1),
+                        corpus_pool: plan.corpus_pool,
                         ..config
                     })?;
                     let (jobs, backoffs) =
@@ -1070,7 +1076,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     // Allocation backoff may go further than the estimate; report what exists.
                     let effective = backend.async_effective_config().unwrap_or(config);
                     let (matrix_device, matrix_host, pinned, prefetch_bytes) =
-                        gpu_vulkan::WorkspaceBudget::async_footprint(
+                        gpu_vulkan::WorkspaceBudget::async_footprint_pooled(
                             inner,
                             gpu_engine::plan::SlotPlan {
                                 jobs,
@@ -1078,6 +1084,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 host_slots: effective.host_slots,
                             },
                             prefetch,
+                            effective.corpus_pool,
                         );
                     plan.matrix_jobs_effective = jobs;
                     plan.async_device_slots = Some(effective.device_slots);
@@ -1087,6 +1094,9 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     plan.pinned_queue_bytes = pinned;
                     plan.corpus_prefetch_bytes = prefetch_bytes;
                     plan.lane_pinned_bytes = effective.lane.pinned_bytes();
+                    plan.corpus_pool = effective.corpus_pool;
+                    plan.corpus_pool_bytes = effective.corpus_pool as u64
+                        * gpu_vulkan::WorkspaceBudget::corpus_host_bytes(inner, jobs);
                     plan.backoff_steps += backoffs;
                     plan
                 } else {
@@ -1993,6 +2003,7 @@ fn pipeline_for_device(args: &RunArgs, device: Option<&VulkanDeviceInfo>) -> Run
         resolved.async_batches = None;
         resolved.coverage_floor = None;
         resolved.corpus_threads = None;
+        resolved.corpus_pool = None;
         resolved.quarantine_slots = None;
         resolved.bottleneck_log = None;
         resolved.boundary_checks = false;
@@ -2029,6 +2040,9 @@ fn async_config(args: &RunArgs) -> gpu_cuda::AsyncConfig {
     };
     if let Some(n) = args.corpus_rotate_batches {
         config.rotate_every_batches = n;
+    }
+    if let Some(n) = args.corpus_pool {
+        config.corpus_pool = n;
     }
     if let Some(mix) = args.compute_mix {
         config.arith = mix.into();
@@ -2166,6 +2180,7 @@ fn validate_args(args: &RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         || args.async_workers.is_some()
         || args.async_batches.is_some()
         || args.corpus_threads.is_some()
+        || args.corpus_pool.is_some()
         || args.async_workers_max.is_some()
         || args.coverage_floor.is_some()
         || args.quarantine_slots.is_some()
@@ -4215,6 +4230,7 @@ mod tests {
             lane: LaneArgs::default(),
             async_batches: None,
             corpus_threads: None,
+            corpus_pool: None,
             quarantine_slots: None,
             blocks_per_generation: 1,
             seed: 1,
@@ -4281,6 +4297,7 @@ mod tests {
             lane: LaneArgs::default(),
             async_batches: None,
             corpus_threads: None,
+            corpus_pool: None,
             quarantine_slots: None,
             blocks_per_generation: 1,
             seed: 1,
@@ -4349,6 +4366,7 @@ mod tests {
             lane: LaneArgs::default(),
             async_batches: None,
             corpus_threads: None,
+            corpus_pool: None,
             quarantine_slots: None,
             blocks_per_generation: 1,
             seed: 1,
@@ -4566,6 +4584,7 @@ mod tests {
             lane: LaneArgs::default(),
             async_batches: None,
             corpus_threads: None,
+            corpus_pool: None,
             quarantine_slots: None,
             blocks_per_generation: 1,
             seed: 1,

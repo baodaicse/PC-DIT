@@ -163,6 +163,9 @@ pub struct BurstSummary {
     pub corpus_rotations: u64,
     pub corpus_prefetch_hits: u64,
     pub corpus_cold_builds: u64,
+    /// A rotation was due and no new corpus was built yet: the burst ran on one from the pool,
+    /// or kept the one in use (v1.2 C13 G2).
+    pub corpus_pool_serves: u64,
     /// SHA-256 computations of actual outputs (policy, last-batch and failure hashes).
     pub hashes_computed: u64,
     pub integrity_checks: u64,
@@ -214,6 +217,8 @@ pub struct Cumulative {
     pub corpus_rotations: u64,
     pub corpus_prefetch_hits: u64,
     pub corpus_cold_builds: u64,
+    /// Rotations served without a new corpus: from the pool, or the one in use kept (C13 G2).
+    pub corpus_pool_serves: u64,
     pub hashes_computed: u64,
     pub integrity_checks: u64,
     pub integrity_failures: u64,
@@ -279,6 +284,7 @@ impl Cumulative {
         self.corpus_rotations += burst.corpus_rotations;
         self.corpus_prefetch_hits += burst.corpus_prefetch_hits;
         self.corpus_cold_builds += burst.corpus_cold_builds;
+        self.corpus_pool_serves += burst.corpus_pool_serves;
         self.hashes_computed += burst.hashes_computed;
         self.integrity_checks += burst.integrity_checks;
         self.integrity_failures += burst.integrity_failures;

@@ -29,6 +29,10 @@ pub struct WorkspaceBudget {
     /// GPU-H6: pinned staging the transfer lane holds (upload + download + flag per slot),
     /// already included in `matrix_host_bytes`; 0 when the lane is off.
     pub lane_pinned_bytes: u64,
+    /// v1.2 C13 G2: corpora the async pipeline keeps besides the one in use, served when the
+    /// next one is not built in time, and their host RAM (inside `matrix_host_bytes`).
+    pub corpus_pool: usize,
+    pub corpus_pool_bytes: u64,
 }
 
 impl WorkspaceBudget {
@@ -134,6 +138,8 @@ impl WorkspaceBudget {
                     async_host_slots: None,
                     pinned_queue_bytes: 0,
                     corpus_prefetch_bytes: 0,
+                    corpus_pool: 0,
+                    corpus_pool_bytes: 0,
                     lane_pinned_bytes: 0,
                 });
             }
@@ -153,17 +159,34 @@ impl WorkspaceBudget {
         plan: SlotPlan,
         prefetch_corpus: bool,
     ) -> (u64, u64, u64, u64) {
-        let (input, output, _) = gpu_engine::gemm::workspace_per_job(inner);
+        Self::async_footprint_pooled(inner, plan, prefetch_corpus, 0)
+    }
+
+    /// Host RAM of one corpus (input and expected results) of `jobs` jobs at `inner`.
+    #[must_use]
+    pub fn corpus_host_bytes(inner: u32, jobs: usize) -> u64 {
+        let (input, _, _) = gpu_engine::gemm::workspace_per_job(inner);
         let expected = (gpu_engine::gemm::MAX_N * gpu_engine::gemm::MAX_N * 4) as u64;
+        jobs as u64 * (input + expected)
+    }
+
+    /// As [`Self::async_footprint`], with `corpus_pool` more corpora kept in host RAM; the host
+    /// value contains them too.
+    #[must_use]
+    pub fn async_footprint_pooled(
+        inner: u32,
+        plan: SlotPlan,
+        prefetch_corpus: bool,
+        corpus_pool: usize,
+    ) -> (u64, u64, u64, u64) {
+        let (input, output, _) = gpu_engine::gemm::workspace_per_job(inner);
+        let corpus = Self::corpus_host_bytes(inner, plan.jobs);
         let jobs = plan.jobs as u64;
         let device = jobs * (input + output * plan.device_slots as u64);
         let pinned_queue = jobs * output * plan.host_slots as u64;
-        let prefetch = if prefetch_corpus {
-            jobs * (input + expected)
-        } else {
-            0
-        };
-        let host = jobs * (2 * input + expected) + pinned_queue + prefetch;
+        let prefetch = if prefetch_corpus { corpus } else { 0 };
+        // The corpus in use plus its pinned upload staging (another input's worth).
+        let host = corpus + jobs * input + pinned_queue + prefetch + corpus_pool as u64 * corpus;
         (device, host, pinned_queue, prefetch)
     }
 
@@ -189,6 +212,37 @@ impl WorkspaceBudget {
         prefetch_corpus: bool,
         lane_pinned_bytes: u64,
     ) -> Result<Self, &'static str> {
+        Self::plan_async_pooled(
+            device,
+            host,
+            pool,
+            integrated,
+            inner,
+            request,
+            prefetch_corpus,
+            lane_pinned_bytes,
+            0,
+        )
+    }
+
+    /// As [`Self::plan_async`], also keeping up to `corpus_pool` more corpora in host RAM (v1.2
+    /// C13 G2), served when the next corpus is not built in time. Short of memory the pool is
+    /// given up first, one corpus at a time, before the slot ladder starts.
+    ///
+    /// # Errors
+    /// As [`Self::plan_async`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_async_pooled(
+        device: u64,
+        host: u64,
+        pool: u64,
+        integrated: bool,
+        inner: u32,
+        request: SlotPlan,
+        prefetch_corpus: bool,
+        lane_pinned_bytes: u64,
+        corpus_pool: usize,
+    ) -> Result<Self, &'static str> {
         if !(1..=gpu_engine::gemm::MAX_K).contains(&inner) {
             return Err("matrix inner dimension outside contract");
         }
@@ -205,9 +259,13 @@ impl WorkspaceBudget {
         let host_reserve = (host / 10).max(128 * MIB);
         let device_free = device.saturating_sub(device_reserve);
         let host_budget = host.saturating_sub(host_reserve);
-        for (step, plan) in request.ladder().into_iter().enumerate() {
+        let attempts = (1..=corpus_pool)
+            .rev()
+            .map(|kept| (request, kept))
+            .chain(request.ladder().into_iter().map(|plan| (plan, 0)));
+        for (step, (plan, kept)) in attempts.enumerate() {
             let (matrix_device, matrix_host, pinned_queue, prefetch) =
-                Self::async_footprint(inner, plan, prefetch_corpus);
+                Self::async_footprint_pooled(inner, plan, prefetch_corpus, kept);
             let matrix_host = matrix_host + lane_pinned_bytes;
             let local_free = device_free.saturating_sub(matrix_device);
             let host_free = host_budget
@@ -242,6 +300,8 @@ impl WorkspaceBudget {
                     pinned_queue_bytes: pinned_queue,
                     corpus_prefetch_bytes: prefetch,
                     lane_pinned_bytes,
+                    corpus_pool: kept,
+                    corpus_pool_bytes: kept as u64 * Self::corpus_host_bytes(inner, plan.jobs),
                 });
             }
         }
@@ -309,6 +369,66 @@ mod tests {
         )
         .unwrap();
         assert!(tight.matrix_jobs_effective < 4096 && tight.backoff_steps > 0);
+    }
+
+    #[test]
+    fn the_corpus_pool_is_held_when_it_fits_and_given_up_first_when_not() {
+        // The RTX 5080 overlap shape: 512 jobs at K 1024 (jobs x K stays as K grows).
+        let corpus = WorkspaceBudget::corpus_host_bytes(1024, 512);
+        let request = ask(512, 3, 8);
+        let plan = |host: u64, pool: usize| {
+            WorkspaceBudget::plan_async_pooled(
+                16 * 1024 * MIB,
+                host,
+                8 * 1024 * MIB,
+                false,
+                1024,
+                request,
+                true,
+                32 * MIB,
+                pool,
+            )
+        };
+        let without = plan(2048 * MIB, 0).unwrap();
+        let with = plan(2048 * MIB, 3).unwrap();
+        assert_eq!((with.corpus_pool, with.backoff_steps), (3, 0));
+        assert_eq!(with.corpus_pool_bytes, 3 * corpus);
+        assert_eq!(
+            with.matrix_host_bytes,
+            without.matrix_host_bytes + 3 * corpus
+        );
+        assert_eq!(without.corpus_pool, 0);
+        // Short of host RAM: the pool shrinks, one corpus at a time, before anything else.
+        let host = without.matrix_host_bytes + corpus + corpus / 2;
+        let budget = host + host / 9 + MIB;
+        let tight = plan(budget, 3).unwrap();
+        assert_eq!(tight.corpus_pool, 1, "{tight:?}");
+        assert_eq!(tight.backoff_steps, 2);
+        assert_eq!(
+            (tight.matrix_jobs_effective, tight.async_host_slots),
+            (512, Some(8))
+        );
+        // Not even room for one: no pool, the slots as asked.
+        let none = plan(
+            without.matrix_host_bytes + without.matrix_host_bytes / 9 + MIB,
+            3,
+        )
+        .unwrap();
+        assert_eq!((none.corpus_pool, none.matrix_jobs_effective), (0, 512));
+        // The old entry point keeps no pool.
+        let old = WorkspaceBudget::plan_async(
+            16 * 1024 * MIB,
+            2048 * MIB,
+            8 * 1024 * MIB,
+            false,
+            1024,
+            request,
+            true,
+            32 * MIB,
+        )
+        .unwrap();
+        assert_eq!(old.corpus_pool, 0);
+        assert_eq!(old.matrix_host_bytes, without.matrix_host_bytes);
     }
 
     fn ask(jobs: usize, device: usize, host: usize) -> SlotPlan {
