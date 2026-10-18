@@ -57,6 +57,8 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
 | C11 | Cân bằng tải GPU / CPU-RAM trong pha chạy chồng: đo tỉ lệ cân bằng, ngân sách băng thông RAM, điều phối | `parked` (phức tạp) |
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
+| C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `in_progress` |
+| C14 | Chuỗi GEMM có đáp án biết trước (M^L = Π) | `parked` |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -676,6 +678,63 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
   phần GPU cần một phiên COMBINED trên máy MAG để xác nhận: so với v1.2.019 (GPU 46 % phép tính, lane 15 % baseline) và
   với pha xoay B của cùng phiên (81 %, 90 %).
 
+### C13 — Cấp corpus kịp cho GPU nhanh (`in_progress`, 2026-10-18)
+
+**Bằng chứng** (v1.2.023, đo vòng lặp; pha chạy chồng `max`):
+
+| | TUF i9-14900K + RTX 5080 | MAG 9950X3D + RTX 5060 Ti |
+|---|---|---|
+| Chờ CPU dựng corpus | 33 % | 27 % |
+| Nạp corpus lên VRAM (chặn luồng điều phối) | 4,8 % | 4,0 % |
+| Kiểm toàn vẹn corpus (chặn luồng điều phối) | 5,9 % | 5,8 % |
+| Vòng burst | 49 % | 59 % |
+| GPU bận trong vòng burst | 59 % | 87 % |
+| GPU bận trên cả pha | 29 % | 52 % |
+| CPU dành cho dựng corpus | 0,83 lõi | 0,82 lõi |
+
+GPU dùng hết một corpus (256 batch) trong 0,2–0,5 s; CPU dựng một corpus FP32 mất 1,5 s vì `gpu-vram-dit` chỉ build cho
+x86-64 cơ bản, `mul_add` thành lời gọi hàm thư viện cho từng phần tử. Đo trên 3700X, 4 luồng, corpus 128 job × K 4096:
+
+| Dựng một corpus | SSE2 (hiện nay) | AVX2+FMA |
+|---|---|---|
+| u32 | 0,21 s | 0,20 s |
+| FP32 | 1,47 s | 0,23 s |
+| INT8 | 0,11 s | 0,05 s |
+| Cả vòng u32 → FP32 → INT8 | 1,79 s | 0,48 s (−73 %) |
+
+**Ba bước** (không đổi chuẩn kiểm: CPU vẫn so toàn bộ từng word với oracle độc lập):
+
+- **G1 — `gpu-vram-dit` theo mức ISA.** Build thêm `gpu-vram-dit-v3` và `-v4`, bản cơ bản chọn bản rộng nhất CPU chạy
+  được rồi `exec` sang, như C4 làm cho `dit-cli` (chung `dit_system::isa`, chỉnh tay bằng `DIT_ISA` / `dit_isa=`).
+  Thuật toán và thứ tự cộng của oracle không đổi, nên corpus và đáp án trùng từng bit giữa các bản; một test bắt buộc
+  so digest của corpus giữa các bản.
+- **G2 — kho corpus, GPU không bao giờ chờ.** Giữ vài corpus đã dựng trong RAM; bộ dựng chạy nền, xong cái mới thì thay
+  cái cũ nhất. Đến lượt đổi mà cái mới chưa xong thì dùng cái kế trong kho thay vì đứng chờ. Mọi batch vẫn so toàn bộ
+  với oracle; report ghi số lần đổi sang corpus trong kho (dùng lại) để thấy khi nào CPU không theo kịp. Kho tính vào
+  ngân sách RAM của GPU, tự nhỏ lại trên máy ít RAM.
+- **G3 — gỡ việc chặn luồng điều phối.** Kiểm toàn vẹn corpus định kỳ chạy trên luồng phụ (batch sai vẫn kiểm ngay như
+  cũ); corpus kế tiếp được chuẩn bị sẵn để lúc đổi chỉ còn nạp lên VRAM.
+
+**G1 đã làm (v1.2.024).** `dit_system::isa::exec_build_for_cpu` dùng chung cho `dit-cli` và `gpu-vram-dit`; extension
+cài `gpu-vram-dit-v3` / `-v4` (khoảng 3,9 MiB mỗi bản) và hash chúng trong manifest; `tools/test_gpu_isa.sh` (cũng là
+`make test-gpu-isa`, chạy mỗi lần build extension) so digest input và đáp án của 9 corpus u32 / FP32 / INT8, tới cỡ
+128 × K 4096, giữa bản cơ bản và các bản máy chạy được: trùng hết trên 3700X (v4 chỉ kiểm được trên máy có AVX-512).
+Lệnh ẩn `gpu-vram-dit corpus-digest` phục vụ phép so này. Report GPU ghi `cpu_isa`.
+
+**Ước tính** (kiểm lại bằng phiên thực địa): GPU bận trên cả pha TUF 29 % → khoảng 53 %, MAG 52 % → khoảng 78 %; phép
+tính đã kiểm ×1,5–1,8; CPU cho dựng corpus 0,83 → khoảng 0,35–0,40 lõi (lõi-giây mỗi corpus −73 %), phần trả lại về
+oracle CPU-RAM. **Cái giá:** image thêm khoảng 7,4 MiB; kho corpus khoảng 270 MiB mỗi corpus ở K 4096 (0,5–1 GiB) lấy từ
+ngân sách RAM của GPU; lỗi RAM host trong corpus được báo trễ tối đa khoảng một lần đổi corpus (verdict không đổi). Sau
+C13, giới hạn kế tiếp là độ bận trong vòng burst (trần luồng kiểm): việc của C9.
+
+### C14 — Chuỗi GEMM có đáp án biết trước (`parked`, 2026-10-18)
+
+GPU nhân X·M·…·M (L tầng) với M dựng sao cho M^L = Π (hoán vị có đổi dấu): đáp án Π·X có sẵn, CPU so toàn bộ mà không
+phải dựng oracle. Gác lại vì: (1) chỉ đúng tuyệt đối với u32, FP32 và INT8 mất tính chất này (làm tròn, ép về int8), nên
+mất phần ép pipe FP32 FMA và Tensor core; (2) kiểm cả chuỗi chứ không từng tích, nên cùng họ với C10 và phải báo riêng
+khỏi CPU-verified; (3) không áp vào data chain: đáp án của chain tính sẵn hai lần lúc nạp và đi qua đường SSD → RAM như
+một phần dữ liệu được kiểm, bỏ nó thì chain mất nửa lượng byte và mất FP32.
+
 ## Quyết định
 
 | Chủ đề | Quyết định | Trạng thái |
@@ -695,6 +754,8 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
 | C8 | INT8 Tensor vào chế độ 1 và COMBINED sau bằng chứng RTX 5060 Ti; chế độ 3 = không INT8 | đã chốt (2026-10-15) |
 | C11 | Gác lại: cân bằng tải bằng đo tỉ lệ + ngân sách băng thông + điều phối là hướng đúng nhưng phức tạp | gác (2026-10-16) |
 | C12 | R3 trong pha chạy chồng của COMBINED (`max` và `balanced`): worker RAM theo phép đo C2b của baseline, gần 1/3 đỉnh; mọi luồng còn lại của CPU-RAM chạy oracle, không nghỉ, không đổi kernel nhẹ. Baseline và menu [1] giữ C2b lấp đầy bus | đã chốt (2026-10-17) |
+| C13 | G1 + G2 (kho corpus) + G3; chuẩn kiểm không đổi; sau đó C9 cho trần luồng kiểm | đã chốt (2026-10-18) |
+| C14 | Gác: chỉ u32, kiểm cả chuỗi (báo riêng), không áp vào data chain | gác (2026-10-18) |
 | C9, C10 | Giữ chuẩn: CPU-verified chỉ khi CPU so toàn bộ với oracle độc lập; device-verified báo riêng. Không dùng tổng kiểm tra kiểu ABFT/Freivalds, FP16/BF16 hay thuật toán không có đáp án chính xác từng bit | đã chốt hướng (2026-10-15), chi tiết cần thảo luận |
 | V0b | Version trong report và `fail-summary.csv`; file cũ không chuyển đổi, thiếu `dit_version` (trước 2026-10-13) là v1.1; CSV dạng cũ đổi tên `fail-summary-v1.1.csv` | đã chốt (2026-10-13) |
 
@@ -708,8 +769,8 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
 6. C6: xoay từng lõi (`done`, v1.2.012). B không cần sửa lớp GPU (đã đo).
 7. C7 + C8: K tự tăng, INT8 trong test đầy đủ (`done`, v1.2.018).
 8. Đo COMBINED v1.2.018 trên máy thật, rồi C9 → C10 sau khi thảo luận.
-9. C12: R3 trong pha chạy chồng (`done`, v1.2.021); C11 gác lại. Kế tiếp: một phiên COMBINED trên máy MAG để xác
-   nhận phần GPU, rồi C9 → C10.
+9. C12: R3 trong pha chạy chồng (`done`, v1.2.021); C11 gác lại.
+10. C13: G1 → G2 → G3, đo trên máy dev, rồi phiên thực địa trên TUF và MAG. Sau đó C9 → C10.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.

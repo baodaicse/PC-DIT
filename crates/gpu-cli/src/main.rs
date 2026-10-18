@@ -92,6 +92,31 @@ enum Command {
     Run(RunArgs),
     /// Print PCI/sensor and CUDA/Vulkan device inventory as JSON.
     Inventory,
+    /// Build one GEMM corpus on the CPU and print its digests and build time as JSON (v1.2
+    /// C13): every ISA build of this program must give the same digests (`tools/test_gpu_isa.sh`).
+    #[command(hide = true)]
+    CorpusDigest(CorpusDigestArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct CorpusDigestArgs {
+    #[arg(long, value_enum, default_value_t = DigestArithArg::U32)]
+    arith: DigestArithArg,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 16)]
+    jobs: usize,
+    #[arg(long, default_value_t = 256)]
+    inner: u32,
+    #[arg(long, default_value_t = 4)]
+    threads: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DigestArithArg {
+    U32,
+    Fp32,
+    Int8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -635,6 +660,8 @@ struct GpuReport {
     schema_version: u32,
     /// DIT-01 version that wrote this report (absent before v1.2: v1.1).
     dit_version: &'static str,
+    /// The build that ran (x86-64 level of its CPU oracle) and how it was chosen (v1.2 C13).
+    cpu_isa: dit_system::isa::IsaEvidence,
     module_id: String,
     run_id: String,
     verdict: Verdict,
@@ -809,6 +836,10 @@ fn cpu_sensor_metrics(snapshot: &TelemetrySnapshot) -> CpuSensorMetrics {
 }
 
 fn main() -> ExitCode {
+    // v1.2 C13: the build for the widest instructions this CPU has (its oracle feeds the GPU).
+    if let Some(code) = dit_system::isa::exec_build_for_cpu("gpu-vram-dit") {
+        return code;
+    }
     match execute(Cli::parse()) {
         Ok(code) => code,
         Err(error) => {
@@ -822,7 +853,36 @@ fn execute(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     match cli.command {
         Command::Inventory => inventory(),
         Command::Run(args) => multi::run_entry(&args),
+        Command::CorpusDigest(args) => corpus_digest(&args),
     }
+}
+
+fn corpus_digest(args: &CorpusDigestArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let arith = match args.arith {
+        DigestArithArg::U32 => gpu_engine::gemm::Arith::U32,
+        DigestArithArg::Fp32 => gpu_engine::gemm::Arith::F32,
+        DigestArithArg::Int8 => gpu_engine::gemm::Arith::I8,
+    };
+    let started = Instant::now();
+    let corpus =
+        gpu_engine::gemm::Corpus::new_arith(arith, args.seed, args.jobs, args.inner, args.threads)?;
+    let seconds = started.elapsed().as_secs_f64();
+    serde_json::to_writer(
+        io::stdout().lock(),
+        &serde_json::json!({
+            "arith": corpus.arith,
+            "seed": corpus.seed,
+            "jobs": corpus.jobs,
+            "n": corpus.n,
+            "k": corpus.k,
+            "input_sha256": corpus.sha256,
+            "expected_sha256": corpus.dot_sha256,
+            "build_seconds": seconds,
+            "cpu_isa": dit_system::isa::IsaEvidence::current(),
+        }),
+    )?;
+    println!();
+    Ok(ExitCode::SUCCESS)
 }
 
 fn inventory() -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -1765,6 +1825,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }),
         schema_version: SCHEMA_VERSION,
         dit_version: dit_contracts::DIT_VERSION,
+        cpu_isa: dit_system::isa::IsaEvidence::current(),
         module_id: MODULE_ID.to_owned(),
         run_id,
         verdict,
@@ -3351,6 +3412,7 @@ fn invalid_report(
         loop_profile: None,
         schema_version: SCHEMA_VERSION,
         dit_version: dit_contracts::DIT_VERSION,
+        cpu_isa: dit_system::isa::IsaEvidence::current(),
         module_id: MODULE_ID.to_owned(),
         run_id: run_id.to_owned(),
         verdict: Verdict::Invalid,

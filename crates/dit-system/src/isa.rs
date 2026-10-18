@@ -6,8 +6,17 @@
 //! workspace forbids `unsafe`, so separate binaries are how the kernels get the wider
 //! instructions. Results do not depend on the level: every kernel is checked against a reference
 //! computed in the same binary.
+//!
+//! `gpu-vram-dit` does the same since v1.2 C13: its CPU oracle (the expected answers of each
+//! corpus) gets the FMA instruction and vector multiplies, which the fast GPUs need to be fed in
+//! time. The oracle's order of operations is the same at every level, so the answers are too.
 
-use std::{fmt, sync::OnceLock};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::OnceLock,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -248,6 +257,74 @@ pub fn parse_chosen(value: &str) -> Option<IsaSelection> {
     }
 }
 
+/// `level`'s build of the running program: `dit-cli-v3` next to `dit-cli` (any level suffix of
+/// the running file's name is replaced).
+#[must_use]
+pub fn build_path(exe: &Path, level: IsaLevel) -> PathBuf {
+    let name = exe
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = IsaLevel::ALL
+        .into_iter()
+        .filter_map(IsaLevel::binary_suffix)
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(&name);
+    exe.with_file_name(format!("{base}{}", level.binary_suffix().unwrap_or("")))
+}
+
+/// Run by the baseline binary first thing: `exec`s the build of `program` this CPU runs best
+/// (or the one `DIT_ISA` / `dit_isa=` forces), with the same arguments and process. `None` when
+/// this binary is the one to run (and records how it was chosen); `Some` exit code when a forced
+/// level cannot run here, or its `exec` failed.
+#[must_use]
+pub fn exec_build_for_cpu(program: &str) -> Option<ExitCode> {
+    if let Ok(value) = std::env::var(ISA_CHOSEN_ENV) {
+        // The baseline binary chose this one.
+        record_selection(parse_chosen(&value).unwrap_or(IsaSelection::Direct));
+        return None;
+    }
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let request = match request(std::env::var(ISA_ENV).ok().as_deref(), &cmdline) {
+        Ok(request) => request,
+        Err(reason) => {
+            eprintln!("INVALID: {reason}");
+            return Some(ExitCode::from(3));
+        }
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return None;
+    };
+    let installed: Vec<IsaLevel> = IsaLevel::ALL
+        .into_iter()
+        .filter(|&level| level == compiled_level() || build_path(&exe, level).is_file())
+        .collect();
+    let (level, selection) = match choose(request, cpu_level(), &installed) {
+        Ok(choice) => choice,
+        Err(reason) => {
+            eprintln!("INVALID: {reason}");
+            return Some(ExitCode::from(3));
+        }
+    };
+    if level == compiled_level() {
+        record_selection(selection);
+        return None;
+    }
+    let path = build_path(&exe, level);
+    let error = std::os::unix::process::CommandExt::exec(
+        std::process::Command::new(&path)
+            .args(std::env::args_os().skip(1))
+            .env(ISA_CHOSEN_ENV, chosen_value(level, selection)),
+    );
+    // Only reached when the exec failed.
+    eprintln!("{program}: could not start {}: {error}", path.display());
+    if selection == IsaSelection::Manual {
+        return Some(ExitCode::from(3));
+    }
+    record_selection(IsaSelection::Auto);
+    None
+}
+
 static SELECTION: OnceLock<IsaSelection> = OnceLock::new();
 
 /// Records how this process's level was decided (once, at start; later calls are ignored).
@@ -291,8 +368,26 @@ impl IsaEvidence {
 
 #[cfg(test)]
 mod tests {
-    use super::{IsaLevel, IsaRequest, IsaSelection, choose, request};
+    use super::{IsaLevel, IsaRequest, IsaSelection, build_path, choose, request};
     use IsaLevel::{V1, V3, V4};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn each_level_has_its_build_next_to_the_baseline_one() {
+        let base = Path::new("/opt/gpu-vram-dit/gpu-vram-dit");
+        assert_eq!(
+            build_path(base, V3),
+            PathBuf::from("/opt/gpu-vram-dit/gpu-vram-dit-v3")
+        );
+        assert_eq!(
+            build_path(Path::new("/opt/cpu-dit-01/dit-cli-v4"), V1),
+            PathBuf::from("/opt/cpu-dit-01/dit-cli")
+        );
+        assert_eq!(
+            build_path(Path::new("/opt/cpu-dit-01/dit-cli-v3"), V4),
+            PathBuf::from("/opt/cpu-dit-01/dit-cli-v4")
+        );
+    }
 
     #[test]
     fn the_request_comes_from_the_variable_then_the_command_line() {

@@ -11,7 +11,7 @@ FRAMES ?= 1
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
 .PHONY: test-power-campaign test-power-image
-.PHONY: gpu-g12-check
+.PHONY: gpu-g12-check test-gpu-isa
 .PHONY: nvidia-driver-layer iso iso-only iso-burn-usb
 .PHONY: gpu-g3-check gpu-cuda-kernel gpu-h1-check gpu-h2-check gpu-h3-check gpu-h5-check gpu-h6-check gpu-h-check
 
@@ -105,6 +105,11 @@ test: check
 	./tools/burn_usb.sh --list >/dev/null
 	python3 ./tools/test_seed_validator.py
 	python3 ./tools/test_unified_project.py
+
+# v1.2 C13: gpu-vram-dit's v3/v4 builds give the baseline's corpora, bit for bit.
+test-gpu-isa:
+	cargo build --release -p gpu-cli
+	./tools/test_gpu_isa.sh
 
 test-ui:
 	cargo build -p dit-cli -p dit-watchdog

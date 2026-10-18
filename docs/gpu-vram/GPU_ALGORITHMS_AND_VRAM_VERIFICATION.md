@@ -143,6 +143,12 @@ của GPU. Khi CPU kiểm không kịp (≥ 2/3 số burst kể từ lần quy�
 - Đầu vào là u32 ngẫu nhiên (splitmix64 theo seed và chỉ số word).
 - CPU tính đáp án (**oracle**) **một lần cho mỗi corpus**, bằng vòng lặp vô hướng đơn giản, cố ý độc lập
   với cách GPU tính (không dùng tile, không dùng cùng thứ tự cộng).
+- **Bản build theo mức ISA (v1.2.024, C13):** `gpu-vram-dit` có thêm `gpu-vram-dit-v3` (AVX2+FMA) và `-v4` (AVX-512) cạnh
+  nó; bản cơ bản chọn bản rộng nhất CPU chạy được rồi `exec` sang, như `dit-cli` (chỉnh tay bằng `DIT_ISA` hoặc
+  `dit_isa=`). Thứ tự phép tính của oracle không đổi, nên corpus và đáp án trùng từng bit giữa các bản
+  (`tools/test_gpu_isa.sh`, chạy mỗi lần build extension). Dựng một corpus 128 job × K 4096 trên 3700X, 4 luồng: FP32
+  1,42 → 0,23 s (bản cơ bản không có lệnh FMA, `mul_add` là lời gọi hàm cho từng phần tử), INT8 0,11 → 0,06 s, u32 không
+  đổi (0,2 s). Report ghi `cpu_isa`.
 - Corpus nằm sẵn trong VRAM; GPU tính lại nhiều lần với generation khác nhau. Ở async, cứ 256 batch thì đổi
   sang corpus mới (seed dẫn xuất, dựng sẵn ở nền).
 - Cứ 512 batch, CPU băm lại corpus phía host và so với SHA-256 lúc dựng. Nếu RAM máy làm hỏng đáp án thì lỗi

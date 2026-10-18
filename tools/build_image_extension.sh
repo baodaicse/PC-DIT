@@ -33,6 +33,22 @@ install -D -m 0755 "$project_dir/target/release/dit-blackbox" \
     "$staging_dir/usr/local/bin/dit-blackbox"
 install -D -m 0755 "$project_dir/target/release/gpu-vram-dit" \
     "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit"
+# v1.2 C13: gpu-vram-dit built again for x86-64-v3 (AVX2+FMA) and x86-64-v4 (AVX-512): its CPU
+# oracle, which builds every corpus's expected answers, gets the FMA instruction and vector
+# multiplies and keeps up with fast GPUs. The baseline binary runs the widest build the CPU has
+# (crates/dit-system/src/isa.rs). Same target directories, flags and --target as dit-cli's in
+# build_boot_image.sh (RUSTFLAGS stay off the build scripts and proc macros).
+GPU_ISA_VARIANTS=(v3 v4)
+GPU_ISA_TARGET=x86_64-unknown-linux-gnu
+for level in "${GPU_ISA_VARIANTS[@]}"; do
+    CARGO_TARGET_DIR="$project_dir/target/isa-$level" RUSTFLAGS="-C target-cpu=x86-64-$level" \
+        cargo build --release -p gpu-cli --target "$GPU_ISA_TARGET" \
+        --manifest-path "$project_dir/Cargo.toml"
+    install -D -m 0755 "$project_dir/target/isa-$level/$GPU_ISA_TARGET/release/gpu-vram-dit" \
+        "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit-$level"
+done
+# Every build this machine can run must give the baseline's corpora, bit for bit.
+"$project_dir/tools/test_gpu_isa.sh" "$project_dir/target/release/gpu-vram-dit"
 install -D -m 0755 "$project_dir/target/release/dit-chain" \
     "$staging_dir/opt/dit-chain/dit-chain"
 install -D -m 0644 "$project_dir/docs/COMBINED_STRESS_CHAIN_ANALYSIS.md" \
@@ -77,6 +93,8 @@ install -D -m 0644 "$project_dir/crates/gpu-vulkan/shaders/matrix_u32.spv" \
 
 nvme_sha=$(sha256sum "$staging_dir/opt/cpu-nvme-dit/cpu-nvme-dit" | awk '{print $1}')
 gpu_sha=$(sha256sum "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit" | awk '{print $1}')
+gpu_v3_sha=$(sha256sum "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit-v3" | awk '{print $1}')
+gpu_v4_sha=$(sha256sum "$staging_dir/opt/gpu-vram-dit/gpu-vram-dit-v4" | awk '{print $1}')
 suite_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-suite" | awk '{print $1}')
 watchdog_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-watchdog" | awk '{print $1}')
 rescue_sha=$(sha256sum "$staging_dir/usr/local/bin/dit-rescue" | awk '{print $1}')
@@ -108,6 +126,8 @@ printf '%s\n' \
     '  "artifacts": {' \
     "    \"cpu-nvme-dit.sha256\": \"$nvme_sha\"," \
     "    \"gpu-vram-dit.sha256\": \"$gpu_sha\"," \
+    "    \"gpu-vram-dit-v3.sha256\": \"$gpu_v3_sha\"," \
+    "    \"gpu-vram-dit-v4.sha256\": \"$gpu_v4_sha\"," \
     "    \"dit-suite.sha256\": \"$suite_sha\"," \
     "    \"dit-watchdog.sha256\": \"$watchdog_sha\"," \
     "    \"dit-rescue.sha256\": \"$rescue_sha\"," \
@@ -133,6 +153,8 @@ printf '%s\n' \
     sha256sum \
         opt/cpu-nvme-dit/cpu-nvme-dit \
         opt/gpu-vram-dit/gpu-vram-dit \
+        opt/gpu-vram-dit/gpu-vram-dit-v3 \
+        opt/gpu-vram-dit/gpu-vram-dit-v4 \
         usr/local/bin/dit-suite \
         usr/local/bin/dit-watchdog \
         usr/local/bin/dit-rescue \
