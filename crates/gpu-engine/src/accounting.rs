@@ -106,8 +106,12 @@ pub struct Timing {
     pub burst_wall_seconds: f64,
     /// Time the owner waited for a prefetched corpus that was not ready yet.
     pub corpus_wait_seconds: f64,
-    /// Wall time spent proving the host copy of the corpus unchanged.
+    /// Wall time the owner thread spent proving the host copy of the corpus unchanged (after a
+    /// failed batch; periodic checks too before v1.2 C13 G3).
     pub integrity_check_seconds: f64,
+    /// v1.2 C13 G3: periodic host-corpus checks on a helper thread, beside the bursts (counted
+    /// when their result is taken).
+    pub integrity_background_seconds: f64,
     /// v1.2.023, a pipeline call as the owner thread sees it. From the call to the burst loop:
     /// the corpus (wait, upload), the device clock origin, lane and sweep set-up.
     pub prepare_seconds: f64,
@@ -139,6 +143,7 @@ impl Timing {
         self.burst_wall_seconds += o.burst_wall_seconds;
         self.corpus_wait_seconds += o.corpus_wait_seconds;
         self.integrity_check_seconds += o.integrity_check_seconds;
+        self.integrity_background_seconds += o.integrity_background_seconds;
         self.prepare_seconds += o.prepare_seconds;
         self.corpus_install_seconds += o.corpus_install_seconds;
         self.origin_sync_seconds += o.origin_sync_seconds;
@@ -166,6 +171,9 @@ pub struct BurstSummary {
     /// A rotation was due and no new corpus was built yet: the burst ran on one from the pool,
     /// or kept the one in use (v1.2 C13 G2).
     pub corpus_pool_serves: u64,
+    /// Corpus uploads that found the input already in the upload staging, written there by a
+    /// helper thread while earlier bursts ran: only the copy to VRAM was left (v1.2 C13 G3).
+    pub corpus_staged_installs: u64,
     /// SHA-256 computations of actual outputs (policy, last-batch and failure hashes).
     pub hashes_computed: u64,
     pub integrity_checks: u64,
@@ -219,6 +227,8 @@ pub struct Cumulative {
     pub corpus_cold_builds: u64,
     /// Rotations served without a new corpus: from the pool, or the one in use kept (C13 G2).
     pub corpus_pool_serves: u64,
+    /// Corpus uploads with the input already staged by a helper thread (C13 G3).
+    pub corpus_staged_installs: u64,
     pub hashes_computed: u64,
     pub integrity_checks: u64,
     pub integrity_failures: u64,
@@ -285,6 +295,7 @@ impl Cumulative {
         self.corpus_prefetch_hits += burst.corpus_prefetch_hits;
         self.corpus_cold_builds += burst.corpus_cold_builds;
         self.corpus_pool_serves += burst.corpus_pool_serves;
+        self.corpus_staged_installs += burst.corpus_staged_installs;
         self.hashes_computed += burst.hashes_computed;
         self.integrity_checks += burst.integrity_checks;
         self.integrity_failures += burst.integrity_failures;

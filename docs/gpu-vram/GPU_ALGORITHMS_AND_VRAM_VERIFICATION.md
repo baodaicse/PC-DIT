@@ -158,7 +158,12 @@ của GPU. Khi CPU kiểm không kịp (≥ 2/3 số burst kể từ lần quy�
   (số lần lấy từ kho), `workspace_budget.corpus_pool`/`corpus_pool_bytes`. Máy dev, CPU cố ý không kịp: phép tính đã
   kiểm 128 → 223 G/s, thời gian chờ corpus 43 % → 1 %.
 - Cứ 512 batch, CPU băm lại corpus phía host và so với SHA-256 lúc dựng. Nếu RAM máy làm hỏng đáp án thì lỗi
-  đó không bị đổ oan cho GPU.
+  đó không bị đổ oan cho GPU. Từ v1.2.026 (C13 G3) lần kiểm định kỳ chạy trên luồng phụ cạnh các burst kế tiếp và
+  báo ở ranh giới burst sau hoặc cuối phiên (`timing.integrity_background_seconds`); sau một batch sai, corpus vẫn
+  được kiểm ngay trước verdict của burst.
+- **Chép sẵn (v1.2.026, C13 G3):** corpus mà lần đổi sắp tới sẽ lấy được chép vào staging pinned trên luồng phụ trong
+  lúc burst chạy, nên lúc đổi chỉ còn DMA lên VRAM (`corpus_staged_installs`); corpus bỏ đi được giải phóng trên luồng
+  phụ. Không thêm RAM hay VRAM.
 
 ### 3.3 Chống kết quả cũ và ghi sai chỗ
 

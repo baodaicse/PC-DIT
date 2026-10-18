@@ -98,11 +98,11 @@ giây, số lần và lần lâu nhất (`max_seconds`).
 |---|---|
 | `prepare_seconds` | từ đầu lời gọi đến vòng burst; gồm bốn trường dưới |
 | `corpus_wait_seconds` | chờ corpus dựng sẵn chưa xong |
-| `corpus_install_seconds` | nạp corpus mới lên VRAM |
+| `corpus_install_seconds` | nạp corpus mới lên VRAM (từ v1.2.026, khi corpus đã được chép sẵn vào staging thì chỉ còn DMA: `corpus_staged_installs`) |
 | `origin_sync_seconds` | đóng mốc đồng hồ thiết bị (chờ stream) |
 | `setup_seconds` | gắn lane, dựng bộ quét DRAM |
 | `loop_seconds` | vòng burst: gửi batch, chờ, giao output cho luồng kiểm |
-| `after_loop_seconds` | sau vòng: drain bộ quét, hash cuối, kiểm biên, kiểm toàn vẹn corpus (`integrity_check_seconds`) |
+| `after_loop_seconds` | sau vòng: drain bộ quét, hash cuối, kiểm biên, kiểm toàn vẹn corpus (`integrity_check_seconds`; từ v1.2.026 chỉ sau batch sai, lần kiểm định kỳ chạy trên luồng phụ: `integrity_background_seconds`) |
 
 Thời gian `pipeline` của CLI trừ `prepare + loop + after_loop` là phần đuôi của lời gọi (cộng sổ, dựng report).
 

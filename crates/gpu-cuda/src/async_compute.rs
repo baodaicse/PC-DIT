@@ -486,6 +486,15 @@ pub(crate) struct Pipeline {
     prefetch: Option<Prefetch>,
     /// Built corpora kept besides the one in use, oldest first (C13 G2); all of the current shape.
     pool: VecDeque<Arc<Corpus>>,
+    /// Writing the input of the corpus a coming rotation takes into `upload` (C13 G3). The owner
+    /// thread touches `upload` only after joining it.
+    staging: Option<Staging>,
+    /// The corpus whose input `upload` holds in full.
+    staged: Option<Arc<Corpus>>,
+    /// Uploads that found their corpus already in `upload` (C13 G3).
+    staged_installs: u64,
+    /// The periodic host-corpus check running on a helper thread (C13 G3).
+    integrity_job: Option<thread::JoinHandle<IntegrityOutcome>>,
     /// Shape of the corpus in use (it changes only at a rotation, between bursts).
     jobs: usize,
     inner: u32,
@@ -525,7 +534,6 @@ pub(crate) struct Pipeline {
     reupload: bool,
 }
 
-/// A corpus being built on a helper thread for the next rotation.
 /// Adaptive shape of the pipeline: the ladder (none when K is fixed), the level in use, the level
 /// of the next corpus, the bursts since the last decision and what that decision saw.
 struct AdaptiveShape {
@@ -548,11 +556,97 @@ impl AdaptiveShape {
     }
 }
 
+/// A corpus being built on a helper thread for the next rotation.
 struct Prefetch {
     seed: u64,
     arith: Arith,
     shape: Shape,
-    handle: thread::JoinHandle<std::result::Result<Corpus, &'static str>>,
+    build: PrefetchBuild,
+}
+
+enum PrefetchBuild {
+    Running(thread::JoinHandle<std::result::Result<Corpus, &'static str>>),
+    /// Joined once finished, so its input can be staged before its rotation (C13 G3).
+    Built(std::result::Result<Arc<Corpus>, &'static str>),
+}
+
+impl Prefetch {
+    fn is_built(&self) -> bool {
+        match &self.build {
+            PrefetchBuild::Running(handle) => handle.is_finished(),
+            PrefetchBuild::Built(_) => true,
+        }
+    }
+
+    /// The corpus once its build is done (joined now, without waiting); `None` while it builds
+    /// or when the build failed (which [`Self::wait`] reports).
+    fn built(&mut self) -> Option<&Arc<Corpus>> {
+        if matches!(&self.build, PrefetchBuild::Running(handle) if handle.is_finished()) {
+            let joined = PrefetchBuild::Built(Err("corpus prefetch panicked"));
+            if let PrefetchBuild::Running(handle) = std::mem::replace(&mut self.build, joined) {
+                self.build = PrefetchBuild::Built(match handle.join() {
+                    Ok(built) => built.map(Arc::new),
+                    Err(_) => Err("corpus prefetch panicked"),
+                });
+            }
+        }
+        match &self.build {
+            PrefetchBuild::Built(Ok(corpus)) => Some(corpus),
+            _ => None,
+        }
+    }
+
+    /// Waits for the build.
+    fn wait(self) -> Result<Arc<Corpus>> {
+        match self.build {
+            PrefetchBuild::Running(handle) => match handle.join() {
+                Ok(built) => built.map(Arc::new).map_err(Error::Request),
+                Err(_) => Err(Error::Request("corpus prefetch panicked")),
+            },
+            PrefetchBuild::Built(built) => built.map_err(Error::Request),
+        }
+    }
+}
+
+/// The input of the corpus a coming rotation takes, being written into the upload staging on a
+/// helper thread while bursts run (C13 G3): the rotation then has only the copy to VRAM left.
+struct Staging {
+    corpus: Arc<Corpus>,
+    handle: thread::JoinHandle<()>,
+}
+
+/// A periodic host-corpus check on a helper thread (C13 G3): what it found and how long it took.
+type IntegrityOutcome = (std::result::Result<(), &'static str>, f64);
+
+/// Lets go of a corpus no longer used, freeing it on a helper thread when this is its last
+/// reference: freeing a corpus of a quarter GiB holds a thread some 25 ms (C13 G3).
+fn retire(corpus: Option<Arc<Corpus>>) {
+    if let Some(corpus) = corpus.filter(|c| Arc::strong_count(c) == 1) {
+        // Without a thread, the closure and the corpus are dropped here.
+        let _ = thread::Builder::new()
+            .name("gpu-corpus-free".into())
+            .spawn(move || drop(corpus));
+    }
+}
+
+/// Writes `words` as little-endian bytes (as the device reads them) at `address`.
+///
+/// # Safety
+/// `address` must be valid for `words.len() * 4` bytes of writes, and nothing else may access
+/// those bytes until this returns.
+unsafe fn copy_words(address: usize, words: &[u32]) {
+    let target = ptr::with_exposed_provenance_mut::<u8>(address);
+    #[cfg(target_endian = "little")]
+    unsafe {
+        ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), target, words.len() * 4);
+    }
+    #[cfg(not(target_endian = "little"))]
+    for (index, word) in words.iter().enumerate() {
+        let bytes = word.to_le_bytes();
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), target.add(index * 4), 4);
+        }
+    }
 }
 
 /// What `prepare` did, for the burst's accounting.
@@ -574,6 +668,11 @@ struct Prepared {
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
+        // The staging thread writes into `upload`: it ends before the field frees it.
+        self.finish_staging();
+        if let Some(job) = self.integrity_job.take() {
+            let _ = job.join();
+        }
         if self.context.stopped.get() || self.context.current().is_err() || self.origin.is_null() {
             return;
         }
@@ -643,6 +742,7 @@ pub(crate) fn wait_stream(backend: &CudaBackend, call: &'static str) -> Result<(
 }
 
 impl Pipeline {
+    #[allow(clippy::too_many_lines)] // Mostly the initializer, one field per line.
     pub(crate) fn new(
         backend: &CudaBackend,
         jobs: usize,
@@ -722,6 +822,10 @@ impl Pipeline {
             batches_on_corpus: 0,
             prefetch: None,
             pool: VecDeque::new(),
+            staging: None,
+            staged: None,
+            staged_installs: 0,
+            integrity_job: None,
             jobs,
             inner,
             shape: AdaptiveShape::new(jobs, inner, config.inner_max),
@@ -826,8 +930,8 @@ impl Pipeline {
             return Err(Error::Request("external corpus exceeds the input buffer"));
         }
         self.prefetch = None;
-        self.pool.clear();
-        self.corpus.take();
+        self.pool.drain(..).for_each(|kept| retire(Some(kept)));
+        retire(self.corpus.take());
         let corpus = Arc::new(corpus);
         self.base_seed = Some(corpus.seed);
         self.batches_on_corpus = 0;
@@ -839,7 +943,14 @@ impl Pipeline {
     /// device received it (c2). A copy found wrong fails with the boundary tag, after leaving the
     /// corpus right on the device when a second upload could.
     fn install(&mut self, backend: &CudaBackend, corpus: &Arc<Corpus>) -> Result<()> {
-        self.upload.write_u32(&corpus.input);
+        self.finish_staging();
+        if self.staged.as_ref().is_some_and(|s| Arc::ptr_eq(s, corpus)) {
+            self.staged_installs += 1;
+        } else {
+            retire(self.staged.take());
+            self.upload.write_u32(&corpus.input);
+            self.staged = Some(Arc::clone(corpus));
+        }
         check("async corpus upload", unsafe {
             (backend.context.driver.upload)(
                 self.input.address,
@@ -849,7 +960,7 @@ impl Pipeline {
             )
         })?;
         wait_stream(backend, "corpus upload")?;
-        self.corpus = Some(Arc::clone(corpus));
+        retire(self.corpus.replace(Arc::clone(corpus)));
         self.reupload = false;
         let threads = self.config.threads();
         let Some(checks) = self.checks.as_mut() else {
@@ -898,6 +1009,70 @@ impl Pipeline {
                 seed,
                 arith,
                 shape,
+                build: PrefetchBuild::Running(handle),
+            });
+    }
+
+    /// Builds a corpus of the shape in use here, waiting for it (no prefetch to take).
+    fn build_now(&self, arith: Arith, seed: u64) -> Result<Arc<Corpus>> {
+        Corpus::new_arith(arith, seed, self.jobs, self.inner, self.config.threads())
+            .map(Arc::new)
+            .map_err(Error::Request)
+    }
+
+    /// Joins the staging thread (started a burst or more ago, so normally done): `upload` is the
+    /// owner thread's again.
+    fn finish_staging(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            // The copy cannot fail; a thread that did not finish leaves `upload` unknown.
+            let staged = staging.handle.join().is_ok().then_some(staging.corpus);
+            retire(std::mem::replace(&mut self.staged, staged));
+        }
+    }
+
+    /// Frees the staged corpus now (when nothing else holds it), so a cold build's peak is one
+    /// corpus plus staging.
+    fn release_staged(&mut self) {
+        self.finish_staging();
+        self.staged = None;
+    }
+
+    /// C13 G3: writes the input of the corpus the coming rotation takes into `upload` on a helper
+    /// thread while the bursts run: the new corpus once built, else (with a pool, from two bursts
+    /// before the rotation) the pool's oldest, which that rotation takes then.
+    fn stage_next(&mut self) {
+        let every = self.config.rotate_every_batches;
+        if self.external || every == 0 {
+            return;
+        }
+        let near = self.batches_on_corpus + 2 * self.config.batches >= every;
+        let next = if let Some(prefetch) = self.prefetch.as_mut().filter(|p| p.is_built()) {
+            prefetch.built().cloned()
+        } else if self.config.corpus_pool > 0 && near {
+            self.pool.front().cloned()
+        } else {
+            None
+        };
+        let Some(next) = next.filter(|next| next.input.len() * 4 <= self.upload.len) else {
+            return;
+        };
+        let holds = |corpus: Option<&Arc<Corpus>>| corpus.is_some_and(|c| Arc::ptr_eq(c, &next));
+        if holds(self.staged.as_ref()) || holds(self.staging.as_ref().map(|s| &s.corpus)) {
+            return;
+        }
+        self.finish_staging();
+        retire(self.staged.take());
+        let address = self.upload.address.expose_provenance();
+        let corpus = Arc::clone(&next);
+        self.staging = thread::Builder::new()
+            .name("gpu-corpus-stage".into())
+            // SAFETY: `address` is the pinned upload staging, checked above to hold the input; the
+            // owner thread neither reads, uploads from nor frees it before joining this thread
+            // (`finish_staging`, in `install` and on drop).
+            .spawn(move || unsafe { copy_words(address, &corpus.input) })
+            .ok()
+            .map(|handle| Staging {
+                corpus: next,
                 handle,
             });
     }
@@ -1020,27 +1195,21 @@ impl Pipeline {
                             inner: self.inner,
                         }) =>
             {
-                match p.handle.join() {
-                    Ok(built) => (built.map_err(Error::Request)?, true),
-                    Err(_) => return Err(Error::Request("corpus prefetch panicked")),
-                }
+                (p.wait()?, true)
             }
             _ => {
                 // A cold build starts from nothing: free the old corpus first so the peak is one
                 // corpus plus staging, not two.
                 self.corpus.take();
-                (
-                    Corpus::new_arith(arith, seed, self.jobs, self.inner, self.config.threads())
-                        .map_err(Error::Request)?,
-                    false,
-                )
+                self.release_staged();
+                (self.build_now(arith, seed)?, false)
             }
         };
         let wait_seconds = waited.elapsed().as_secs_f64();
         // No outstanding batches cross this boundary. Drop old corpus before replacement.
-        self.corpus.take();
+        retire(self.corpus.take());
         let installing = Instant::now();
-        let installed = self.install(backend, &Arc::new(corpus));
+        let installed = self.install(backend, &corpus);
         install_seconds += installing.elapsed().as_secs_f64();
         self.start_prefetch(base);
         installed?;
@@ -1092,10 +1261,7 @@ impl Pipeline {
                 fresh: false,
             });
         }
-        let built = self
-            .prefetch
-            .as_ref()
-            .is_some_and(|prefetch| prefetch.handle.is_finished());
+        let built = self.prefetch.as_ref().is_some_and(Prefetch::is_built);
         if current_fits && !built {
             return self.serve_from_pool(backend, base, install_seconds);
         }
@@ -1111,14 +1277,13 @@ impl Pipeline {
                 // The adaptive shape stepped: the new corpus is of the next shape, which nothing
                 // kept fits.
                 self.apply_shape();
-                self.pool.clear();
-                self.corpus.take();
+                self.pool.drain(..).for_each(|kept| retire(Some(kept)));
+                retire(self.corpus.take());
+                self.finish_staging();
+                retire(self.staged.take());
             }
             let shape = prefetch.shape;
-            let built = match prefetch.handle.join() {
-                Ok(built) => built.map_err(Error::Request)?,
-                Err(_) => return Err(Error::Request("corpus prefetch panicked")),
-            };
+            let built = prefetch.wait()?;
             // Never upload a corpus of another shape than the kernels will run.
             if shape == shape_now(self) {
                 prefetched = Some(built);
@@ -1128,10 +1293,8 @@ impl Pipeline {
         let corpus = if let Some(corpus) = prefetched {
             corpus
         } else {
-            let seed = derive_corpus_seed(base, self.rotation);
             let arith = self.config.arith.for_rotation(self.rotation, self.tensor);
-            Corpus::new_arith(arith, seed, self.jobs, self.inner, self.config.threads())
-                .map_err(Error::Request)?
+            self.build_now(arith, derive_corpus_seed(base, self.rotation))?
         };
         let wait_seconds = waited.elapsed().as_secs_f64();
         let rotated = prefetch_hit && self.corpus.is_some();
@@ -1146,12 +1309,12 @@ impl Pipeline {
             self.pool.push_back(current);
         }
         while self.pool.len() > self.config.corpus_pool {
-            self.pool.pop_front();
+            retire(self.pool.pop_front());
         }
         self.batches_on_corpus = 0;
         let seed = corpus.seed;
         let installing = Instant::now();
-        let installed = self.install(backend, &Arc::new(corpus));
+        let installed = self.install(backend, &corpus);
         install_seconds += installing.elapsed().as_secs_f64();
         self.start_prefetch(base);
         installed?;
@@ -1212,6 +1375,71 @@ impl Pipeline {
             pool_served: true,
             fresh: false,
         })
+    }
+
+    /// Starts the periodic host-corpus check on a helper thread (C13 G3); false when no thread
+    /// could be started (the check then runs here).
+    fn start_integrity(&mut self, corpus: &Arc<Corpus>) -> bool {
+        let corpus = Arc::clone(corpus);
+        self.integrity_job = thread::Builder::new()
+            .name("gpu-corpus-integrity".into())
+            .spawn(move || {
+                let checked = Instant::now();
+                let outcome = corpus.integrity_check();
+                (outcome, checked.elapsed().as_secs_f64())
+            })
+            .ok();
+        self.integrity_job.is_some()
+    }
+
+    /// The background host-corpus check once it has finished, or waited for when `wait`.
+    fn take_integrity(&mut self, wait: bool) -> Option<IntegrityOutcome> {
+        if !wait && !self.integrity_job.as_ref()?.is_finished() {
+            return None;
+        }
+        let job = self.integrity_job.take()?;
+        // A check that did not finish proved nothing intact.
+        Some(
+            job.join()
+                .unwrap_or((Err("host corpus check did not finish"), 0.0)),
+        )
+    }
+
+    /// A host-corpus check found the host copy changed: host memory, not the GPU, is suspect.
+    fn host_memory_changed(&mut self, failure: &mut Option<String>, reason: &str) {
+        self.burst_attribution = Some("host_memory_changed");
+        self.failure_attribution
+            .get_or_insert_with(|| "host_memory_changed".into());
+        failure.get_or_insert_with(|| format!("host corpus integrity: {reason}"));
+    }
+
+    /// End of the run (C13 G3): waits for the host-corpus check still on its helper thread and
+    /// counts it. Returns what it found wrong.
+    pub(crate) fn finish(&mut self) -> Option<String> {
+        let (outcome, seconds) = self.take_integrity(true)?;
+        self.cumulative.integrity_checks += 1;
+        self.cumulative.timing.integrity_background_seconds += seconds;
+        let reason = outcome.err()?;
+        self.cumulative.integrity_failures += 1;
+        let mut failure = None;
+        self.host_memory_changed(&mut failure, reason);
+        if let Some(error) = &failure {
+            self.first_error.get_or_insert_with(|| error.clone());
+        }
+        failure
+    }
+
+    /// Negative gate: the host copy of the corpus in use changes (one input bit) after its
+    /// upload, as damaged host memory would change it; the device copy stays right.
+    pub(crate) fn inject_host_corpus_fault(&mut self) -> Result<()> {
+        let corpus = self
+            .corpus
+            .as_ref()
+            .ok_or(Error::Request("corpus missing"))?;
+        let mut changed = Corpus::clone(corpus);
+        changed.input[0] ^= 1;
+        self.corpus = Some(Arc::new(changed));
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
@@ -1430,7 +1658,10 @@ impl Pipeline {
         backend.ready()?;
         self.burst_attribution = None;
         let prepare_started = Instant::now();
+        let staged_before = self.staged_installs;
         let prepared = self.prepare(backend, seed)?;
+        let staged_installs = self.staged_installs - staged_before;
+        self.stage_next();
         let reused = prepared.reused;
         // Everything below refers to the corpus actually in use, not the run's base seed.
         let lane_seed = seed;
@@ -2027,38 +2258,50 @@ impl Pipeline {
                 });
             }
         }
-        // Prove the host copy of the corpus unchanged after any failed batch and periodically:
-        // damaged host memory would otherwise be reported as a GPU fault.
+        // Prove the host copy of the corpus unchanged after any failed batch (here, before the
+        // burst's verdict) and periodically: damaged host memory would otherwise be reported as a
+        // GPU fault. C13 G3: the periodic check runs on a helper thread beside the next bursts and
+        // reports at a later burst boundary (or in `finish`); with an external corpus, replaced
+        // every burst, it stays here.
         let (mut integrity_checks, mut integrity_failures, mut integrity_seconds) = (0, 0, 0.0);
+        let mut integrity_background_seconds = 0.0;
+        if let Some((outcome, seconds)) = self.take_integrity(false) {
+            integrity_checks += 1;
+            integrity_background_seconds = seconds;
+            if let Err(reason) = outcome {
+                integrity_failures += 1;
+                self.host_memory_changed(&mut failure, reason);
+            }
+        }
         let every = self.config.integrity_every_batches;
         self.batches_since_integrity += ledger.totals.submitted;
         let periodic = every > 0 && self.batches_since_integrity >= every;
-        if periodic {
-            self.batches_since_integrity = 0;
-        }
-        if ledger.totals.submitted > 0
-            && (ledger.totals.failed > 0 || periodic)
-            && !backend.submission_stopped()
-        {
-            let checked = Instant::now();
-            integrity_checks = 1;
-            match corpus.integrity_check() {
-                Ok(()) => {
-                    if ledger.totals.failed > 0 {
-                        self.burst_attribution = Some("corpus_intact");
-                        self.failure_attribution
-                            .get_or_insert_with(|| "corpus_intact".into());
+        let failed = ledger.totals.failed > 0;
+        if ledger.totals.submitted > 0 && (failed || periodic) && !backend.submission_stopped() {
+            let background = !failed && !self.external;
+            if background && self.integrity_job.is_some() {
+                // The last one still runs: this one starts at a later burst boundary.
+            } else if background && self.start_integrity(&corpus) {
+                self.batches_since_integrity = 0;
+            } else {
+                self.batches_since_integrity = 0;
+                let checked = Instant::now();
+                integrity_checks += 1;
+                match corpus.integrity_check() {
+                    Ok(()) => {
+                        if failed {
+                            self.burst_attribution = Some("corpus_intact");
+                            self.failure_attribution
+                                .get_or_insert_with(|| "corpus_intact".into());
+                        }
+                    }
+                    Err(reason) => {
+                        integrity_failures += 1;
+                        self.host_memory_changed(&mut failure, reason);
                     }
                 }
-                Err(reason) => {
-                    integrity_failures = 1;
-                    self.burst_attribution = Some("host_memory_changed");
-                    self.failure_attribution
-                        .get_or_insert_with(|| "host_memory_changed".into());
-                    failure.get_or_insert_with(|| format!("host corpus integrity: {reason}"));
-                }
+                integrity_seconds = checked.elapsed().as_secs_f64();
             }
-            integrity_seconds = checked.elapsed().as_secs_f64();
         }
         // Confirmation (the host-corpus check above) is done: hold nothing past the burst.
         for held in ledger
@@ -2126,6 +2369,7 @@ impl Pipeline {
                 burst_wall_seconds: burst_wall,
                 corpus_wait_seconds: prepared.wait_seconds,
                 integrity_check_seconds: integrity_seconds,
+                integrity_background_seconds,
                 prepare_seconds,
                 corpus_install_seconds: prepared.install_seconds,
                 origin_sync_seconds,
@@ -2140,6 +2384,7 @@ impl Pipeline {
             corpus_prefetch_hits: u64::from(prepared.prefetch_hit),
             corpus_cold_builds: u64::from(prepared.fresh && !prepared.prefetch_hit),
             corpus_pool_serves: u64::from(prepared.pool_served),
+            corpus_staged_installs: staged_installs,
             device_in_flight_peak: ledger.peak_device_in_flight(),
             host_slots_used_peak: ledger.peak_host_used(),
             hashes_computed,
@@ -2452,6 +2697,36 @@ impl CudaBackend {
             report.lane = pipeline.lane_report();
         }
         Ok(())
+    }
+    /// Call once, at the end of an async run: waits for the periodic host-corpus check still on
+    /// its helper thread (C13 G3) and adds it to the report.
+    /// # Errors
+    /// The check found the host copy of the corpus changed.
+    pub fn finish_async(&self) -> Result<()> {
+        let mut pipeline = self.balanced.borrow_mut();
+        let Some(pipeline) = pipeline.as_mut() else {
+            return Ok(());
+        };
+        let failure = pipeline.finish();
+        if let Some(report) = self.balanced_report.borrow_mut().as_mut() {
+            report.cumulative = pipeline.cumulative.clone();
+            report.rates = pipeline.cumulative.rates();
+            report.error.clone_from(&pipeline.first_error);
+            report
+                .failure_attribution
+                .clone_from(&pipeline.failure_attribution);
+        }
+        failure.map_or(Ok(()), |error| Err(Error::Unavailable(error)))
+    }
+    /// Negative gate: changes one bit of the host copy of the corpus in use (not the device's).
+    /// # Errors
+    /// Fails before the async resources and their first corpus exist.
+    pub fn inject_host_corpus_fault(&self) -> Result<()> {
+        self.balanced
+            .borrow_mut()
+            .as_mut()
+            .ok_or(Error::Request("async resources not prepared"))?
+            .inject_host_corpus_fault()
     }
 }
 

@@ -150,6 +150,13 @@ impl Backend {
             Engine::Vulkan(_) => Ok(()),
         }
     }
+    /// Once, at the end: the periodic host-corpus check still on its helper thread reports.
+    pub fn finish_async(&self) -> Result<()> {
+        match &self.engine {
+            Engine::Cuda(b) => b.finish_async().map_err(|e| e.to_string()),
+            Engine::Vulkan(_) => Ok(()),
+        }
+    }
     pub fn inject_lane_fault(&self, fault: gpu_cuda::LaneFault) -> Result<()> {
         match &self.engine {
             Engine::Cuda(b) => b.inject_lane_fault(fault).map_err(|e| e.to_string()),

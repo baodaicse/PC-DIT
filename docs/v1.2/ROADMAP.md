@@ -57,7 +57,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
 | C11 | Cân bằng tải GPU / CPU-RAM trong pha chạy chồng: đo tỉ lệ cân bằng, ngân sách băng thông RAM, điều phối | `parked` (phức tạp) |
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
-| C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `in_progress` |
+| C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `done` (v1.2.024–026), chờ phiên thực địa |
 | C14 | Chuỗi GEMM có đáp án biết trước (M^L = Π) | `parked` |
 
 ### V0 — Version và hiển thị (`done`)
@@ -678,7 +678,7 @@ cái làm tải lệch là lượng băng thông RAM C1 + C4 mở ra (RAM ghi + 
   phần GPU cần một phiên COMBINED trên máy MAG để xác nhận: so với v1.2.019 (GPU 46 % phép tính, lane 15 % baseline) và
   với pha xoay B của cùng phiên (81 %, 90 %).
 
-### C13 — Cấp corpus kịp cho GPU nhanh (`in_progress`, 2026-10-18)
+### C13 — Cấp corpus kịp cho GPU nhanh (`done`, v1.2.024–026, 2026-10-18)
 
 **Bằng chứng** (v1.2.023, đo vòng lặp; pha chạy chồng `max`):
 
@@ -745,6 +745,43 @@ dựng không kịp GPU); thời gian oracle và sinh input chỉ cộng cho cor
 Lỗi chèn khi có kho vẫn FAIL đúng. Các test phần cứng đếm số lần xoay theo lịch (`fp32.rs`, `tensor.rs`) chạy với
 `corpus_pool: 0`.
 
+**G3 đã làm (v1.2.026).** Ba việc rời luồng điều phối; chuẩn kiểm không đổi:
+
+- **Kiểm toàn vẹn định kỳ trên luồng phụ.** Cứ 512 batch, lần băm lại corpus phía host chạy trên luồng
+  `gpu-corpus-integrity` cạnh các burst kế tiếp; kết quả được lấy ở ranh giới burst sau, hoặc cuối phiên
+  (`finish_async`, gpu-cli gọi một lần trước khi tổng kết, nên lần kiểm cuối không bị mất). Batch sai vẫn được kiểm
+  ngay, trên luồng điều phối, trước verdict của burst, để gán `corpus_intact` / `host_memory_changed` như cũ. Corpus
+  nạp từ ngoài (dit-chain, đổi mỗi bước) vẫn kiểm như cũ. Thay đổi trong RAM host mà chỉ lần kiểm định kỳ thấy được
+  báo trễ thêm tối đa một burst; verdict không đổi.
+- **Corpus kế tiếp chép sẵn vào staging.** Corpus mà lần đổi sắp tới sẽ lấy (corpus mới khi đã dựng xong; khi có kho
+  và corpus mới chưa xong thì corpus cũ nhất trong kho, từ hai burst trước lượt đổi) được chép vào vùng staging pinned
+  trên luồng `gpu-corpus-stage` trong lúc burst chạy; lúc đổi chỉ còn DMA lên VRAM. Không thêm RAM hay VRAM: dùng lại
+  staging sẵn có, và luồng điều phối chỉ đụng tới staging sau khi luồng chép đã xong (join).
+- **Giải phóng corpus trên luồng phụ.** Giải phóng một corpus 264 MB (rời kho, bị thay) tốn khoảng 25 ms.
+
+Report: `timing.integrity_background_seconds` (thời gian kiểm trên luồng phụ); `integrity_check_seconds` giờ chỉ là
+thời gian luồng điều phối chờ kiểm (sau batch sai); `corpus_staged_installs` (lần nạp chỉ còn DMA). Gate phần cứng mới
+`crates/gpu-cuda/tests/corpus_pipeline.rs`: đổi một bit corpus phía host (bản trên GPU vẫn đúng) thì lần kiểm nền bắt
+được và gán `host_memory_changed`, không batch nào FAIL, luồng điều phối không chờ lần kiểm nào; corpus chép sẵn được
+kiểm như mọi corpus và lỗi chèn vẫn FAIL. Đo trên máy dev (GTX 960, 3700X, 40 s, 128 job × K 4096, `alternate`, kho
+3; G2 = v1.2.025; mỗi ô 2 lần chạy xen kẽ, lệch nhau dưới 1,5 %):
+
+| | Đổi corpus mỗi 256 batch (CPU theo kịp), G2 → G3 | Mỗi 2 batch (CPU không kịp), G2 → G3 |
+|---|---|---|
+| Phép tính đã kiểm | 233 → 238 G/s | 224 → 235 G/s |
+| Luồng điều phối bị chặn (chuẩn bị + sau vòng) | 1,39 → 0,50 s | 4,25 → 2,37 s |
+| Vòng burst | 96 → 99 % | 89 → 94 % |
+| Lần đổi chỉ còn DMA | 8 / 8 | 32 / 67 |
+| Verdict / lỗi chèn | PASS / FAIL | PASS / FAIL |
+
+GTX 960 chậm nên trên máy dev GPU vẫn là giới hạn và mức tăng nhỏ. Khi đổi mỗi 2 batch, corpus mới hay xong trong burst
+cuối trước lượt đổi, sau khi corpus trong kho đã được chép, nên chỉ một nửa số lần đổi trúng; ở thực địa một corpus kéo
+dài khoảng 8 burst nên corpus đã xong có nhiều ranh giới burst để được chép. **Ước tính cho TUF** (pha chạy chồng
+v1.2.023): kiểm toàn vẹn 5,9 % + giải phóng corpus 0,8 % + phần chép của nạp corpus (khoảng 60–75 % của 4,8 % trên PCIe
+5.0) trả về vòng burst khoảng 9 % thời gian pha, cộng với G2 (chờ corpus 33 % → khoảng 1 %); pha GPU chạy riêng khoảng
+8 %. **Cái giá:** hai luồng phụ ngắn làm đúng phần việc đã rời luồng điều phối (chép khoảng 22 ms mỗi lần đổi, băm
+khoảng 0,2 s mỗi 512 batch); một lần chép thừa khi corpus được chép sẵn không được lấy (tối đa một lần mỗi lượt đổi).
+
 **Ước tính** (kiểm lại bằng phiên thực địa): GPU bận trên cả pha TUF 29 % → khoảng 53 %, MAG 52 % → khoảng 78 %; phép
 tính đã kiểm ×1,5–1,8; CPU cho dựng corpus 0,83 → khoảng 0,35–0,40 lõi (lõi-giây mỗi corpus −73 %), phần trả lại về
 oracle CPU-RAM. **Cái giá:** image thêm khoảng 7,4 MiB; kho corpus khoảng 270 MiB mỗi corpus ở K 4096 (0,5–1 GiB) lấy từ
@@ -794,7 +831,7 @@ một phần dữ liệu được kiểm, bỏ nó thì chain mất nửa lượ
 7. C7 + C8: K tự tăng, INT8 trong test đầy đủ (`done`, v1.2.018).
 8. Đo COMBINED v1.2.018 trên máy thật, rồi C9 → C10 sau khi thảo luận.
 9. C12: R3 trong pha chạy chồng (`done`, v1.2.021); C11 gác lại.
-10. C13: G1 → G2 → G3, đo trên máy dev, rồi phiên thực địa trên TUF và MAG. Sau đó C9 → C10.
+10. C13: G1 → G2 → G3 (`done`, v1.2.024–026, đo trên máy dev), rồi phiên thực địa trên TUF và MAG. Sau đó C9 → C10.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.

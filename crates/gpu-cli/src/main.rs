@@ -1651,6 +1651,13 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             break;
         }
     }
+    // The periodic host-corpus check still on its helper thread (C13 G3) reports before the
+    // totals; a change it found is a compute failure, as one found during a burst is.
+    if let Some(backend) = vulkan.as_ref()
+        && let Err(error) = backend.finish_async()
+    {
+        failures.push(failure(generation, 0, "compute", error));
+    }
     // The loop's totals with the pipeline call split up, for the report and the last progress.
     let final_loop_profile = vulkan.is_some().then(|| {
         let mut profile = loop_profile.clone();
