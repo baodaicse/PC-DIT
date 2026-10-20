@@ -59,7 +59,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
 | C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `done` (v1.2.024–026), đã kiểm thực địa |
 | C14 | Chuỗi GEMM có đáp án biết trước (M^L = Π) | `parked` |
-| C15 | Sửa sau kết quả thực địa v1.2.023–026: RAM của iGPU trong kế hoạch bộ nhớ, lỗi cấp phát là INVALID, đọc cảm biến không chặn GPU, không chạy lại CPU-RAM trong COMBINED | `planned` |
+| C15 | Sửa sau kết quả thực địa v1.2.023–026: lỗi cấp phát là INVALID, đọc cảm biến không chặn GPU, không chạy lại CPU-RAM trong COMBINED | `planned` |
 | C16 | GPU nhanh: bộ điều khiển tải giữ đủ batch trên GPU, batch lớn hơn khi nhiều VRAM, nhãn bottleneck đúng | `planned` |
 
 ### V0 — Version và hiển thị (`done`)
@@ -820,7 +820,7 @@ v3) 0,41 T/s, 84 %, 76 %.
 - **Đúng như dự tính:** chờ corpus khoảng 0 % trên mọi máy; luồng điều phối không còn kiểm toàn vẹn (trên Xeon, lần kiểm
   nền tốn 718 s trong pha 1675 s, trước G3 phần này chặn thẳng luồng điều phối); gần như mọi lần đổi corpus chỉ còn DMA
   (`corpus_staged_installs` bằng số lần nạp); bản `gpu-vram-dit` được chọn là v4 trên Zen 4/5, v3 trên Intel và Haswell.
-- **TUF thấp hơn ước tính** (vòng burst 60 % thay vì khoảng 90 %) vì một lỗi khác: đọc cảm biến chiếm 35 % pha, xem C15c.
+- **TUF thấp hơn ước tính** (vòng burst 60 % thay vì khoảng 90 %) vì một lỗi khác: đọc cảm biến chiếm 35 % pha, xem C15b.
 - **Giới hạn kế tiếp (sửa lại 2026-10-20):** report ghi `verifier_worker_ceiling` cả pha trên mọi GPU nhanh (RTX PRO
   6000, 4090, 5080), nhưng CPU so không phải là giới hạn: hàng đợi kiểm rỗng, luồng kiểm chỉ dùng 0,14–0,2 lõi. Thứ giữ
   GPU ở mức bận 24–43 % là bộ điều khiển tải, kẹt ở 1 batch trên GPU; nhãn trên chỉ phản ánh việc bộ điều khiển đang
@@ -836,32 +836,22 @@ một phần dữ liệu được kiểm, bỏ nó thì chain mất nửa lượ
 
 ### C15 — Sửa sau kết quả thực địa v1.2.023–026 (`planned`, 2026-10-20)
 
-Bằng chứng: `Result/1910` (5 phiên v1.2.023) và `Result/2010` (25 phiên v1.2.026). C15a, C15b, C15d ảnh hưởng tới
-verdict; C15c trả lại vòng burst cho GPU. Mỗi mục một commit, có test.
+Bằng chứng: `Result/1910` (5 phiên v1.2.023) và `Result/2010` (25 phiên v1.2.026). C15a và C15c ảnh hưởng tới
+verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có test.
 
-- **C15a — RAM của iGPU nằm trong kế hoạch bộ nhớ.** ProArt X870E (9950X, 186 GiB, iGPU AMD Raphael): 8 phiên INVALID
-  vì CPU-RAM bị `OOM_KILLED` khoảng 46 s sau khi pha chạy chồng bắt đầu. cgroup của CPU-RAM không chạm giới hạn riêng
-  (`max` 0, `oom` 0, `oom_kill` 1): cả máy hết RAM. iGPU (`device_type` `INTEGRATED_GPU`) báo `device_local` 63 GiB,
-  thực chất là RAM hệ thống; bài test cấp 60 % (38 GiB) qua driver, không hiện trong RSS. Lớp GPU khởi động trước
-  CPU-RAM vài giây nên thấy RAM còn trống nhiều (`budget.rs` cho iGPU tới một nửa RAM trống), còn phiên chỉ dành cho GPU
-  `gpu_host_budget_bytes` 2 GiB và chia phần còn lại cho arena CPU-RAM (142 GiB). Arena 140 GiB thì có lúc lọt (ProArt
-  1 lần, MAG 9950X 2 lần); 7500F không có iGPU, arena 180 GiB vẫn PASS. **Sửa:** vùng "VRAM" của GPU tích hợp là RAM
-  host: phiên tính nó vào kế hoạch bộ nhớ trước khi chia arena CPU-RAM, và lớp GPU cấp cho iGPU đúng phần phiên đã dành,
-  không theo kích thước heap driver báo. Phần dành cho iGPU đo rồi chốt (đo trước, chọn hằng số sau). Test: kế hoạch
-  bộ nhớ có iGPU UMA; tổng arena + iGPU + phần còn lại không vượt RAM.
-- **C15b — Lỗi cấp phát là INVALID, không phải FAIL.** Hai phiên FAIL `?PCIe-GPU2|VRAM2` (1 và 11 sự kiện) thực chất là
-  `Vulkan call failed in allocate_memory: ERROR_OUT_OF_DEVICE_MEMORY` trên iGPU lúc máy đã cạn RAM (hệ quả của C15a), bị
+- **C15a — Lỗi cấp phát là INVALID, không phải FAIL.** Hai phiên FAIL `?PCIe-GPU2|VRAM2` (1 và 11 sự kiện) thực chất là
+  `Vulkan call failed in allocate_memory: ERROR_OUT_OF_DEVICE_MEMORY` trên iGPU lúc máy đã hết RAM (`oom_kill`), bị
   ghi thành sự kiện `gpu:transfer` / `gpu:retention`. Theo nguyên tắc INVALID không trộn với FAIL: thiếu bộ nhớ khi cấp
   phát (Vulkan và CUDA, device lẫn host) không tạo fault record; lớp GPU kết thúc INVALID với lý do thiếu bộ nhớ.
   Test: cấp phát lỗi giả lập ra INVALID, ledger không có sự kiện.
-- **C15c — Đọc cảm biến không chặn vòng lặp GPU, không gửi lệnh tới SSD đang test.** TUF (SSD Lexar NM610 PRO, không
+- **C15b — Đọc cảm biến không chặn vòng lặp GPU, không gửi lệnh tới SSD đang test.** TUF (SSD Lexar NM610 PRO, không
   DRAM): bước `host_sample` của `gpu-vram-dit` chiếm 35 % pha chạy chồng (một lần tối đa 3 s), 14 % rotation B, 5,5 %
   pha GPU chạy riêng; các máy khác 1–6 %. Mỗi giây nó đọc mọi chip hwmon, cả nhiệt độ NVMe: mỗi lần đọc là một lệnh
   admin tới SSD, chờ sau hàng đợi ghi của lớp SSD. Đây cũng là hiện tượng "thời gian ngoài vòng lặp" của TUF ngày 17/10
   (Patriot P410). **Sửa:** `gpu-vram-dit` đọc cảm biến trên luồng phụ (vòng lặp lấy giá trị mới nhất) và chỉ đọc chip
   của CPU; rà các nơi khác đọc hwmon theo chu kỳ để SSD đang test không nhận thêm lệnh admin không cần. Kỳ vọng: vòng
   burst của TUF từ 60 % lên khoảng 90 % như các máy khác.
-- **C15d — Không chạy lại chẩn đoán CPU-RAM trong COMBINED.** MAG 9950X3D (`Result/1910`, phiên 921): CPU-RAM FAIL trong
+- **C15c — Không chạy lại chẩn đoán CPU-RAM trong COMBINED.** MAG 9950X3D (`Result/1910`, phiên 921): CPU-RAM FAIL trong
   pha chạy chồng (4 lần lật 1 bit, `confirm_rewrite_fixed`). Engine tự chạy lại nguyên bài (1670 s) để phân loại; pha
   hết giờ, phiên chờ thêm 900 s rồi drain: report lượt đầu mất (lớp CPU-RAM của pha thành INVALID, verdict vẫn FAIL nhờ
   ledger), phiên dài thêm 15 phút, lượt chạy lại thấy thêm byte sai nhưng mất chi tiết vì không ghi fault record.
@@ -956,7 +946,7 @@ khi CPU so còn dư hơn 20 lần (xem C16).
 | C12 | R3 trong pha chạy chồng của COMBINED (`max` và `balanced`): worker RAM theo phép đo C2b của baseline, gần 1/3 đỉnh; mọi luồng còn lại của CPU-RAM chạy oracle, không nghỉ, không đổi kernel nhẹ. Baseline và menu [1] giữ C2b lấp đầy bus | đã chốt (2026-10-17) |
 | C13 | G1 + G2 (kho corpus) + G3; chuẩn kiểm không đổi; sau đó C9 cho trần luồng kiểm | đã chốt (2026-10-18) |
 | C14 | Gác: chỉ u32, kiểm cả chuỗi (báo riêng), không áp vào data chain | gác (2026-10-18) |
-| C15 | C15a → C15d, mỗi mục một commit, trước C9 | đã chốt (2026-10-20) |
+| C15 | C15a → C15c, mỗi mục một commit, trước C9 | đã chốt (2026-10-20) |
 | C16 | Sửa bộ điều khiển tải và cỡ batch cho GPU nhanh trước C9; CPU so còn dư hơn 20 lần, không phải giới hạn | đã chốt (2026-10-20) |
 | C9, xem lại | M khả nghịch mod 2, B ngẫu nhiên; bước chiếu hay không chốt khi làm C9a | đã chốt hướng (2026-10-20) |
 | Freivalds/ABFT, xem lại | Vẫn không làm: trái chuẩn so chính xác và không tăng phép tính trên mỗi word CPU so | đã chốt (2026-10-20) |
@@ -975,7 +965,7 @@ khi CPU so còn dư hơn 20 lần (xem C16).
 8. Đo COMBINED v1.2.018 trên máy thật, rồi C9 → C10 sau khi thảo luận.
 9. C12: R3 trong pha chạy chồng (`done`, v1.2.021); C11 gác lại.
 10. C13: G1 → G2 → G3 (`done`, v1.2.024–026), đã kiểm thực địa (2026-10-20).
-11. C15: C15a (RAM của iGPU) → C15b (lỗi cấp phát là INVALID) → C15c (đọc cảm biến) → C15d (rerun CPU-RAM).
+11. C15: C15a (lỗi cấp phát là INVALID) → C15b (đọc cảm biến) → C15c (rerun CPU-RAM).
 12. C16: C16a (vì sao hàng đợi đầy) → C16b (hồi phục) → C16c (batch lớn hơn) → C16d (nhãn), rồi phiên thực địa trên
     ProArt X870E, TUF và một máy RTX PRO 6000 hoặc 4090.
 13. C9 (M khả nghịch mod 2; đo C9d trên máy RTX PRO 6000 hoặc 4090) → C10.
