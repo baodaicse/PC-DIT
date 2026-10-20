@@ -844,6 +844,12 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   ghi thành sự kiện `gpu:transfer` / `gpu:retention`. Theo nguyên tắc INVALID không trộn với FAIL: thiếu bộ nhớ khi cấp
   phát (Vulkan và CUDA, device lẫn host) không tạo fault record; lớp GPU kết thúc INVALID với lý do thiếu bộ nhớ.
   Test: cấp phát lỗi giả lập ra INVALID, ledger không có sự kiện.
+  **Đã làm (v1.2.031):** gpu-vram-dit đặt riêng lỗi thiếu bộ nhớ (`ERROR_OUT_OF_DEVICE_MEMORY`,
+  `ERROR_OUT_OF_HOST_MEMORY`, `CUDA_ERROR_OUT_OF_MEMORY`) vào `resource_errors` trước khi ghi fault record, dừng chạy
+  (`completion_reason` `out_of_memory`) và ra INVALID; lỗi dữ liệu vẫn FAIL dù có thiếu bộ nhớ. Lỗi CUDA giờ in kèm tên
+  mã (`status 2 (CUDA_ERROR_OUT_OF_MEMORY)`). dit-chain thiếu bộ nhớ khi nạp corpus hoặc khi kiểm thì dừng vòng đọc,
+  INVALID có lý do. Phiên ghi lý do vào lớp GPU (`out of memory: …`, kể cả nhiều GPU). Negative gate mới
+  `--inject-hardware-fault out-of-memory`: trên GTX 960 ra INVALID, 0 fault record; `transfer` vẫn FAIL, 1 fault record.
 - **C15b — Đọc cảm biến không chặn vòng lặp GPU, không gửi lệnh tới SSD đang test.** TUF (SSD Lexar NM610 PRO, không
   DRAM): bước `host_sample` của `gpu-vram-dit` chiếm 35 % pha chạy chồng (một lần tối đa 3 s), 14 % rotation B, 5,5 %
   pha GPU chạy riêng; các máy khác 1–6 %. Mỗi giây nó đọc mọi chip hwmon, cả nhiệt độ NVMe: mỗi lần đọc là một lệnh

@@ -798,6 +798,14 @@ pub fn outcome(layer: Layer, dir: &Path) -> (LayerOutcome, String) {
                         LayerOutcome::PassHwWarnings,
                         "corrected hardware errors".into(),
                     ),
+                    // v1.2 C15a: why the run proved nothing.
+                    (LayerOutcome::Invalid, _) if view.first_resource_error().is_some() => (
+                        LayerOutcome::Invalid,
+                        format!(
+                            "out of memory: {}",
+                            view.first_resource_error().unwrap_or_default()
+                        ),
+                    ),
                     (outcome, status) => (outcome, status.unwrap_or_default().to_owned()),
                 }
             },
@@ -1076,6 +1084,28 @@ mod tests {
 
     fn outcome_of(layer: Layer, dir: &Path) -> LayerOutcome {
         outcome(layer, dir).0
+    }
+
+    #[test]
+    fn a_gpu_that_ran_out_of_memory_is_invalid_with_the_reason() {
+        let dir = std::env::temp_dir().join(format!("dit-gpu-oom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let oom = "Vulkan call failed in allocate_memory: ERROR_OUT_OF_DEVICE_MEMORY";
+        // One GPU, then a multi-GPU run whose second GPU ran out.
+        for report in [
+            serde_json::json!({"verdict": "INVALID", "hardware_tested": false,
+                "hardware_status": "clean", "resource_errors": [{"detail": oom}]}),
+            serde_json::json!({"verdict": "INVALID", "hardware_tested": false,
+                "device_reports": [{"verdict": "PASS"},
+                    {"verdict": "INVALID", "resource_errors": [{"detail": oom}]}]}),
+        ] {
+            std::fs::write(dir.join("report.json"), report.to_string()).unwrap();
+            let (outcome, detail) = outcome(Layer::Gpu, &dir);
+            assert_eq!(outcome, LayerOutcome::Invalid);
+            assert_eq!(detail, format!("out of memory: {oom}"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

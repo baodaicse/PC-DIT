@@ -405,6 +405,7 @@ fn run_multi(
             command.arg("--inject-vulkan-fault").arg(match fault {
                 super::VulkanFaultArg::Transfer => "transfer",
                 super::VulkanFaultArg::Matrix => "matrix",
+                super::VulkanFaultArg::OutOfMemory => "out-of-memory",
             });
         }
         if let Some(rounds) = args.compute_rounds {

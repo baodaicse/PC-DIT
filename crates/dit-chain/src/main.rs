@@ -1050,6 +1050,9 @@ fn read_phase(
     let inject_load = 2_u64;
     let per_result = 2 * u64::from(layout.inner);
     let session = layout.session;
+    // v1.2 C15a: the GPU ran out of memory. No evidence about the chain: the run ends INVALID
+    // with this reason, never a FAIL.
+    let mut out_of_memory: Option<String> = None;
     while Instant::now() < deadline && !ctx.stopped() && !backend.submission_stopped() {
         let load = ctx.report.reads.loads;
         let header = records.headers[usize::try_from(index).unwrap_or(0)].clone();
@@ -1121,7 +1124,11 @@ fn read_phase(
             let uploaded = backend.load_corpus(corpus);
             ctx.report.reads.stage_seconds.upload += stage.elapsed().as_secs_f64();
             if let Err(error) = uploaded {
-                ctx.fail("chain-upload", index, "gpu_vram_pcie", error.to_string());
+                if error.is_out_of_memory() {
+                    out_of_memory = Some(format!("chain-upload record {index}: {error}"));
+                } else {
+                    ctx.fail("chain-upload", index, "gpu_vram_pcie", error.to_string());
+                }
                 break 'step false;
             }
             let inject_gpu = args.inject == Some(InjectArg::Gpu) && load == inject_load;
@@ -1140,6 +1147,10 @@ fn read_phase(
                     step_ops = evidence.results_verified * per_result;
                     ctx.report.gpu.operations_verified += step_ops;
                     true
+                }
+                Err(error) if error.is_out_of_memory() => {
+                    out_of_memory = Some(format!("chain-gpu record {index}: {error}"));
+                    break 'step false;
                 }
                 Err(error) => {
                     let attribution = if backend.last_burst_attribution()
@@ -1184,6 +1195,9 @@ fn read_phase(
                 }
             }
         };
+        if out_of_memory.is_some() {
+            break;
+        }
         let logged = Step { index, batches, ok };
         steps.push(logged);
         hash = step_hash(&hash, logged, &header);
@@ -1228,7 +1242,9 @@ fn read_phase(
             "replayed read path differs from the live one".into(),
         );
     }
-    if backend.submission_stopped() {
+    if let Some(detail) = out_of_memory {
+        Err(format!("out of memory: {detail}"))
+    } else if backend.submission_stopped() {
         Err("GPU submission stopped".into())
     } else if ctx.report.reads.loads == 0 {
         Err("no record was read and verified".into())

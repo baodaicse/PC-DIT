@@ -60,7 +60,7 @@ pub enum MatrixFault {
 pub enum Error {
     #[error("CUDA unavailable: {0}")]
     Unavailable(String),
-    #[error("CUDA {call}: status {status}")]
+    #[error("CUDA {call}: status {status}{}", api_name(*status))]
     Api { call: &'static str, status: i32 },
     #[error("CUDA request: {0}")]
     Request(&'static str),
@@ -74,6 +74,36 @@ pub enum Error {
         actual: u32,
     },
 }
+impl Error {
+    /// v1.2 C15a: the driver ran out of memory (`CUDA_ERROR_OUT_OF_MEMORY`). No evidence about
+    /// the hardware under test: the caller ends INVALID, never FAIL.
+    #[must_use]
+    pub fn is_out_of_memory(&self) -> bool {
+        matches!(self, Self::Api { status: 2, .. })
+    }
+}
+
+/// The driver's name of a common `CUresult`, so a report says which failure it was (v1.2 C15a:
+/// running out of memory is told apart from a fault of the hardware under test).
+fn api_name(status: i32) -> &'static str {
+    match status {
+        1 => " (CUDA_ERROR_INVALID_VALUE)",
+        2 => " (CUDA_ERROR_OUT_OF_MEMORY)",
+        3 => " (CUDA_ERROR_NOT_INITIALIZED)",
+        4 => " (CUDA_ERROR_DEINITIALIZED)",
+        100 => " (CUDA_ERROR_NO_DEVICE)",
+        101 => " (CUDA_ERROR_INVALID_DEVICE)",
+        201 => " (CUDA_ERROR_INVALID_CONTEXT)",
+        400 => " (CUDA_ERROR_INVALID_HANDLE)",
+        700 => " (CUDA_ERROR_ILLEGAL_ADDRESS)",
+        701 => " (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES)",
+        702 => " (CUDA_ERROR_LAUNCH_TIMEOUT)",
+        719 => " (CUDA_ERROR_LAUNCH_FAILED)",
+        999 => " (CUDA_ERROR_UNKNOWN)",
+        _ => "",
+    }
+}
+
 struct MatrixSlot {
     input: Buffer,
     output: Buffer,

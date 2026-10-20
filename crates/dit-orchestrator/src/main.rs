@@ -1118,6 +1118,29 @@ struct GpuReportView {
     failures: Vec<GpuFailureView>,
     #[serde(default)]
     detection: Option<GpuDetectionView>,
+    /// v1.2 C15a: calls that failed for want of memory (an INVALID run, never a FAIL).
+    #[serde(default)]
+    resource_errors: Vec<GpuFailureView>,
+    /// The per-GPU reports of a multi-GPU run.
+    #[serde(default)]
+    device_reports: Vec<GpuDeviceReportView>,
+}
+
+#[derive(serde::Deserialize)]
+struct GpuDeviceReportView {
+    #[serde(default)]
+    resource_errors: Vec<GpuFailureView>,
+}
+
+impl GpuReportView {
+    /// The first out-of-memory error of the run or of one of its GPUs.
+    fn first_resource_error(&self) -> Option<&str> {
+        self.resource_errors
+            .iter()
+            .chain(self.device_reports.iter().flat_map(|d| &d.resource_errors))
+            .map(|error| error.detail.as_str())
+            .next()
+    }
 }
 
 #[derive(serde::Deserialize)]

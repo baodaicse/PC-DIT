@@ -308,6 +308,9 @@ impl LaneArgs {
 enum VulkanFaultArg {
     Transfer,
     Matrix,
+    /// v1.2 C15a negative gate: the first transfer fails for want of device memory, as the
+    /// driver reports it; the run must end INVALID with no fault record.
+    OutOfMemory,
 }
 
 impl From<FaultArg> for FaultKind {
@@ -700,6 +703,10 @@ struct GpuReport {
     last_compute_attempt: Option<ComputeProfile>,
     failure_count: u64,
     failures: Vec<FailureEvidence>,
+    /// v1.2 C15a: calls that failed for want of memory (device or host). No evidence about the
+    /// hardware under test: no fault record, never a FAIL; the run ends there, INVALID.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    resource_errors: Vec<FailureEvidence>,
     gpu_inventory: Vec<GpuDevice>,
     telemetry_start: Vec<GpuTelemetry>,
     telemetry_end: Vec<GpuTelemetry>,
@@ -978,6 +985,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut retention_checks = 0_u64;
     let mut sweeps = 0_u64;
     let mut failures = Vec::new();
+    let mut resource_errors = Vec::new();
     let mut last_transfer = None;
     let mut last_compute = None;
     let mut last_compute_attempt = None;
@@ -1349,6 +1357,13 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 let chunk_usize =
                     usize::try_from(active_chunk).map_err(|_| "chunk is too large")?;
                 let transfer_result = if generation == 0
+                    && args.inject_vulkan_fault == Some(VulkanFaultArg::OutOfMemory)
+                {
+                    Err(
+                        "Vulkan call failed in allocate_memory: ERROR_OUT_OF_DEVICE_MEMORY (injected)"
+                            .to_owned(),
+                    )
+                } else if generation == 0
                     && args.inject_vulkan_fault == Some(VulkanFaultArg::Transfer)
                 {
                     backend.verify_transfer_injected(
@@ -1636,6 +1651,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
         let emitting = Instant::now();
+        set_aside_resource_errors(&mut failures, faults_emitted, &mut resource_errors);
         emit_faults(
             &fault_writer,
             &failures,
@@ -1648,6 +1664,10 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         loop_closed.clone_from(&loop_profile);
         if args.stop_on_error && !failures.is_empty() {
             completion_reason = "stop_on_error".to_owned();
+            break;
+        }
+        if !resource_errors.is_empty() {
+            completion_reason = "out_of_memory".to_owned();
             break;
         }
     }
@@ -1757,6 +1777,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         hardware_note = health.summary();
     }
+    set_aside_resource_errors(&mut failures, faults_emitted, &mut resource_errors);
     emit_faults(
         &fault_writer,
         &failures,
@@ -1769,8 +1790,9 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let hardware_tested = vulkan.is_some()
         && (transfer_operations > 0 || profile == ProfileArg::ComputeOnly)
         && (matrix_dispatches > 0 || !compute_enabled)
-        && failures.is_empty();
-    let verdict = final_verdict(cancelled, failures.len());
+        && failures.is_empty()
+        && resource_errors.is_empty();
+    let verdict = final_verdict(cancelled, failures.len(), resource_errors.len());
     if renderer.is_some() || args.progress_file.is_some() {
         let mut state = ui_state(
             &system,
@@ -1893,6 +1915,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         matrix_dispatches_gpu_completed: matrix_gpu_completed,
         failure_count: u64::try_from(failures.len()).unwrap_or(u64::MAX),
         failures,
+        resource_errors,
         gpu_inventory: devices,
         telemetry_start,
         telemetry_end,
@@ -2352,13 +2375,46 @@ fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u
     left_start < right_end && right_start < left_end
 }
 
-fn final_verdict(cancelled: bool, failure_count: usize) -> Verdict {
+/// A data failure is a FAIL whatever else happened; a run cut short for want of memory, with
+/// none, proves nothing either way (INVALID).
+fn final_verdict(cancelled: bool, failure_count: usize, resource_error_count: usize) -> Verdict {
     if cancelled {
         Verdict::Aborted
-    } else if failure_count == 0 {
-        Verdict::Pass
-    } else {
+    } else if failure_count > 0 {
         Verdict::Fail
+    } else if resource_error_count > 0 {
+        Verdict::Invalid
+    } else {
+        Verdict::Pass
+    }
+}
+
+/// v1.2 C15a: a call that failed for want of memory (Vulkan device or host memory, CUDA
+/// `CUDA_ERROR_OUT_OF_MEMORY`), not because data came back wrong.
+fn out_of_memory(detail: &str) -> bool {
+    [
+        "ERROR_OUT_OF_DEVICE_MEMORY",
+        "ERROR_OUT_OF_HOST_MEMORY",
+        "CUDA_ERROR_OUT_OF_MEMORY",
+    ]
+    .iter()
+    .any(|code| detail.contains(code))
+}
+
+/// Moves the failures not yet turned into fault records that are out-of-memory errors to
+/// `resource`: they never become a fault record or a FAIL.
+fn set_aside_resource_errors(
+    failures: &mut Vec<FailureEvidence>,
+    emitted: usize,
+    resource: &mut Vec<FailureEvidence>,
+) {
+    let fresh = failures.split_off(emitted.min(failures.len()));
+    for failure in fresh {
+        if out_of_memory(&failure.detail) {
+            resource.push(failure);
+        } else {
+            failures.push(failure);
+        }
     }
 }
 
@@ -3474,6 +3530,7 @@ fn invalid_report(
             phase: phase.to_owned(),
             detail,
         }],
+        resource_errors: Vec::new(),
         gpu_inventory: devices,
         telemetry_start: telemetry.clone(),
         telemetry_end: telemetry,
@@ -4609,9 +4666,52 @@ mod tests {
         assert!(should_stop(&args, 0, Duration::from_mins(30)));
         assert_eq!(completed_pool_sweeps(&[3, 1, 2]), 1);
         assert_eq!(completed_pool_sweeps(&[3, 2, 2]), 2);
-        assert_eq!(final_verdict(true, 0), Verdict::Aborted);
-        assert_eq!(final_verdict(false, 1), Verdict::Fail);
+        assert_eq!(final_verdict(true, 0, 0), Verdict::Aborted);
+        assert_eq!(final_verdict(false, 1, 0), Verdict::Fail);
+        assert_eq!(final_verdict(false, 1, 1), Verdict::Fail);
+        assert_eq!(final_verdict(false, 0, 1), Verdict::Invalid);
+        assert_eq!(final_verdict(false, 0, 0), Verdict::Pass);
         assert!(ranges_overlap(0, 8, 4, 12));
         assert!(!ranges_overlap(0, 4, 4, 8));
+    }
+
+    #[test]
+    fn out_of_memory_is_set_aside_from_the_failures_and_never_a_fail() {
+        let api = |status| gpu_cuda::Error::Api {
+            call: "cuMemAlloc",
+            status,
+        };
+        assert!(api(2).is_out_of_memory() && !api(700).is_out_of_memory());
+        let cuda = api(2).to_string();
+        assert_eq!(cuda, "CUDA cuMemAlloc: status 2 (CUDA_ERROR_OUT_OF_MEMORY)");
+        let failures_seen = [
+            (
+                "retention",
+                "stale pattern at 0x40: expected 0x1, actual 0x0",
+            ),
+            // The field (Result/2010, the iGPU of a ProArt X870E once host memory ran out).
+            (
+                "transfer",
+                "Vulkan call failed in allocate_memory: ERROR_OUT_OF_DEVICE_MEMORY",
+            ),
+            ("compute", cuda.as_str()),
+            (
+                "transfer",
+                "Vulkan call failed in allocate_memory: ERROR_OUT_OF_HOST_MEMORY",
+            ),
+        ];
+        let mut failures: Vec<FailureEvidence> = failures_seen
+            .iter()
+            .map(|(phase, detail)| failure(0, 1, phase, detail))
+            .collect();
+        // The first one is already a fault record: it is never moved.
+        failures.insert(0, failure(0, 1, "compute", "CUDA_ERROR_OUT_OF_MEMORY"));
+        let mut resource = Vec::new();
+        set_aside_resource_errors(&mut failures, 1, &mut resource);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[1].phase, "retention");
+        assert_eq!(resource.len(), 3);
+        assert!(resource.iter().all(|f| out_of_memory(&f.detail)));
+        assert_eq!(final_verdict(false, 0, resource.len()), Verdict::Invalid);
     }
 }

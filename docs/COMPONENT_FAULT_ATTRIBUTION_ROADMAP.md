@@ -428,6 +428,7 @@ Kiểm trên GTX 960 (`build/f3/`):
 | Lane, vùng đổi trong VRAM giữa lúc ghi và lúc đọc lại (`lane-rest`) | `vram-rest=1` → `VRAM1` xác định |
 | Hiệu năng, GEMM + lane song song, cấu hình menu (3 cặp xen kẽ) | compute 285,4 → 281,5 GOPS (**−1,4 %**); lane kiểm 1.823 → 1.841 MiB/s (**không giảm**) |
 | Sổ lỗi | test `injected_gpu_boundary_faults_land_on_their_cells` và `injected_lane_boundary_faults_land_on_their_cells` đưa đúng các dòng lỗi thật trên qua bộ quy ô |
+| Thiếu bộ nhớ (`--inject-hardware-fault out-of-memory`, v1.2.031) | INVALID `out_of_memory`, không fault record, không ô nào; lỗi `ERROR_OUT_OF_DEVICE_MEMORY` / `ERROR_OUT_OF_HOST_MEMORY` / `CUDA_ERROR_OUT_OF_MEMORY` không bao giờ là FAIL (cả ở dit-chain) |
 
 Giới hạn còn lại:
 - Buffer host bị đổi **thoáng qua** sau khi copy về không tách được với lỗi trên đường về: ghi là `d2h`. Ô RAM host hỏng
