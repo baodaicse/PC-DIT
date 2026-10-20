@@ -53,13 +53,14 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `done` (v1.2.012) |
 | C7 | GPU: K của GEMM tự tăng khi CPU kiểm không kịp | `done` (v1.2.018) |
 | C8 | GPU: INT8 Tensor core trong test đầy đủ và COMBINED | `done` (v1.2.018) |
-| C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word | `planned` (thảo luận) |
+| C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word (M khả nghịch mod 2, xem lại 2026-10-20) | `planned` (thảo luận) |
 | C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
 | C11 | Cân bằng tải GPU / CPU-RAM trong pha chạy chồng: đo tỉ lệ cân bằng, ngân sách băng thông RAM, điều phối | `parked` (phức tạp) |
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
 | C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `done` (v1.2.024–026), đã kiểm thực địa |
 | C14 | Chuỗi GEMM có đáp án biết trước (M^L = Π) | `parked` |
 | C15 | Sửa sau kết quả thực địa v1.2.023–026: RAM của iGPU trong kế hoạch bộ nhớ, lỗi cấp phát là INVALID, đọc cảm biến không chặn GPU, không chạy lại CPU-RAM trong COMBINED | `planned` |
+| C16 | GPU nhanh: bộ điều khiển tải giữ đủ batch trên GPU, batch lớn hơn khi nhiều VRAM, nhãn bottleneck đúng | `planned` |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -526,9 +527,22 @@ tag generation và word canh như mục 3.3.
 | Phép tính trên mỗi word CPU so | ~2 K | ~130 K (gấp ~65 lần) |
 | Dữ liệu trung gian | trong shared memory | X_s ghi/đọc VRAM (N×K mỗi job, 128 MiB mỗi tầng với 512 job) |
 
-- **Điều kiện để lỗi không bị nuốt:** mọi hệ số của M_s và B là số **lẻ**. Với phép lấy dư 2³², lỗi e ở một ô trung
-  gian lan sang cả hàng kế tiếp là e·m; nếu m lẻ thì e·m ≡ 0 chỉ khi e ≡ 0, nên một lỗi đơn ở bất kỳ tầng nào chắc
-  chắn đổi output cuối. (Nếu m chẵn, lỗi e = 2³¹ có thể biến mất.)
+- **Điều kiện để lỗi không bị nuốt (sửa 2026-10-20).** Điều kiện cũ "mọi hệ số của M_s và B là số lẻ" **sai**: nó chỉ
+  xét một bước lan. Khi mọi hệ số lẻ thì M ≡ J (ma trận toàn 1) theo mod 2, và vì K chẵn nên J·J ≡ 0 mod 2; một lỗi
+  lật bit 31 ở một tầng biến mất hẳn sau thêm 2 tầng, và cứ 2 tầng dữ liệu mất thêm một bit thấp (dữ liệu suy biến về
+  0, đúng cảnh báo "nhân lặp mod 2³² suy biến"). Điều kiện đúng:
+  - mỗi M_s **khả nghịch theo mod 2** (định thức lẻ), ví dụ tích của ma trận tam giác dưới và trên có đường chéo lẻ,
+    hệ số ngoài đường chéo ngẫu nhiên, nhân thêm một hoán vị. Khi đó X ↦ X·M_s là song ánh trên Z/2³², không lỗi nào
+    ở tầng giữa bị triệt tiêu và dữ liệu không suy biến;
+  - B **ngẫu nhiên** (không ép lẻ), mỗi hàng có ít nhất một hệ số lẻ. Vì B chiếu K chiều xuống N < K chiều nên luôn có
+    lỗi lọt qua phép chiếu: lỗi ở tầng cuối hoặc ở output luôn lộ ra, lỗi ở tầng sớm hơn lọt với xác suất khoảng 2^-N
+    (2^-64 với N = 64). Phép so của CPU vẫn chính xác từng word với oracle chính xác; phần xác suất chỉ là việc một
+    lỗi bên trong có đi tới output hay không, như một bit lật trong thanh ghi rồi bị ghi đè.
+  - Mô phỏng (K = 8, N = 4, L = 4): M toàn lẻ làm mất 20/20 lỗi bit 31, mọi ô của X₄ có ít nhất 2 bit thấp bằng 0;
+    M khả nghịch mod 2 giữ 20/20. Ở bước chiếu, B toàn lẻ làm mất 52 % lỗi bit 31 từ tầng 1, B ngẫu nhiên 6,5 %
+    (2^-4 = 6,25 %).
+  - Phương án không có bước chiếu (output là X_L, N×K) thì không lỗi nào lọt, nhưng output lớn gấp K/N lần nên chỉ
+    tăng phép tính trên mỗi word CPU so khoảng L lần (thay vì khoảng 65 lần). Chọn khi thảo luận C9a.
 - **Oracle:** CPU tính cả chuỗi bằng vòng lặp vô hướng độc lập, một lần cho mỗi corpus, dựng sẵn ở nền như hiện nay;
   corpus được GPU tính lại 256 batch với generation khác nhau, nên công CPU chia đều cho 256 lần. Với L = 4 và 512 job:
   khoảng 275 G phép tính mỗi corpus (vài chục giây trên 4 luồng phụ); cần đo để chắc dựng kịp trên CPU yếu.
@@ -546,7 +560,7 @@ thường khi CPU kiểm là giới hạn; ngưỡng chấp nhận.
 
 **Các bước:** C9a oracle CPU, logic thuần và test (điều kiện hệ số lẻ, lan lỗi); C9b kernel CUDA, các lỗi cài sẵn, test
 phần cứng trên GTX 960; C9c đưa vào vòng luân phiên, báo cáo, UI, nối với C7; C9d đo trên máy thật (COMBINED trên
-máy RTX PRO 6000 hoặc RTX 4090, nơi trần luồng kiểm nặng nhất theo kết quả thực địa của C13).
+máy RTX PRO 6000 hoặc RTX 4090, GPU nhanh nhất trong kết quả thực địa, sau C16).
 
 ### C10 — Compute sweep khả nghịch, GPU tự kiểm (`planned`)
 
@@ -787,7 +801,8 @@ khoảng 0,2 s mỗi 512 batch); một lần chép thừa khi corpus được ch
 tính đã kiểm ×1,5–1,8; CPU cho dựng corpus 0,83 → khoảng 0,35–0,40 lõi (lõi-giây mỗi corpus −73 %), phần trả lại về
 oracle CPU-RAM. **Cái giá:** image thêm khoảng 7,4 MiB; kho corpus khoảng 270 MiB mỗi corpus ở K 4096 (0,5–1 GiB) lấy từ
 ngân sách RAM của GPU; lỗi RAM host trong corpus được báo trễ tối đa khoảng một lần đổi corpus (verdict không đổi). Sau
-C13, giới hạn kế tiếp là độ bận trong vòng burst (trần luồng kiểm): việc của C9.
+C13, giới hạn kế tiếp là độ bận trong vòng burst. (Thực địa 2026-10-20: không phải trần luồng kiểm mà bộ điều khiển tải
+chỉ cho 1 batch trên GPU, xem C16.)
 
 ### Kết quả thực địa của C13 (v1.2.026, 2026-10-20)
 
@@ -806,9 +821,10 @@ v3) 0,41 T/s, 84 %, 76 %.
   nền tốn 718 s trong pha 1675 s, trước G3 phần này chặn thẳng luồng điều phối); gần như mọi lần đổi corpus chỉ còn DMA
   (`corpus_staged_installs` bằng số lần nạp); bản `gpu-vram-dit` được chọn là v4 trên Zen 4/5, v3 trên Intel và Haswell.
 - **TUF thấp hơn ước tính** (vòng burst 60 % thay vì khoảng 90 %) vì một lỗi khác: đọc cảm biến chiếm 35 % pha, xem C15c.
-- **Giới hạn kế tiếp:** trên mọi GPU nhanh (RTX PRO 6000, 4090, 5080), cả pha chạy chồng ở `verifier_worker_ceiling`: 4/4
-  luồng kiểm bận, K đã ở 4096; GPU chờ CPU kiểm 58–74 % thời gian vòng burst. GPU chậm (3060, 4050, 3050) thì GPU là
-  giới hạn (bận 76–85 %). Đúng là việc của C9; đo C9d trên máy RTX PRO 6000 hoặc 4090, nơi trần luồng kiểm nặng nhất.
+- **Giới hạn kế tiếp (sửa lại 2026-10-20):** report ghi `verifier_worker_ceiling` cả pha trên mọi GPU nhanh (RTX PRO
+  6000, 4090, 5080), nhưng CPU so không phải là giới hạn: hàng đợi kiểm rỗng, luồng kiểm chỉ dùng 0,14–0,2 lõi. Thứ giữ
+  GPU ở mức bận 24–43 % là bộ điều khiển tải, kẹt ở 1 batch trên GPU; nhãn trên chỉ phản ánh việc bộ điều khiển đang
+  giữ tải. Chi tiết và hướng sửa ở C16. GPU chậm (3060, 4050, 3050) thì GPU là giới hạn (bận 76–85 %).
 
 ### C14 — Chuỗi GEMM có đáp án biết trước (`parked`, 2026-10-18)
 
@@ -853,6 +869,72 @@ verdict; C15c trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   record và bước xác nhận tại chỗ); menu [1] giữ rerun. Phụ: lớp báo 8 lỗi (byte sai engine thấy, mỗi lỗi thấy hai lần)
   còn ledger 4; CSV dùng ledger nên đúng, gom vào việc hiển thị "susp" đang gác.
 
+### C16 — GPU nhanh: giữ đủ batch trên GPU (`planned`, 2026-10-20)
+
+**Bằng chứng** (`Result/2010`, pha chạy chồng `max`, v1.2.026):
+
+| | RTX PRO 6000 | RTX 4090 | RTX 5080 | RTX 3060 |
+|---|---|---|---|---|
+| Batch trên GPU cùng lúc cuối pha (cho phép 3) | 1 | 1 | 1 | 3 |
+| Thời gian bộ điều khiển ở `THROTTLED` | 99,8 % | 99,8 % | 99,8 % | 19 % (`BALANCED` 80 %) |
+| Lần hạ tải / lần hồi phục xong, cả pha | 66 / 0 | 61 / 0 | 32 / 1 | 121 / 121 |
+| GPU bận | 24 % | 38 % | 35 % | 85 % |
+| Output cần so | 0,82 GB/s | 0,97 GB/s | 0,68 GB/s | 0,45 GB/s |
+| Lõi CPU so + băm | 0,20 | 0,19 | 0,14 | 0,09 |
+| Hàng đợi kiểm | rỗng, chờ tối đa 0,01 s | như trái | như trái | như trái |
+
+- Luồng kiểm so 5,4 GB/s mỗi lõi; 4 luồng xử lý được khoảng 21 GB/s, gấp hơn 20 lần lượng output thực tế. CPU so
+  **không** phải giới hạn.
+- Mỗi batch trên PRO 6000 chỉ có 0,49 ms kernel và 0,13 ms chép về; với 1 batch trên GPU, một vòng gửi → tính → chép
+  → kiểm mất 2,6 ms, nên GPU bận khoảng 24 %, khớp số đo. Phần thời gian cố định của mỗi batch (luồng điều phối,
+  event, giao cho luồng kiểm, bộ điều khiển) lớn hơn kernel nhiều lần.
+- Thỉnh thoảng hàng đợi host chạm ngưỡng cứng (`fill` ≥ 0,9, hoặc đủ 8 slot với `fill` ≥ 0,5), bộ điều khiển hạ về 1
+  batch. Nó hồi phục từng bước: pacing giảm dần (×3/4 mỗi bước) rồi mới tăng số batch; mỗi bước phải yên `hold` tick,
+  `hold` nhân đôi tới 160 tick (8 s) khi một bước bị theo sau bởi lần đầy mới. Trên GPU nhanh hai lần hạ tải cách nhau
+  khoảng 25–50 s, không đủ để đi hết đường hồi phục, nên bộ điều khiển gần như không bao giờ về lại 3 batch (1 lần
+  hồi phục xong trên 159 lần hạ tải của ba máy). RTX 3060 hồi phục xong sau mọi lần hạ tải.
+- Bộ phân loại ghi `VERIFIER_BOUND` mỗi khi bộ điều khiển đang giữ tải (`backlog_throttled`), kể cả khi hàng đợi
+  rỗng, nên nhãn `verifier_worker_ceiling` che mất nguyên nhân thật.
+
+**Các bước** (chuẩn kiểm không đổi: CPU vẫn so toàn bộ output với oracle độc lập):
+
+- **C16a — vì sao hàng đợi chạm ngưỡng cứng.** Ghi mỗi lần đầy (thời điểm, `fill`, slot đang dùng, luồng kiểm đang làm
+  gì, việc nền đang chạy: dựng corpus, kiểm toàn vẹn, chép staging, CPU-RAM) vào nhật ký bottleneck, rồi đo trên máy
+  dev với tải CPU như pha chạy chồng. Nghi vấn: luồng kiểm bị chậm trong chốc lát khi CPU bị chiếm hết.
+- **C16b — hồi phục tương xứng với nguyên nhân.** Một lần đầy ngắn rồi hàng đợi rỗng lại không làm `hold` leo tới 8 s;
+  đi lại tới đủ số batch khi hàng đợi rỗng và kết quả kiểm vẫn về đều. Giữ các bất biến của bộ điều khiển
+  ([../gpu-vram/GPU_ASYNC_BALANCED_PIPELINE_ROADMAP.md](../gpu-vram/GPU_ASYNC_BALANCED_PIPELINE_ROADMAP.md) §2):
+  không bỏ kiểm, không lấy mẫu, không giảm K.
+- **C16c — batch lớn hơn trên GPU nhiều VRAM.** Thêm job mỗi batch khi VRAM cho phép (4090 24 GB, PRO 6000 96 GB) để
+  kernel mỗi batch dài hơn hẳn phần thời gian cố định. Output và công so tăng cùng tỉ lệ với phép tính, nên tỉ lệ
+  phép tính trên mỗi word CPU so không đổi; corpus và oracle lớn theo số job, vẫn chia cho 256 lần tính lại; kho
+  corpus tính vào ngân sách RAM như G2. Độ dài kernel mục tiêu đo rồi chốt.
+- **C16d — nhãn bottleneck đúng.** Bộ điều khiển giữ tải trong khi hàng đợi rỗng thì ghi một nhãn riêng (bộ điều khiển
+  đang giữ), không ghi `VERIFIER_BOUND`.
+
+**Kỳ vọng** (kiểm bằng phiên thực địa): GPU nhanh bận gấp 2–3 lần, toàn bộ vẫn CPU-verified; CPU so tăng tương ứng,
+từ 0,2 lên khoảng 0,5 lõi.
+
+### Đã cân nhắc, không làm: kiểm GEMM bằng Freivalds/ABFT (xem lại 2026-10-20)
+
+Đề xuất (từ một phiên phân tích commit c431fd6): GPU tính C = A·B với n lớn (2048–8192), CPU kiểm C·r = A·(B·r) trong
+O(n²) thay vì dựng oracle O(n³); thêm chuỗi GPU → GPU (A_{t+1} = mix(C_t)) và các bài toán "tính nặng, kiểm rẻ" khác
+(sort kiểm bằng fingerprint, NTT, giải hệ). Không làm, vì:
+
+- **Trái quyết định đã chốt** (C9, C10, 2026-10-15) và nguyên tắc 5: checksum không thay phép so chính xác. Phần "so
+  chính xác 64 ô lấy mẫu" là lấy mẫu, không được tính CPU-verified. Muốn đổi phải có ADR.
+- **Không tăng tỉ lệ đang cần tăng.** CPU vẫn phải đọc hết n² word output (tính C·r), mỗi word 2–3 phép tính, cùng bậc
+  với phép so hiện nay. Phép tính GPU trên mỗi word output bằng 2 × chiều trong: Freivalds n = 4096 cho 8192, GEMM
+  hiện nay K = 4096 cũng 8192. Thứ nó tiết kiệm là oracle bậc ba, vốn đã được chia cho 256 lần tính lại và từ C13 không
+  còn chặn GPU.
+- **Giữ lại hai nhận xét đúng:** nhân lặp mod 2³² suy biến (đã sửa vào điều kiện của C9); và dữ liệu nên đổi giữa các
+  bước để không lặp mãi cùng một mẫu (C9 tạo dữ liệu trung gian mới ở mỗi tầng trong VRAM).
+
+**Ý "CPU tính một lần, GPU tính lại nhiều lần":** đó là thiết kế hiện tại (oracle một lần mỗi corpus, GPU tính lại 256
+lần với tag generation riêng, CPU so toàn bộ). Để GPU tự so các lần lặp với bản CPU đã kiểm thì phần đó là
+device-verified, báo riêng, cùng họ với C10; chỉ cần một lần khác là FAIL, không biểu quyết theo đa số. Chưa cần
+khi CPU so còn dư hơn 20 lần (xem C16).
+
 ## Quyết định
 
 | Chủ đề | Quyết định | Trạng thái |
@@ -875,6 +957,9 @@ verdict; C15c trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
 | C13 | G1 + G2 (kho corpus) + G3; chuẩn kiểm không đổi; sau đó C9 cho trần luồng kiểm | đã chốt (2026-10-18) |
 | C14 | Gác: chỉ u32, kiểm cả chuỗi (báo riêng), không áp vào data chain | gác (2026-10-18) |
 | C15 | C15a → C15d, mỗi mục một commit, trước C9 | đã chốt (2026-10-20) |
+| C16 | Sửa bộ điều khiển tải và cỡ batch cho GPU nhanh trước C9; CPU so còn dư hơn 20 lần, không phải giới hạn | đã chốt (2026-10-20) |
+| C9, xem lại | M khả nghịch mod 2, B ngẫu nhiên; bước chiếu hay không chốt khi làm C9a | đã chốt hướng (2026-10-20) |
+| Freivalds/ABFT, xem lại | Vẫn không làm: trái chuẩn so chính xác và không tăng phép tính trên mỗi word CPU so | đã chốt (2026-10-20) |
 | C9, C10 | Giữ chuẩn: CPU-verified chỉ khi CPU so toàn bộ với oracle độc lập; device-verified báo riêng. Không dùng tổng kiểm tra kiểu ABFT/Freivalds, FP16/BF16 hay thuật toán không có đáp án chính xác từng bit | đã chốt hướng (2026-10-15), chi tiết cần thảo luận |
 | V0b | Version trong report và `fail-summary.csv`; file cũ không chuyển đổi, thiếu `dit_version` (trước 2026-10-13) là v1.1; CSV dạng cũ đổi tên `fail-summary-v1.1.csv` | đã chốt (2026-10-13) |
 
@@ -890,8 +975,10 @@ verdict; C15c trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
 8. Đo COMBINED v1.2.018 trên máy thật, rồi C9 → C10 sau khi thảo luận.
 9. C12: R3 trong pha chạy chồng (`done`, v1.2.021); C11 gác lại.
 10. C13: G1 → G2 → G3 (`done`, v1.2.024–026), đã kiểm thực địa (2026-10-20).
-11. C15: C15a (RAM của iGPU) → C15b (lỗi cấp phát là INVALID) → C15c (đọc cảm biến) → C15d (rerun CPU-RAM), rồi phiên
-    thực địa trên ProArt X870E và TUF. Sau đó C9 (đo C9d trên máy RTX PRO 6000 hoặc 4090) → C10.
+11. C15: C15a (RAM của iGPU) → C15b (lỗi cấp phát là INVALID) → C15c (đọc cảm biến) → C15d (rerun CPU-RAM).
+12. C16: C16a (vì sao hàng đợi đầy) → C16b (hồi phục) → C16c (batch lớn hơn) → C16d (nhãn), rồi phiên thực địa trên
+    ProArt X870E, TUF và một máy RTX PRO 6000 hoặc 4090.
+13. C9 (M khả nghịch mod 2; đo C9d trên máy RTX PRO 6000 hoặc 4090) → C10.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.
