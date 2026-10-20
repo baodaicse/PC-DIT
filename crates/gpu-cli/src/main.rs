@@ -23,8 +23,8 @@ use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_DURATION_SECONDS: u64 = 1_800;
@@ -799,22 +799,36 @@ struct CpuSensorMetrics {
     power_watts: Option<f64>,
 }
 
+/// Host load for the dashboard. CPU temperature and power come from a helper thread once a
+/// second (v1.2 C15b): a sensor read that blocks (seen up to 3 s) never holds the GPU loop.
 struct GpuHostSampler {
     host: HostSampler,
-    sensors: LiveSensorSampler,
-    cached: CpuSensorMetrics,
-    last_sensor_sample: Instant,
+    sensors: Arc<Mutex<CpuSensorMetrics>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl GpuHostSampler {
     fn detect() -> Self {
-        let sensors = LiveSensorSampler::default();
-        let cached = cpu_sensor_metrics(&sensors.sample());
+        let sampler = LiveSensorSampler::default();
+        let sensors = Arc::new(Mutex::new(cpu_sensor_metrics(&sampler.sample())));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (latest, stopped) = (Arc::clone(&sensors), Arc::clone(&stop));
+        // Without the thread the readings stay those taken here.
+        let _ = std::thread::Builder::new()
+            .name("gpu-host-sensors".into())
+            .spawn(move || {
+                while !stopped.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let metrics = cpu_sensor_metrics(&sampler.sample());
+                    if let Ok(mut slot) = latest.lock() {
+                        *slot = metrics;
+                    }
+                }
+            });
         Self {
             host: HostSampler::detect(),
             sensors,
-            cached,
-            last_sensor_sample: Instant::now(),
+            stop,
         }
     }
 
@@ -823,14 +837,18 @@ impl GpuHostSampler {
     }
 
     fn sample(&mut self) -> LiveUtilization {
-        if self.last_sensor_sample.elapsed() >= Duration::from_secs(1) {
-            self.cached = cpu_sensor_metrics(&self.sensors.sample());
-            self.last_sensor_sample = Instant::now();
-        }
         let mut live = self.host.sample();
-        live.cpu_temperature_celsius = self.cached.temperature_celsius;
-        live.cpu_power_watts = self.cached.power_watts;
+        if let Ok(metrics) = self.sensors.lock() {
+            live.cpu_temperature_celsius = metrics.temperature_celsius;
+            live.cpu_power_watts = metrics.power_watts;
+        }
         live
+    }
+}
+
+impl Drop for GpuHostSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 

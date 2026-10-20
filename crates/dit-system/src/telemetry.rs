@@ -645,10 +645,21 @@ fn is_cpu_package_zone(label: &str) -> bool {
     label == "package" || label.starts_with("package-") || label.starts_with("pkg")
 }
 
+/// v1.2 C15b: a drive's temperature sensor. Reading it sends the drive a command (a read of
+/// its SMART log), which waits behind the I/O of an SSD test: up to 3 s on a DRAM-less SSD
+/// under write load, every second, from every monitor. Drive temperatures come from the SSD
+/// test's own SMART reads instead.
+fn is_drive_sensor(chip: &str) -> bool {
+    matches!(chip, "nvme" | "drivetemp")
+}
+
 fn collect_hwmon_temperatures(root: &Path) -> Vec<TemperatureReading> {
     let mut readings = Vec::new();
     for hwmon in child_directories(root) {
         let chip = read_trimmed(hwmon.join("name")).unwrap_or_else(|| "hwmon".to_owned());
+        if is_drive_sensor(&chip) {
+            continue;
+        }
         let Ok(files) = fs::read_dir(&hwmon) else {
             continue;
         };
@@ -690,10 +701,15 @@ fn collect_thermal_zone_temperatures(root: &Path) -> Vec<TemperatureReading> {
                 .is_some_and(|name| name.starts_with("thermal_zone"))
         })
         .filter_map(|zone| {
+            let kind = read_trimmed(zone.join("type")).unwrap_or_else(|| "thermal_zone".to_owned());
+            // A drive's zone reads the drive, as its hwmon sensor does (C15b).
+            if kind.starts_with("nvme") {
+                return None;
+            }
             let value = read_i64(zone.join("temp")).filter(|value| sane_temperature(*value))?;
             Some(TemperatureReading {
                 source: zone.join("temp").display().to_string(),
-                label: read_trimmed(zone.join("type")).unwrap_or_else(|| "thermal_zone".to_owned()),
+                label: kind,
                 millidegrees_c: value,
                 critical_millidegrees_c: collect_zone_critical(&zone),
             })
@@ -914,10 +930,29 @@ fn unix_ms() -> u128 {
 mod tests {
     use super::{
         CounterReading, TelemetrySnapshot, TemperatureReading, ThrottleDelta,
-        collect_throttle_groups, energy_delta, parse_kernel_events, parse_key_value_counters,
-        sane_temperature, throttle_delta,
+        collect_hwmon_temperatures, collect_throttle_groups, energy_delta, parse_kernel_events,
+        parse_key_value_counters, sane_temperature, throttle_delta,
     };
     use std::fs;
+
+    #[test]
+    fn drive_sensors_are_never_read() {
+        let root = std::env::temp_dir().join(format!("dit-hwmon-{}", std::process::id()));
+        for (hwmon, chip, temp) in [
+            ("hwmon0", "k10temp", "61000"),
+            ("hwmon1", "nvme", "45000"),
+            ("hwmon2", "drivetemp", "38000"),
+        ] {
+            let dir = root.join(hwmon);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("name"), format!("{chip}\n")).unwrap();
+            fs::write(dir.join("temp1_input"), format!("{temp}\n")).unwrap();
+        }
+        let readings = collect_hwmon_temperatures(&root);
+        fs::remove_dir_all(&root).unwrap();
+        let labels: Vec<&str> = readings.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["k10temp:temp1"]);
+    }
 
     #[test]
     fn parses_cgroup_memory_events() {

@@ -857,6 +857,13 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   (Patriot P410). **Sửa:** `gpu-vram-dit` đọc cảm biến trên luồng phụ (vòng lặp lấy giá trị mới nhất) và chỉ đọc chip
   của CPU; rà các nơi khác đọc hwmon theo chu kỳ để SSD đang test không nhận thêm lệnh admin không cần. Kỳ vọng: vòng
   burst của TUF từ 60 % lên khoảng 90 % như các máy khác.
+  **Đã làm (v1.2.032):** bộ thu thập chung của `dit-system` không đọc chip hwmon của ổ đĩa (`nvme`, `drivetemp`) và
+  thermal zone `nvme*`. Nhờ vậy năm nơi đọc theo chu kỳ đều hết gửi lệnh tới SSD: `gpu-vram-dit`, bộ giám sát an toàn
+  của CPU-RAM (mỗi 250 ms), dashboard COMBINED, màn hình CPU-RAM, giao diện SSD. Nhiệt độ SSD vẫn lấy từ SMART của lớp
+  SSD; nhiệt độ dùng cho an toàn vốn chỉ là của CPU. `gpu-vram-dit` đọc cảm biến CPU trên luồng phụ mỗi giây, vòng lặp
+  chỉ lấy giá trị mới nhất. Máy dev: đọc nhiệt độ NVMe lúc ổ rảnh mất 1 ms (trung vị), tối đa 10,7 ms; bước
+  `host_sample` sau khi sửa trung bình 0,13 ms, tối đa 0,16 ms (0,09 % thời gian). Kiểm lại vòng burst của TUF bằng phiên
+  thực địa.
 - **C15c — Không chạy lại chẩn đoán CPU-RAM trong COMBINED.** MAG 9950X3D (`Result/1910`, phiên 921): CPU-RAM FAIL trong
   pha chạy chồng (4 lần lật 1 bit, `confirm_rewrite_fixed`). Engine tự chạy lại nguyên bài (1670 s) để phân loại; pha
   hết giờ, phiên chờ thêm 900 s rồi drain: report lượt đầu mất (lớp CPU-RAM của pha thành INVALID, verdict vẫn FAIL nhờ
