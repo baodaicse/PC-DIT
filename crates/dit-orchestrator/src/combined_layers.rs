@@ -143,6 +143,10 @@ pub fn cpu_ram(
         "250",
         "--rounds",
         "1",
+        // v1.2 C15c: no diagnostic rerun of a FAIL. It would run the whole duration again
+        // inside a phase that has a fixed length: drained after the grace period, the first
+        // report is lost. Each mismatch already has its fault record and in-place confirmation.
+        "--no-diagnostic-rerun",
     ]));
     args.extend([
         "--progress-report".into(),
@@ -934,6 +938,45 @@ mod tests {
         assert_eq!(niced.env.len(), 1);
         let plain = niced_or_not(0);
         assert_eq!(plain.program, PathBuf::from("/opt/cpu-dit-01/dit-cli"));
+    }
+
+    #[test]
+    fn no_cpu_ram_run_of_a_session_reruns_a_failure() {
+        let crate::Command::RenderMenu(menu) =
+            <crate::Cli as clap::Parser>::try_parse_from(["dit-suite", "render-menu"])
+                .unwrap()
+                .command
+        else {
+            panic!("wrong command")
+        };
+        let dir = Path::new("/run/x");
+        let overlap = cpu_ram(
+            &menu,
+            dir,
+            1680,
+            &CpuSplit::Fixed {
+                workers: 4,
+                oracle: 28,
+            },
+            &CpuMemory::Arena { mib: 4096 },
+            1536,
+        );
+        let baseline = cpu_ram(
+            &menu,
+            dir,
+            120,
+            &CpuSplit::Measured,
+            &CpuMemory::Alone,
+            1536,
+        );
+        let rotation = cpu_rotation(&menu, dir, 240, "a", &[], 1536);
+        for launch in [overlap, baseline, rotation] {
+            assert!(
+                launch.args.iter().any(|arg| arg == "--no-diagnostic-rerun"),
+                "{:?}",
+                launch.args
+            );
+        }
     }
 
     #[test]

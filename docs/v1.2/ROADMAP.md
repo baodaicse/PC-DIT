@@ -858,6 +858,9 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   **Sửa:** COMBINED truyền `--no-diagnostic-rerun` cho mọi lần chạy CPU-RAM (pha có giới hạn giờ; mỗi lỗi đã có fault
   record và bước xác nhận tại chỗ); menu [1] giữ rerun. Phụ: lớp báo 8 lỗi (byte sai engine thấy, mỗi lỗi thấy hai lần)
   còn ledger 4; CSV dùng ledger nên đúng, gom vào việc hiển thị "susp" đang gác.
+  **Đã làm (v1.2.030):** `combined_layers::cpu_ram` thêm `--no-diagnostic-rerun` cho mọi lần COMBINED chạy CPU-RAM
+  (baseline, pha chạy chồng, xoay lõi). Kiểm trên máy dev với lỗi RAM cài sẵn, 8 s: có rerun 16,6 s
+  (`reproducible_same_route`), có cờ 8,5 s (`disabled`), cả hai FAIL.
 
 ### C16 — GPU nhanh: giữ đủ batch trên GPU (`planned`, 2026-10-20)
 
