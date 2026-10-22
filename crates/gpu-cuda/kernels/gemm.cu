@@ -188,6 +188,68 @@ extern "C" __global__ void dit_vram_sweep_verify(const uint4 *region, unsigned l
     if (local) atomicAdd(bad, local);
 }
 
+// v1.2 C10: compute passes of the GPU-DRAM sweep. mix_block / unmix_block must equal
+// gpu_engine::sweep::mix_block / unmix_block: add, xor, rotate and a multiply by an odd constant,
+// every step invertible, keyed by the pass key, the round and the block index.
+__device__ __forceinline__ unsigned rotl32(unsigned x, unsigned r) { return (x << r) | (x >> (32 - r)); }
+__device__ __forceinline__ unsigned rotr32(unsigned x, unsigned r) { return (x >> r) | (x << (32 - r)); }
+__device__ __forceinline__ unsigned mix_round_key(unsigned key, unsigned round,
+    unsigned long long block) {
+    return key ^ (round * 0x9E3779B9u) ^ ((unsigned)block * 0x85EBCA6Bu) ^ (unsigned)(block >> 32);
+}
+__device__ __forceinline__ uint4 mix_block(uint4 s, unsigned key, unsigned long long block,
+    unsigned rounds) {
+    unsigned a = s.x, b = s.y, c = s.z, d = s.w;
+    for (unsigned r = 0; r < rounds; ++r) {
+        unsigned k = mix_round_key(key, r, block);
+        a += b ^ k; d ^= a; d = rotl32(d, 16);
+        c += d; b ^= c; b = rotl32(b, 12);
+        a *= 0x2545F491u; c ^= rotl32(a, 7);
+    }
+    return make_uint4(a, b, c, d);
+}
+__device__ __forceinline__ uint4 unmix_block(uint4 s, unsigned key, unsigned long long block,
+    unsigned rounds, unsigned inverse) {
+    unsigned a = s.x, b = s.y, c = s.z, d = s.w;
+    for (unsigned r = rounds; r > 0;) {
+        --r;
+        unsigned k = mix_round_key(key, r, block);
+        c ^= rotl32(a, 7); a *= inverse;
+        b = rotr32(b, 12); b ^= c; c -= d;
+        d = rotr32(d, 16); d ^= a; a -= b ^ k;
+    }
+    return make_uint4(a, b, c, d);
+}
+
+// Forward: mixes every 16-byte block of the span in place. Fault 1 (negative gate): block 0 of
+// the span is left as written, as if the kernel had skipped it.
+extern "C" __global__ void dit_vram_sweep_forward(uint4 *region, unsigned long long first,
+    unsigned long long vectors, unsigned key, unsigned rounds, unsigned fault) {
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long v = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         v < vectors; v += stride) {
+        if (fault == 1 && v == 0) continue;
+        region[v] = mix_block(region[v], key, first / 4 + v, rounds);
+    }
+}
+
+// Verify of a compute pass: unmixes each block in registers and counts the words that differ
+// from the pattern. VRAM keeps the mixed data, which a CPU checkpoint reads at the boundary.
+extern "C" __global__ void dit_vram_sweep_unmix_verify(const uint4 *region,
+    unsigned long long first, unsigned long long vectors, unsigned key, unsigned rounds,
+    unsigned inverse, unsigned *bad) {
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    unsigned local = 0;
+    for (unsigned long long v = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         v < vectors; v += stride) {
+        uint4 x = unmix_block(region[v], key, first / 4 + v, rounds, inverse);
+        unsigned long long w = first + v * 4;
+        local += (x.x != sweep_word(w, key)) + (x.y != sweep_word(w + 1, key))
+            + (x.z != sweep_word(w + 2, key)) + (x.w != sweep_word(w + 3, key));
+    }
+    if (local) atomicAdd(bad, local);
+}
+
 // ---- Boundary checks (docs/COMPONENT_FAULT_ATTRIBUTION_ROADMAP.md, step F3) ----
 // `boundary_mix` must equal gpu_engine::gemm::boundary_mix: the hash of a word array is the sum
 // (mod 2^32) of boundary_mix(index, word), so blocks can add their parts in any order. The word

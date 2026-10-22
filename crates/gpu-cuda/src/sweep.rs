@@ -15,8 +15,9 @@ use crate::{
 use gpu_engine::{
     lane::Zone,
     sweep::{
-        CHECKPOINT_BYTES, DEFAULT_SPAN_BYTES, SweepPhase, SweepPlan, SweepStep, idle_after,
-        sweep_pattern_into,
+        CHECKPOINT_BYTES, Checkpoint, DEFAULT_MIX_ROUNDS, DEFAULT_SPAN_BYTES,
+        MIX_MULTIPLIER_INVERSE, MIX_OPS_PER_ROUND, SweepPhase, SweepPlan, SweepStep, idle_after,
+        mixed_pattern_into, sweep_pattern_into,
     },
     verifier::first_difference,
 };
@@ -52,6 +53,9 @@ pub struct SweepConfig {
     /// Least time between two trades of pool halves with the transfer lane: each trade stops
     /// the lane and re-reads its pending retention checks, so it is kept rare.
     pub swap_interval_ms: u64,
+    /// v1.2 C10: rounds of the reversible mix of a compute pass (every other pass); 0 keeps
+    /// every pass a plain DRAM pass.
+    pub mix_rounds: u32,
 }
 
 impl Default for SweepConfig {
@@ -62,6 +66,7 @@ impl Default for SweepConfig {
             share: None,
             checkpoint_interval_ms: 2_000,
             swap_interval_ms: 10_000,
+            mix_rounds: DEFAULT_MIX_ROUNDS,
         }
     }
 }
@@ -69,7 +74,11 @@ impl Default for SweepConfig {
 impl SweepConfig {
     pub(crate) fn validate(self) -> Result<()> {
         let out = |v: Option<f64>| v.is_some_and(|v| !(0.05..=1.0).contains(&v));
-        if out(self.duty) || out(self.share) || self.checkpoint_interval_ms == 0 {
+        if out(self.duty)
+            || out(self.share)
+            || self.checkpoint_interval_ms == 0
+            || self.mix_rounds > 1024
+        {
             return Err(Error::Request(
                 "sweep duty and share must be within 0.05..=1.0",
             ));
@@ -93,9 +102,25 @@ pub struct SweepReport {
     pub device_verified_bytes: u64,
     pub bad_words: u64,
     pub kernel_event_seconds: f64,
+    /// Device time of the fill, forward (mix) and verify kernels, apart.
+    pub fill_event_seconds: f64,
+    pub forward_event_seconds: f64,
+    pub verify_event_seconds: f64,
     pub checkpoint_ops: u64,
     /// Bytes the CPU read back over `PCIe` and found equal to the host-regenerated pattern.
     pub checkpoint_cpu_verified_bytes: u64,
+    /// v1.2 C10: mix rounds of a compute pass (0: none).
+    pub mix_rounds: u32,
+    /// Bytes of compute passes the device unmixed and found equal to the pattern; included in
+    /// `device_verified_bytes`.
+    pub compute_device_verified_bytes: u64,
+    /// Operations behind them: mix and unmix, `MIX_OPS_PER_ROUND` per round and block.
+    /// Device-verified only, never added to what the CPU verified.
+    pub device_verified_compute_ops: u64,
+    /// Bytes of the mixed state the CPU read back and found equal to its own mix of the
+    /// pattern: the device computed the mix right, not only consistently.
+    pub compute_checkpoint_cpu_verified_bytes: u64,
+    pub compute_bad_words: u64,
     pub zone_swaps: u64,
     pub failures_total: u64,
 }
@@ -106,12 +131,7 @@ enum Running {
     /// queued once the kernel is done: queued behind a running kernel, it would hold up every
     /// device-to-host copy after it (the transfer lane's included) until that kernel ended.
     Counter(SweepStep),
-    Checkpoint {
-        allocation: usize,
-        offset: u64,
-        bytes: u64,
-        key: u32,
-    },
+    Checkpoint(Checkpoint),
 }
 
 pub(crate) struct Sweeper {
@@ -144,7 +164,8 @@ impl Sweeper {
         seed: u64,
     ) -> Result<Self> {
         config.validate()?;
-        let plan = SweepPlan::new(zones, DEFAULT_SPAN_BYTES, seed).map_err(Error::Request)?;
+        let plan = SweepPlan::new(zones, DEFAULT_SPAN_BYTES, seed, config.mix_rounds)
+            .map_err(Error::Request)?;
         let context = &backend.context;
         let concurrent = backend.concurrent_kernels;
         let full = backend.sm_count * BLOCKS_PER_SM;
@@ -177,6 +198,7 @@ impl Sweeper {
                 duty,
                 concurrent_kernels: concurrent,
                 zone_bytes: plan.zone_bytes(),
+                mix_rounds: config.mix_rounds,
                 ..SweepReport::default()
             },
             plan,
@@ -254,6 +276,7 @@ impl Sweeper {
             zones,
             DEFAULT_SPAN_BYTES,
             self.seed ^ passes.rotate_left(29),
+            self.config.mix_rounds,
         )
         .map_err(Error::Request)?;
         self.report.zone_bytes = self.plan.zone_bytes();
@@ -284,11 +307,9 @@ impl Sweeper {
         let checkpoint_due = self.plan.at_pass_boundary()
             && self.last_checkpoint.elapsed()
                 >= Duration::from_millis(self.config.checkpoint_interval_ms);
-        if checkpoint_due
-            && let Some((allocation, offset, bytes, key)) = self.plan.next_checkpoint()
-        {
+        if checkpoint_due && let Some(checkpoint) = self.plan.next_checkpoint() {
             self.last_checkpoint = now;
-            return self.launch_checkpoint(backend, allocation, offset, bytes, key);
+            return self.launch_checkpoint(backend, checkpoint);
         }
         let step = self.plan.next_step();
         self.launch_step(backend, step)
@@ -338,92 +359,145 @@ impl Sweeper {
         Ok(buffer.address + offset)
     }
 
+    /// One sweep kernel on the sweep stream, over the whole grid.
+    fn launch_kernel(
+        &self,
+        call: &'static str,
+        function: Handle,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        check(call, unsafe {
+            (self.context.driver.launch)(
+                function,
+                self.grid,
+                1,
+                1,
+                THREADS,
+                1,
+                1,
+                0,
+                self.stream,
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        })
+    }
+
+    /// Clears the mismatch counter a verify kernel adds into.
+    fn reset_counter(&self) -> Result<()> {
+        check("sweep counter reset", unsafe {
+            (self.context.driver.fill)(self.counter.address, 0, 1, self.stream)
+        })
+    }
+
+    /// Takes the armed negative-gate fault if it is `fault`.
+    fn take_fault(&mut self, fault: LaneFault) -> bool {
+        let armed = self.fault == Some(fault);
+        if armed {
+            self.fault = None;
+        }
+        armed
+    }
+
     fn launch_step(&mut self, backend: &CudaBackend, step: SweepStep) -> Result<()> {
-        let driver = &self.context.driver;
         let mut address = Self::device_range(backend, step.allocation, step.offset, step.bytes)?;
         let mut first = step.first_word();
         let mut vectors = step.bytes / 16;
         let mut key = step.key;
+        let mut rounds = step.rounds;
+        let mut counter = self.counter.address;
         self.in_flight = true;
         check("sweep start", unsafe {
-            (driver.event_record)(self.events[0], self.stream)
+            (self.context.driver.event_record)(self.events[0], self.stream)
         })?;
         match step.phase {
-            SweepPhase::Fill => {
-                let mut params = [
+            SweepPhase::Fill => self.launch_kernel(
+                "sweep fill",
+                backend.sweep_fill_function,
+                &mut [
                     (&raw mut address).cast::<c_void>(),
                     (&raw mut first).cast(),
                     (&raw mut vectors).cast(),
                     (&raw mut key).cast(),
-                ];
-                check("sweep fill", unsafe {
-                    (driver.launch)(
-                        backend.sweep_fill_function,
-                        self.grid,
-                        1,
-                        1,
-                        THREADS,
-                        1,
-                        1,
-                        0,
-                        self.stream,
-                        params.as_mut_ptr(),
-                        ptr::null_mut(),
-                    )
-                })?;
+                ],
+            )?,
+            SweepPhase::Forward => {
+                let mut fault = u32::from(self.take_fault(LaneFault::ComputeSweepSkip));
+                self.launch_kernel(
+                    "sweep forward",
+                    backend.sweep_forward_function,
+                    &mut [
+                        (&raw mut address).cast::<c_void>(),
+                        (&raw mut first).cast(),
+                        (&raw mut vectors).cast(),
+                        (&raw mut key).cast(),
+                        (&raw mut rounds).cast(),
+                        (&raw mut fault).cast(),
+                    ],
+                )?;
+                if self.take_fault(LaneFault::ComputeSweepState) {
+                    // As a bit going bad at rest would: one mixed word changes before the unmix.
+                    check("sweep state fault", unsafe {
+                        (self.context.driver.fill)(address, 0xDEAD_BEEF, 1, self.stream)
+                    })?;
+                }
+            }
+            SweepPhase::Verify if step.rounds > 0 => {
+                if self.take_fault(LaneFault::ComputeSweepKey) {
+                    key ^= 1;
+                }
+                self.reset_counter()?;
+                let mut inverse = MIX_MULTIPLIER_INVERSE;
+                self.launch_kernel(
+                    "sweep unmix verify",
+                    backend.sweep_unmix_verify_function,
+                    &mut [
+                        (&raw mut address).cast::<c_void>(),
+                        (&raw mut first).cast(),
+                        (&raw mut vectors).cast(),
+                        (&raw mut key).cast(),
+                        (&raw mut rounds).cast(),
+                        (&raw mut inverse).cast(),
+                        (&raw mut counter).cast(),
+                    ],
+                )?;
             }
             SweepPhase::Verify => {
-                if self.fault == Some(LaneFault::SweepVerify) {
+                if self.take_fault(LaneFault::SweepVerify) {
                     // As damaged memory would: every word differs from what the check expects.
                     key ^= 1;
-                    self.fault = None;
                 }
-                check("sweep counter reset", unsafe {
-                    (driver.fill)(self.counter.address, 0, 1, self.stream)
-                })?;
-                let mut counter = self.counter.address;
-                let mut params = [
-                    (&raw mut address).cast::<c_void>(),
-                    (&raw mut first).cast(),
-                    (&raw mut vectors).cast(),
-                    (&raw mut key).cast(),
-                    (&raw mut counter).cast(),
-                ];
-                check("sweep verify", unsafe {
-                    (driver.launch)(
-                        backend.sweep_verify_function,
-                        self.grid,
-                        1,
-                        1,
-                        THREADS,
-                        1,
-                        1,
-                        0,
-                        self.stream,
-                        params.as_mut_ptr(),
-                        ptr::null_mut(),
-                    )
-                })?;
+                self.reset_counter()?;
+                self.launch_kernel(
+                    "sweep verify",
+                    backend.sweep_verify_function,
+                    &mut [
+                        (&raw mut address).cast::<c_void>(),
+                        (&raw mut first).cast(),
+                        (&raw mut vectors).cast(),
+                        (&raw mut key).cast(),
+                        (&raw mut counter).cast(),
+                    ],
+                )?;
             }
         }
         check("sweep end", unsafe {
-            (driver.event_record)(self.events[1], self.stream)
+            (self.context.driver.event_record)(self.events[1], self.stream)
         })?;
         self.running = Some(Running::Step(step));
         Ok(())
     }
 
-    fn launch_checkpoint(
-        &mut self,
-        backend: &CudaBackend,
-        allocation: usize,
-        offset: u64,
-        bytes: u64,
-        key: u32,
-    ) -> Result<()> {
+    fn launch_checkpoint(&mut self, backend: &CudaBackend, checkpoint: Checkpoint) -> Result<()> {
         let driver = &self.context.driver;
-        let device = Self::device_range(backend, allocation, offset, bytes)?;
-        let len = usize::try_from(bytes).map_err(|_| Error::Request("checkpoint size"))?;
+        let device = Self::device_range(
+            backend,
+            checkpoint.allocation,
+            checkpoint.offset,
+            checkpoint.bytes,
+        )?;
+        let len =
+            usize::try_from(checkpoint.bytes).map_err(|_| Error::Request("checkpoint size"))?;
         self.in_flight = true;
         check("sweep start", unsafe {
             (driver.event_record)(self.events[0], self.stream)
@@ -434,12 +508,7 @@ impl Sweeper {
         check("sweep end", unsafe {
             (driver.event_record)(self.events[1], self.stream)
         })?;
-        self.running = Some(Running::Checkpoint {
-            allocation,
-            offset,
-            bytes,
-            key,
-        });
+        self.running = Some(Running::Checkpoint(checkpoint));
         Ok(())
     }
 
@@ -471,8 +540,13 @@ impl Sweeper {
             Some(Running::Step(step)) => {
                 self.report.kernel_event_seconds += busy;
                 match step.phase {
-                    SweepPhase::Fill => self.report.fill_bytes += step.bytes,
+                    SweepPhase::Fill => {
+                        self.report.fill_bytes += step.bytes;
+                        self.report.fill_event_seconds += busy;
+                    }
+                    SweepPhase::Forward => self.report.forward_event_seconds += busy,
                     SweepPhase::Verify => {
+                        self.report.verify_event_seconds += busy;
                         // The kernel is done: now the counter copy runs at once.
                         self.in_flight = true;
                         check("sweep counter read", unsafe {
@@ -492,12 +566,7 @@ impl Sweeper {
                 }
             }
             Some(Running::Counter(step)) => self.account_verify(step),
-            Some(Running::Checkpoint {
-                allocation,
-                offset,
-                bytes,
-                key,
-            }) => self.account_checkpoint(allocation, offset, bytes, key)?,
+            Some(Running::Checkpoint(checkpoint)) => self.account_checkpoint(checkpoint)?,
             None => {}
         }
         Ok(true)
@@ -508,13 +577,27 @@ impl Sweeper {
         // SAFETY: the end event completed the counter's D2H.
         let raw = unsafe { self.flag.completed_bytes(4) };
         let bad = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let compute = step.rounds > 0;
         if bad == 0 {
             self.report.device_verified_bytes += step.bytes;
+            if compute {
+                self.report.compute_device_verified_bytes += step.bytes;
+                // Mix and unmix, every block.
+                self.report.device_verified_compute_ops +=
+                    2 * (step.bytes / 16) * u64::from(step.rounds) * MIX_OPS_PER_ROUND;
+            }
             return;
         }
         self.report.bad_words += u64::from(bad);
+        if compute {
+            self.report.compute_bad_words += u64::from(bad);
+        }
         self.fail(
-            "vram-sweep",
+            if compute {
+                "compute-sweep"
+            } else {
+                "vram-sweep"
+            },
             step.pass,
             step.allocation,
             step.offset,
@@ -526,18 +609,30 @@ impl Sweeper {
         );
     }
 
-    /// A checkpoint read-back has landed: the CPU compares it with the host-regenerated pattern.
-    fn account_checkpoint(
-        &mut self,
-        allocation: usize,
-        offset: u64,
-        bytes: u64,
-        key: u32,
-    ) -> Result<()> {
+    /// A checkpoint read-back has landed: the CPU compares it with the pattern it regenerates
+    /// itself, mixed by its own code after a compute pass (C10: the device's mix, not only its
+    /// round trip, is checked).
+    fn account_checkpoint(&mut self, checkpoint: Checkpoint) -> Result<()> {
+        let Checkpoint {
+            allocation,
+            offset,
+            bytes,
+            key,
+            rounds,
+        } = checkpoint;
         let len = usize::try_from(bytes).map_err(|_| Error::Request("checkpoint size"))?;
         let mut expected = vec![0_u8; len];
-        sweep_pattern_into(&mut expected, key, offset / 4);
-        if self.fault == Some(LaneFault::SweepCheckpoint) {
+        if rounds > 0 {
+            mixed_pattern_into(&mut expected, key, offset / 4, rounds);
+        } else {
+            sweep_pattern_into(&mut expected, key, offset / 4);
+        }
+        let corrupt = match self.fault {
+            Some(LaneFault::SweepCheckpoint) => rounds == 0,
+            Some(LaneFault::ComputeSweepCheckpoint) => rounds > 0,
+            _ => false,
+        };
+        if corrupt {
             self.checkpoint.corrupt_first_byte();
             self.fault = None;
         }
@@ -546,9 +641,18 @@ impl Sweeper {
         let actual = unsafe { self.checkpoint.completed_bytes(len) };
         self.report.checkpoint_ops += 1;
         match first_difference(&expected, actual) {
-            None => self.report.checkpoint_cpu_verified_bytes += bytes,
+            None => {
+                self.report.checkpoint_cpu_verified_bytes += bytes;
+                if rounds > 0 {
+                    self.report.compute_checkpoint_cpu_verified_bytes += bytes;
+                }
+            }
             Some(index) => self.fail(
-                "vram-sweep-checkpoint",
+                if rounds > 0 {
+                    "compute-sweep-checkpoint"
+                } else {
+                    "vram-sweep-checkpoint"
+                },
                 self.plan.passes_completed(),
                 allocation,
                 offset,

@@ -227,6 +227,11 @@ struct LaneArgs {
     /// Share of the device's resident threads the sweep launches (0.05..=1.0, default 1.0).
     #[arg(long, requires = "vram_sweep")]
     vram_sweep_share: Option<f64>,
+    /// Rounds of the reversible mix of the sweep's compute passes (every other pass; v1.2 C10):
+    /// mixed in VRAM, left at rest, unmixed and compared on the device, the mix checked by the
+    /// CPU at checkpoints. 0 keeps every pass a plain DRAM pass (default 32, at most 1024).
+    #[arg(long, requires = "vram_sweep")]
+    vram_sweep_mix_rounds: Option<u32>,
 }
 
 impl LaneArgs {
@@ -289,6 +294,11 @@ impl LaneArgs {
         }
         if let Some(share) = self.vram_sweep_share {
             command.arg("--vram-sweep-share").arg(share.to_string());
+        }
+        if let Some(rounds) = self.vram_sweep_mix_rounds {
+            command
+                .arg("--vram-sweep-mix-rounds")
+                .arg(rounds.to_string());
         }
         if let Some(profile) = self.workload_profile
             && let Some(value) = profile.to_possible_value()
@@ -2134,11 +2144,16 @@ fn async_config(args: &RunArgs) -> gpu_cuda::AsyncConfig {
         config.quarantine_slots = n;
     }
     config.lane = lane_config(args);
+    let sweep_defaults = gpu_cuda::SweepConfig::default();
     config.sweep = gpu_cuda::SweepConfig {
         enabled: args.lane.vram_sweep,
         duty: args.lane.vram_sweep_duty,
         share: args.lane.vram_sweep_share,
-        ..gpu_cuda::SweepConfig::default()
+        mix_rounds: args
+            .lane
+            .vram_sweep_mix_rounds
+            .unwrap_or(sweep_defaults.mix_rounds),
+        ..sweep_defaults
     };
     config.boundary_checks = args.boundary_checks;
     config.workers = config.workers.min(config.host_slots.max(1));
@@ -2219,6 +2234,13 @@ fn validate_lane_args(args: &RunArgs) -> Result<(), Box<dyn std::error::Error>> 
         .any(|value| !(0.05..=1.0).contains(&value))
     {
         return Err("--vram-sweep-duty and --vram-sweep-share must be within 0.05..=1.0".into());
+    }
+    if args
+        .lane
+        .vram_sweep_mix_rounds
+        .is_some_and(|rounds| rounds > 1024)
+    {
+        return Err("--vram-sweep-mix-rounds must be at most 1024".into());
     }
     if !lane_active(args) && args.lane.lane_tuning() {
         return Err(
@@ -2549,6 +2571,11 @@ fn build_scorecard(i: &ScorecardInputs<'_>) -> hwhealth::DetectionScorecard {
             device_verified_gib_per_second: sweep
                 .map(|s| s.device_verified_bytes as f64 / 1_073_741_824.0 / seconds),
             sweep_checkpoint_cpu_verified_bytes: sweep.map(|s| s.checkpoint_cpu_verified_bytes),
+            device_verified_compute_ops: sweep.map(|s| s.device_verified_compute_ops),
+            device_verified_compute_ops_per_second: sweep
+                .map(|s| s.device_verified_compute_ops as f64 / seconds),
+            compute_checkpoint_cpu_verified_bytes: sweep
+                .map(|s| s.compute_checkpoint_cpu_verified_bytes),
         },
         first_failure: i.first_failure.clone(),
         stress: i.stress.clone(),
@@ -2656,8 +2683,16 @@ fn collect_lane_failures(backend: &Backend, failures: &mut Vec<FailureEvidence>)
 #[allow(clippy::cast_precision_loss)]
 fn sweep_note(report: &gpu_cuda::SweepReport, elapsed: Duration) -> String {
     let seconds = elapsed.as_secs_f64().max(1e-9);
+    let compute = if report.mix_rounds > 0 {
+        format!(
+            " | compute {:.1} Gop/s device-verified",
+            report.device_verified_compute_ops as f64 / 1e9 / seconds
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "device-verified {} ({:.1} GiB/s) | passes {} | CPU checkpoints {} | half swaps {}",
+        "device-verified {} ({:.1} GiB/s){compute} | passes {} | CPU checkpoints {} | half swaps {}",
         format_bytes(report.device_verified_bytes),
         report.device_verified_bytes as f64 / 1_073_741_824.0 / seconds,
         report.passes_completed,

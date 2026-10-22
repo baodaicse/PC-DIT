@@ -214,6 +214,7 @@ fn prepared_sweep(pool_mib: u64) -> CudaBackend {
                 share: None,
                 checkpoint_interval_ms: 100,
                 swap_interval_ms: 300,
+                ..SweepConfig::default()
             },
             ..AsyncConfig::default()
         })
@@ -245,7 +246,10 @@ fn run_sweep_until(backend: &CudaBackend, done: impl Fn(&gpu_cuda::SweepReport) 
 fn h6_sweep_verifies_on_the_device_trades_halves_and_its_checkpoints_agree() {
     let backend = prepared_sweep(128);
     run_sweep_until(&backend, |s| {
-        s.zone_swaps >= 2 && s.checkpoint_ops >= 2 && s.passes_completed >= 4
+        s.zone_swaps >= 2
+            && s.checkpoint_ops >= 2
+            && s.passes_completed >= 4
+            && s.compute_checkpoint_cpu_verified_bytes > 0
     });
     backend.flush_lane().unwrap();
     assert!(backend.take_lane_failures().is_empty());
@@ -255,6 +259,17 @@ fn h6_sweep_verifies_on_the_device_trades_halves_and_its_checkpoints_agree() {
     assert!(s.device_verified_bytes >= 4 * s.zone_bytes, "{s:?}");
     assert_eq!(s.fill_bytes, s.device_verified_bytes, "{s:?}");
     assert!(s.checkpoint_cpu_verified_bytes > 0, "{s:?}");
+    // v1.2 C10: every other pass is a compute pass, unmixed and compared on the device, its mix
+    // checked by the CPU at a checkpoint; device-verified only.
+    assert!(
+        s.mix_rounds > 0 && s.compute_device_verified_bytes >= s.zone_bytes,
+        "{s:?}"
+    );
+    assert!(
+        s.device_verified_compute_ops > 0 && s.forward_event_seconds > 0.0,
+        "{s:?}"
+    );
+    assert_eq!(s.compute_bad_words, 0, "{s:?}");
     // The lane kept verifying through the trades and has covered both halves.
     let lane = backend.lane_report().unwrap();
     assert!(lane.transfer.sweeps >= 1, "{:?}", lane.transfer);
@@ -268,11 +283,20 @@ fn h6_each_injected_sweep_fault_is_reported_once_with_its_phase() {
     for (fault, phase) in [
         (LaneFault::SweepVerify, "vram-sweep"),
         (LaneFault::SweepCheckpoint, "vram-sweep-checkpoint"),
+        // v1.2 C10 compute passes: a block left unmixed, a word changed at rest, the unmix
+        // with another key, a corrupted read-back of the mixed state.
+        (LaneFault::ComputeSweepSkip, "compute-sweep"),
+        (LaneFault::ComputeSweepState, "compute-sweep"),
+        (LaneFault::ComputeSweepKey, "compute-sweep"),
+        (
+            LaneFault::ComputeSweepCheckpoint,
+            "compute-sweep-checkpoint",
+        ),
     ] {
         let backend = prepared_sweep(64);
         backend.inject_lane_fault(fault).unwrap();
         run_sweep_until(&backend, |s| {
-            s.passes_completed >= 4 && s.checkpoint_ops >= 2
+            s.passes_completed >= 4 && s.checkpoint_ops >= 2 && s.failures_total >= 1
         });
         backend.flush_lane().unwrap();
         let failures = backend.take_lane_failures();

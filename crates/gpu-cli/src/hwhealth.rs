@@ -1232,6 +1232,12 @@ pub struct CoverageDetection {
     pub device_verified_gib_per_second: Option<f64>,
     /// Sweep bytes the CPU re-checked over `PCIe` (checkpoints proving the device's own check).
     pub sweep_checkpoint_cpu_verified_bytes: Option<u64>,
+    /// v1.2 C10: operations of the sweep's compute passes (mix and unmix) the device verified:
+    /// device-verified only, never part of the CPU-verified compute above.
+    pub device_verified_compute_ops: Option<u64>,
+    pub device_verified_compute_ops_per_second: Option<f64>,
+    /// Mixed state the CPU read back and found equal to its own mix of the pattern.
+    pub compute_checkpoint_cpu_verified_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

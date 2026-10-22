@@ -151,6 +151,14 @@ pub enum LaneFault {
     SweepVerify,
     /// Corrupt the read-back of the GPU-DRAM sweep's first CPU checkpoint.
     SweepCheckpoint,
+    /// v1.2 C10: the first forward (mix) kernel of a compute pass leaves one block unmixed.
+    ComputeSweepSkip,
+    /// v1.2 C10: one word of the first span mixed by a compute pass changes at rest.
+    ComputeSweepState,
+    /// v1.2 C10: the first unmix-and-compare kernel uses another key.
+    ComputeSweepKey,
+    /// v1.2 C10: corrupt the read-back of the first CPU checkpoint after a compute pass.
+    ComputeSweepCheckpoint,
 }
 
 #[derive(Clone, Debug, Serialize)]

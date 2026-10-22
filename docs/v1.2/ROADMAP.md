@@ -54,7 +54,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C7 | GPU: K của GEMM tự tăng khi CPU kiểm không kịp | `done` (v1.2.018) |
 | C8 | GPU: INT8 Tensor core trong test đầy đủ và COMBINED | `done` (v1.2.018) |
 | C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word (M khả nghịch mod 2, xem lại 2026-10-20) | `done` (v1.2.038–039), chờ phiên thực địa |
-| C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
+| C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `done` (v1.2.040), chờ phiên thực địa |
 | C11 | Cân bằng tải GPU / CPU-RAM trong pha chạy chồng: đo tỉ lệ cân bằng, ngân sách băng thông RAM, điều phối | `parked` (phức tạp) |
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
 | C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `done` (v1.2.024–026), đã kiểm thực địa |
@@ -596,7 +596,7 @@ dashboard `chain … Gop/s`. Negative gate: `arm_matrix_fault` (`ChainBitFlip`, 
 | Dựng một corpus chuỗi 128 job × kc 1024 | 1,69 s (bản v1, 4 luồng) |
 | Digest corpus chuỗi v1 so với v3 | trùng (16 × 256 và 4 × 1024) |
 
-### C10 — Compute sweep khả nghịch, GPU tự kiểm (`planned`)
+### C10 — Compute sweep khả nghịch, GPU tự kiểm (`done`, v1.2.040, 2026-10-22)
 
 **Mục tiêu.** Lấp thời gian GPU đang rảnh vì chờ CPU kiểm bằng tải ALU + VRAM nặng, tự kiểm trên GPU. Theo đúng quy
 tắc của bộ quét DRAM hiện có (mục 2.5 tài liệu GPU): phần này là **device-verified**, báo riêng, **không bao giờ** cộng
@@ -633,6 +633,32 @@ cáo, UI; C10d đo trên máy thật.
 
 **Thứ tự đề xuất:** đo COMBINED v1.2.018 trên một máy thật trước, để biết sau C7 + `nice 10` GPU còn chờ CPU tới đâu.
 Rồi C9 (tăng phần CPU-verified, chuẩn mạnh nhất) trước C10 (device-verified, lấp phần rảnh còn lại).
+
+**Đã làm (v1.2.040).** Các điểm "cần chốt" được chốt khi làm:
+
+- **Xen kẽ, không thay:** lượt chẵn của bộ quét vẫn là quét DRAM thuần; lượt lẻ là compute pass: ghi pattern → tiến R
+  vòng trên toàn bộ vùng (ghi lại VRAM, dữ liệu nằm chờ trong lúc phần còn lại được tiến) → lùi R vòng và so với pattern
+  trên GPU (chỉ trong thanh ghi, VRAM giữ trạng thái đã trộn).
+- **Hàm trộn** trên khối 128 bit (4 word): mỗi vòng cộng, XOR, xoay bit và nhân với hằng số lẻ `0x2545F491`, khóa
+  vòng từ khóa pass, chỉ số vòng và chỉ số khối; mọi bước khả nghịch. Test thuộc tính: lùi ∘ tiến = đồng nhất; sai khóa
+  hay sai chỉ số khối thì không về; một bit lật ở bất kỳ word nào làm khác cả 4 word sau khi lùi (32 vòng).
+- **R = 32** (`--vram-sweep-mix-rounds`, 0 = tắt, tối đa 1024), chọn theo đo trên GTX 960: kernel tiến đọc và ghi
+  nên sàn bộ nhớ là 28,8 ms/GiB; 16 vòng đúng bằng sàn (ALU ẩn), 32 vòng 34,5 ms/GiB (ALU và DRAM đều gần giới hạn),
+  64 vòng 66,5 ms/GiB (ALU là giới hạn, DRAM rảnh).
+- **Duty giữ nguyên** của bộ quét (0,25): sau C16 CPU kiểm hiếm khi là giới hạn, nên không nối duty với `VERIFIER_BOUND`.
+- **Checkpoint CPU:** ở ranh giới sau một compute pass, CPU đọc 16 MiB trạng thái đã trộn và so với cách tính trộn
+  của chính nó: chứng minh GPU tính đúng, không chỉ "đi rồi về khớp".
+- **Lỗi và ô:** GPU đếm sai là FAIL phase `compute-sweep` (nghi `GPU|VRAM`); checkpoint sai là
+  `compute-sweep-checkpoint` (nghi `PCIe-GPU|GPU|VRAM`). Lỗi cài sẵn: `ComputeSweepSkip` (một khối không được tiến),
+  `ComputeSweepState` (một word đổi lúc nằm chờ), `ComputeSweepKey` (lùi bằng khóa khác), `ComputeSweepCheckpoint`;
+  gate H6 thấy đúng 1 lỗi với đúng phase cho mỗi loại.
+- **Báo riêng:** `sweep.compute_device_verified_bytes`, `sweep.device_verified_compute_ops`,
+  `sweep.compute_checkpoint_cpu_verified_bytes`, `detection.coverage.device_verified_compute_ops(_per_second)`, dòng
+  `DRAM SWEEP … compute … Gop/s device-verified`; không bao giờ cộng vào phần CPU đã kiểm.
+
+Máy dev (GTX 960), cấu hình như COMBINED (`--vram-max --vram-sweep --compute-mix all`, 30 s): PASS; CPU đã kiểm u32
+55,6 + FP32 55,1 + chuỗi 86,0 G/s; GPU tự kiểm 3,8 GiB/s quét và 98,2 G phép tính/s compute sweep; CPU checkpoint
+224 MiB, trong đó 176 MiB trạng thái đã trộn.
 
 ### C11 — Cân bằng tải trong pha chạy chồng (`parked`, 2026-10-16)
 
@@ -1063,7 +1089,8 @@ khi CPU so còn dư hơn 20 lần (xem C16).
 11. C15: C15a (lỗi cấp phát là INVALID) → C15b (đọc cảm biến) → C15c (rerun CPU-RAM).
 12. C16: C16a (vì sao hàng đợi đầy) → C16b (hồi phục) → C16c (batch lớn hơn) → C16d (nhãn), rồi phiên thực địa trên
     ProArt X870E, TUF và một máy RTX PRO 6000 hoặc 4090.
-13. C9 (M khả nghịch mod 2; đo C9d trên máy RTX PRO 6000 hoặc 4090) → C10.
+13. C9 (`done`, v1.2.038–039) → C10 (`done`, v1.2.040). Còn lại: phiên thực địa (C9d, C10d) trên máy RTX PRO 6000
+    hoặc 4090, ProArt X870E và TUF, cùng các phép đo C15/C16 chưa làm được trên máy dev.
 
 Mỗi bước kết thúc bằng: `make test`, đo trên host, kiểm QEMU nếu đụng tới image, và cập nhật bảng
 hạng mục ở trên.

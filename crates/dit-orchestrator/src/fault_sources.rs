@@ -348,6 +348,21 @@ pub fn gpu_phase(phase: &str, gpu: u8) -> (Attribution, &'static str) {
             ]),
             "gpu/compute_round_trip",
         ),
+        // v1.2 C10: mixed, left at rest and unmixed on the GPU, compared there: the ALU or
+        // the VRAM, nothing crossed the link.
+        "compute-sweep" => (
+            Attribution::Unresolved(vec![Component::Gpu(gpu), Component::Vram(gpu)]),
+            "gpu/device_local_compute",
+        ),
+        // The mixed state, read back over the link and checked against the CPU's own mix.
+        "compute-sweep-checkpoint" => (
+            Attribution::Unresolved(vec![
+                Component::PcieGpu(gpu),
+                Component::Gpu(gpu),
+                Component::Vram(gpu),
+            ]),
+            "gpu/compute_sweep_checkpoint",
+        ),
         // Written, verified and re-read entirely on the GPU: nothing crossed the link.
         "vram-sweep" | "vram-self-check" => (
             Attribution::Confirmed(Component::Vram(gpu)),
@@ -1507,6 +1522,19 @@ mod tests {
         assert_eq!(
             gpu_phase("retention", 1).0,
             Attribution::Unresolved(vec![Component::PcieGpu(1), Component::Vram(1)])
+        );
+        // v1.2 C10 compute sweep: on the device only, then over the link.
+        assert_eq!(
+            gpu_phase("compute-sweep", 1).0,
+            Attribution::Unresolved(vec![Component::Gpu(1), Component::Vram(1)])
+        );
+        assert_eq!(
+            gpu_phase("compute-sweep-checkpoint", 1).0,
+            Attribution::Unresolved(vec![
+                Component::PcieGpu(1),
+                Component::Gpu(1),
+                Component::Vram(1)
+            ])
         );
         assert_eq!(
             gpu_hardware_reason("NVIDIA Xid 48", 1),

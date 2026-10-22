@@ -963,7 +963,15 @@ impl Pipeline {
     }
 
     pub(crate) fn inject_lane_fault(&mut self, fault: LaneFault) -> Result<()> {
-        if matches!(fault, LaneFault::SweepVerify | LaneFault::SweepCheckpoint) {
+        if matches!(
+            fault,
+            LaneFault::SweepVerify
+                | LaneFault::SweepCheckpoint
+                | LaneFault::ComputeSweepSkip
+                | LaneFault::ComputeSweepState
+                | LaneFault::ComputeSweepKey
+                | LaneFault::ComputeSweepCheckpoint
+        ) {
             if !self.config.sweep.enabled {
                 return Err(Error::Request("the GPU-DRAM sweep is off"));
             }

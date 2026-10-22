@@ -88,6 +88,11 @@ tự kiểm. Nguồn: [sweep.rs (engine)](../../crates/gpu-engine/src/sweep.rs),
   `vram-sweep`. Cứ ~2 s, ở ranh giới giữa hai pass, 16 MiB (xoay vòng qua cả vùng) được đọc về qua PCIe và CPU
   so với pattern sinh lại trên host. Sai là FAIL phase `vram-sweep-checkpoint`: bộ tự kiểm của GPU không còn
   đáng tin.
+- **Compute pass (v1.2.040, C10):** cứ một pass thường thì một pass tính: ghi pattern, kernel
+  `dit_vram_sweep_forward` trộn khả nghịch R vòng (mặc định 32, `--vram-sweep-mix-rounds`) từng khối 16 byte tại chỗ,
+  dữ liệu nằm chờ trong VRAM, rồi `dit_vram_sweep_unmix_verify` gỡ trộn trong thanh ghi và đếm word sai (FAIL phase
+  `compute-sweep`). Checkpoint sau một pass tính so trạng thái đã trộn với cách CPU tự trộn pattern (FAIL phase
+  `compute-sweep-checkpoint`). Phép tính của pass tính là **device-verified**, báo riêng (`device_verified_compute_ops`).
 - **Chia vùng với lane:** mỗi allocation chia hai nửa. Lane DMA (CPU-verified) làm một nửa, bộ quét làm nửa
   kia, và **đổi nửa** khi cả hai đã phủ xong nửa của mình (tối thiểu 10 s một lần). Trước khi đổi, lane đọc
   lại mọi vùng còn chờ kiểm retention. Nhờ vậy cả CPU-verified lẫn device-verified đều phủ 100% pool.

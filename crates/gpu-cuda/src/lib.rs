@@ -38,7 +38,7 @@ pub use memory::{LiveResources, live_resources};
 pub use sweep::{SweepConfig, SweepReport};
 pub use workers::Fairness;
 
-pub const KERNEL_SHA256: &str = "615d07fe09cc0425c2e083a975540517ef90d8d2d9b41fcf0b279f7bed1e9629";
+pub const KERNEL_SHA256: &str = "94615b8bb629c440c41800db00957271908a55123482ecac076798460858fd83";
 const PTX: &[u8] = include_bytes!("../kernels/gemm.ptx");
 /// INT8 tensor-core GEMM (`kernels/tensor.cu`), built for `compute_80`: loaded only on devices of
 /// compute capability 8.0 or newer.
@@ -138,6 +138,9 @@ pub struct CudaBackend {
     /// GPU-DRAM sweep kernels (16-byte accesses).
     sweep_fill_function: Handle,
     sweep_verify_function: Handle,
+    /// v1.2 C10: the compute passes of the sweep (mix in place, unmix and compare).
+    sweep_forward_function: Handle,
+    sweep_unmix_verify_function: Handle,
     /// Boundary-check kernels (step F3): hash of a word array, the GPU's check of its own output
     /// and the seal of that check.
     hash_function: Handle,
@@ -335,6 +338,8 @@ impl CudaBackend {
             verify_function: ptr::null_mut(),
             sweep_fill_function: ptr::null_mut(),
             sweep_verify_function: ptr::null_mut(),
+            sweep_forward_function: ptr::null_mut(),
+            sweep_unmix_verify_function: ptr::null_mut(),
             hash_function: ptr::null_mut(),
             check_function: ptr::null_mut(),
             seal_function: ptr::null_mut(),
@@ -423,6 +428,14 @@ impl CudaBackend {
             (
                 &raw mut self.sweep_verify_function,
                 c"dit_vram_sweep_verify",
+            ),
+            (
+                &raw mut self.sweep_forward_function,
+                c"dit_vram_sweep_forward",
+            ),
+            (
+                &raw mut self.sweep_unmix_verify_function,
+                c"dit_vram_sweep_unmix_verify",
             ),
             (&raw mut self.hash_function, c"dit_hash_words"),
             (&raw mut self.check_function, c"dit_check_output"),
