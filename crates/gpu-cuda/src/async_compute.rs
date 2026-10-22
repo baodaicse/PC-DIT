@@ -53,8 +53,14 @@ pub struct AsyncConfig {
     pub workers: usize,
     /// CPU-budget ceiling for verifier workers (equal to `workers` disables scaling).
     pub workers_max: usize,
-    /// Largest burst; the scheduler may ask for shorter ones.
+    /// Burst in batches when nothing else decides it, and the largest the scheduler may ask for
+    /// (it may ask for shorter ones).
     pub batches: u64,
+    /// v1.2 C16c: without a scheduler request, a burst grows to about this many milliseconds of
+    /// measured batch time (at least `batches`, at most one corpus rotation): long enough for
+    /// the load controller to see whole windows and for the drain at its end to matter little.
+    /// 0: every burst is `batches`.
+    pub burst_target_ms: u64,
     /// Pressure when `MemAvailable` falls below this (0 disables the check).
     pub min_available_bytes: u64,
     /// Failed batches whose host slot is held, at most, so evidence survives for confirmation.
@@ -102,6 +108,7 @@ impl Default for AsyncConfig {
             workers: 2,
             workers_max: 4,
             batches: 32,
+            burst_target_ms: 250,
             min_available_bytes: 256 * 1024 * 1024,
             quarantine_slots: 1,
             quarantine_max_age_ms: 30_000,
@@ -128,6 +135,7 @@ impl AsyncConfig {
             || !(1..=self.host_slots).contains(&self.workers)
             || self.quarantine_slots >= self.host_slots
             || !(1..=1024).contains(&self.batches)
+            || self.burst_target_ms > 10_000
             || !(1..=3_600_000).contains(&self.quarantine_max_age_ms)
             || self.rotate_every_batches > 1_000_000
             || self.corpus_threads > 16
@@ -495,6 +503,8 @@ pub(crate) struct Pipeline {
     staged: Option<Arc<Corpus>>,
     /// Uploads that found their corpus already in `upload` (C13 G3).
     staged_installs: u64,
+    /// Smoothed wall time per batch of past bursts, milliseconds (C16c); 0 before the first.
+    batch_wall_ms: f64,
     /// The periodic host-corpus check running on a helper thread (C13 G3).
     integrity_job: Option<thread::JoinHandle<IntegrityOutcome>>,
     /// Shape of the corpus in use (it changes only at a rotation, between bursts).
@@ -827,6 +837,7 @@ impl Pipeline {
             staging: None,
             staged: None,
             staged_installs: 0,
+            batch_wall_ms: 0.0,
             integrity_job: None,
             jobs,
             inner,
@@ -1015,6 +1026,26 @@ impl Pipeline {
             });
     }
 
+    /// v1.2 C16c: the burst when nothing asks for one: about `burst_target_ms` of the measured
+    /// batch time, between `batches` and one corpus rotation (256 batches without rotation).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn burst_batches(&self) -> u64 {
+        let floor = self.config.batches.max(1);
+        if self.config.burst_target_ms == 0 || self.batch_wall_ms <= 0.0 {
+            return floor;
+        }
+        let rotation = match self.config.rotate_every_batches {
+            0 => 256,
+            every => every,
+        };
+        let wanted = (self.config.burst_target_ms as f64 / self.batch_wall_ms).round() as u64;
+        wanted.clamp(floor, rotation.max(floor))
+    }
+
     /// Builds a corpus of the shape in use here, waiting for it (no prefetch to take).
     fn build_now(&self, arith: Arith, seed: u64) -> Result<Arc<Corpus>> {
         Corpus::new_arith(arith, seed, self.jobs, self.inner, self.config.threads())
@@ -1047,7 +1078,7 @@ impl Pipeline {
         if self.external || every == 0 {
             return;
         }
-        let near = self.batches_on_corpus + 2 * self.config.batches >= every;
+        let near = self.batches_on_corpus + 2 * self.burst_batches() >= every;
         let next = if let Some(prefetch) = self.prefetch.as_mut().filter(|p| p.is_built()) {
             prefetch.built().cloned()
         } else if self.config.corpus_pool > 0 && near {
@@ -1743,11 +1774,10 @@ impl Pipeline {
             start_generation
         } else {
             start_generation
-                .checked_add(
-                    batches
-                        .unwrap_or(self.config.batches)
-                        .clamp(1, self.config.batches),
-                )
+                .checked_add(batches.map_or_else(
+                    || self.burst_batches(),
+                    |asked| asked.clamp(1, self.config.batches),
+                ))
                 .ok_or(Error::Request("batch identity overflow"))?
         };
         let lane_deadline = lane_slice.map(|d| Instant::now() + d);
@@ -2417,6 +2447,17 @@ impl Pipeline {
             failure = failure.map(|e| format!("{e} {tag}"));
         }
         self.cumulative.add_burst(burst.clone());
+        // C16c: the batch time the next burst is sized by (a burst too short to say little is
+        // not counted).
+        if burst.totals.submitted >= 8 {
+            #[allow(clippy::cast_precision_loss)]
+            let per_batch = burst_wall * 1000.0 / burst.totals.submitted as f64;
+            self.batch_wall_ms = if self.batch_wall_ms > 0.0 {
+                0.7 * self.batch_wall_ms + 0.3 * per_batch
+            } else {
+                per_batch
+            };
+        }
         self.shape.window.observe(regime);
         let cells = burst.totals.verified * (corpus.jobs * corpus.n * corpus.n) as u64;
         // Each cell is 2K operations, K of this burst's corpus (the adaptive shape changes K).

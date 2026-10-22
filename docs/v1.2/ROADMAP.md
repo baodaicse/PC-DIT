@@ -942,6 +942,21 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   kernel mỗi batch dài hơn hẳn phần thời gian cố định. Output và công so tăng cùng tỉ lệ với phép tính, nên tỉ lệ
   phép tính trên mỗi word CPU so không đổi; corpus và oracle lớn theo số job, vẫn chia cho 256 lần tính lại; kho
   corpus tính vào ngân sách RAM như G2. Độ dài kernel mục tiêu đo rồi chốt.
+  **Đo lại trước khi làm (2026-10-22):** số job mỗi batch không phải chỗ cần sửa. Với batch rất ngắn trên GTX 960
+  (K 256, 16 job, kernel 0,14 ms), pipeline vẫn chạy 4190 batch/s, nên luồng điều phối không phải giới hạn. Thứ còn
+  lại là độ dài burst: burst cố định 32 batch chỉ kéo dài 8–16 ms trên GPU nhanh, ngắn hơn cửa sổ quyết định 50 ms
+  (mà cửa sổ còn reset mỗi burst). Bộ điều khiển vì vậy không lên được 3 batch, và cuối mỗi burst pipeline xả sạch.
+  Batch lớn hơn thì corpus và kho corpus phải lớn theo số job, vượt ngân sách RAM 2 GiB của mỗi GPU. Burst dài hơn
+  thì không tốn gì.
+  **Đã làm (v1.2.037):** khi bộ lập lịch không yêu cầu độ dài, burst kéo dài khoảng `--async-burst-ms` (mặc định 250)
+  theo thời gian mỗi batch đo được ở các burst trước, trong khoảng [`--async-batches` (32), một lượt đổi corpus (256)].
+  GPU chậm giữ 32; GPU nhanh lên tới 256. Máy dev, GPU riêng, 20 s:
+
+  | | Burst cố định 32 | Burst theo thời gian |
+  |---|---|---|
+  | K 256, 64 job (batch 0,54 ms) | 1626 batch/s, bận 89,2 %, 2 batch trên GPU, sau vòng lặp 2,7 % | 1697 batch/s (+4 %), bận 97,3 %, 3 batch, sau vòng lặp 0,4 % |
+  | K 4096, 128 job (batch 25 ms) | 51 batch/s, bận 98,0 % | 53 batch/s, bận 97,9 % (không đổi) |
+
 - **C16d — nhãn bottleneck đúng.** Bộ điều khiển giữ tải trong khi hàng đợi rỗng thì ghi một nhãn riêng (bộ điều khiển
   đang giữ), không ghi `VERIFIER_BOUND`.
 

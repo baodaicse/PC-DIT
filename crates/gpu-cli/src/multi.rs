@@ -370,6 +370,7 @@ fn run_multi(
                 args.async_workers_max.map(|n| n as u64),
             ),
             ("--async-batches", args.async_batches),
+            ("--async-burst-ms", args.async_burst_ms),
             ("--corpus-threads", args.corpus_threads.map(|n| n as u64)),
             ("--corpus-pool", args.corpus_pool.map(|n| n as u64)),
             (
@@ -1359,6 +1360,7 @@ mod tests {
             bottleneck_log: None,
             lane: crate::LaneArgs::default(),
             async_batches: None,
+            async_burst_ms: None,
             corpus_threads: None,
             corpus_pool: None,
             quarantine_slots: None,
@@ -1429,6 +1431,7 @@ mod tests {
             bottleneck_log: None,
             lane: crate::LaneArgs::default(),
             async_batches: None,
+            async_burst_ms: None,
             corpus_threads: None,
             corpus_pool: None,
             quarantine_slots: None,

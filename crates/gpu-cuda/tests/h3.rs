@@ -127,6 +127,8 @@ fn h3_slots_wrap_around_many_times_without_reuse_before_completion() {
             host_slots: 3,
             quarantine_slots: 1,
             batches: 32,
+            // Fixed bursts: the gate counts batches (v1.2 C16c would time them).
+            burst_target_ms: 0,
             ..requested()
         })
         .unwrap();

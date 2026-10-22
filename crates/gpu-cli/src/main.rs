@@ -405,9 +405,14 @@ struct RunArgs {
     /// the CPU share). `--async-workers` alone fixes the count.
     #[arg(long)]
     async_workers_max: Option<usize>,
-    /// Async only: largest compute burst in batches (default 32).
+    /// Async only: compute burst in batches when the burst is not timed, and the shortest timed
+    /// one (default 32).
     #[arg(long)]
     async_batches: Option<u64>,
+    /// Async only: a compute burst lasts about this many milliseconds of measured batch time, up
+    /// to one corpus rotation (default 250; 0: every burst is `--async-batches`).
+    #[arg(long)]
+    async_burst_ms: Option<u64>,
     /// Async only: minimum fraction (0..=0.9) of run time given to transfer/retention
     /// verification. The scheduler shortens compute bursts (and adds transfer pairs) to hold it.
     /// Giving this also opts out of the default overlapped lane (H6), since the two schedule
@@ -2049,6 +2054,7 @@ fn pipeline_for_device(args: &RunArgs, device: Option<&VulkanDeviceInfo>) -> Run
         resolved.async_workers = None;
         resolved.async_workers_max = None;
         resolved.async_batches = None;
+        resolved.async_burst_ms = None;
         resolved.coverage_floor = None;
         resolved.corpus_threads = None;
         resolved.corpus_pool = None;
@@ -2100,6 +2106,9 @@ fn async_config(args: &RunArgs) -> gpu_cuda::AsyncConfig {
     }
     if let Some(n) = args.async_host_slots {
         config.host_slots = n;
+    }
+    if let Some(ms) = args.async_burst_ms {
+        config.burst_target_ms = ms;
     }
     if let Some(n) = args.async_batches {
         config.batches = n;
@@ -2227,6 +2236,7 @@ fn validate_args(args: &RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         || args.async_host_slots.is_some()
         || args.async_workers.is_some()
         || args.async_batches.is_some()
+        || args.async_burst_ms.is_some()
         || args.corpus_threads.is_some()
         || args.corpus_pool.is_some()
         || args.async_workers_max.is_some()
@@ -4035,7 +4045,9 @@ mod tests {
         ]));
         assert!(reject(&["--async-compute", "--async-device-slots", "1"]));
         assert!(reject(&["--async-compute", "--async-host-slots", "65"]));
-        assert!(reject(&["--async-compute", "--quarantine-slots", "8"]));
+        // Quarantine may never hold every host slot (16 by default since v1.2 C16b).
+        assert!(reject(&["--async-compute", "--quarantine-slots", "16"]));
+        assert!(!reject(&["--async-compute", "--quarantine-slots", "8"]));
         assert!(reject(&["--async-compute", "--async-batches", "0"]));
         assert!(reject(&["--async-compute", "--async-workers", "0"]));
     }
@@ -4311,6 +4323,7 @@ mod tests {
             bottleneck_log: None,
             lane: LaneArgs::default(),
             async_batches: None,
+            async_burst_ms: None,
             corpus_threads: None,
             corpus_pool: None,
             quarantine_slots: None,
@@ -4378,6 +4391,7 @@ mod tests {
             bottleneck_log: None,
             lane: LaneArgs::default(),
             async_batches: None,
+            async_burst_ms: None,
             corpus_threads: None,
             corpus_pool: None,
             quarantine_slots: None,
@@ -4447,6 +4461,7 @@ mod tests {
             bottleneck_log: None,
             lane: LaneArgs::default(),
             async_batches: None,
+            async_burst_ms: None,
             corpus_threads: None,
             corpus_pool: None,
             quarantine_slots: None,
@@ -4665,6 +4680,7 @@ mod tests {
             bottleneck_log: None,
             lane: LaneArgs::default(),
             async_batches: None,
+            async_burst_ms: None,
             corpus_threads: None,
             corpus_pool: None,
             quarantine_slots: None,
