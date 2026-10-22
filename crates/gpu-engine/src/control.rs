@@ -14,6 +14,15 @@ use std::collections::VecDeque;
 
 const MAX_DECISIONS: usize = 64;
 const MAX_PACING_MS: u64 = 2_000;
+/// v1.2 C16b: a full host queue that is still full after this long is an overload, handled as
+/// a throttle (one batch at a time, then step by step). One that drains sooner was a burst:
+/// submissions resume where they were.
+const PAUSE_LIMIT_MS: u64 = 500;
+/// A pause is a burst unless it is the `PAUSE_OVERLOAD_COUNT`-th within this long: queue-full
+/// pauses that frequent mean the verifiers are at their limit, and the load is stepped down one
+/// notch (the usual lever: one batch fewer, pacing toward the verdict rate).
+const PAUSE_WINDOW_MS: u64 = 1_000;
+const PAUSE_OVERLOAD_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -134,6 +143,9 @@ pub struct LoadController {
     pub pacing_ms: u64,
     pub throttle_events: u64,
     pub recovery_events: u64,
+    /// v1.2 C16b: the host queue filled and drained again within `PAUSE_LIMIT_MS`: submissions
+    /// paused, then resumed at the same limit and pacing (not a throttle).
+    pub pause_events: u64,
     pub state_changes: u64,
     /// Milliseconds spent in each state, indexed like [`ControlState`].
     pub dwell_ms: [u64; 6],
@@ -175,6 +187,18 @@ pub struct LoadController {
     /// Smoothed spacing of actual submissions: tells whether pacing is what limits the rate.
     #[serde(skip)]
     submit_gap_ms: f64,
+    /// A full host queue paused submissions: what to return to once it drains.
+    #[serde(skip)]
+    pause: Option<Pause>,
+    /// When the recent pauses began, within `PAUSE_WINDOW_MS`.
+    #[serde(skip)]
+    recent_pauses: VecDeque<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Pause {
+    from: ControlState,
+    since_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -209,6 +233,7 @@ impl LoadController {
             pacing_ms: 0,
             throttle_events: 0,
             recovery_events: 0,
+            pause_events: 0,
             state_changes: 0,
             dwell_ms: [0; 6],
             decisions: VecDeque::new(),
@@ -230,6 +255,8 @@ impl LoadController {
             ticks_total: 0,
             last_recover_tick: None,
             submit_gap_ms: 0.0,
+            pause: None,
+            recent_pauses: VecDeque::new(),
         }
     }
 
@@ -354,6 +381,50 @@ impl LoadController {
     }
 
     /// A throttle or hard cap soon after a recovery step means the step was premature.
+    /// The queue drained below `resume` after a pause. A lone pause was a burst: submissions
+    /// resume at the same limit and pacing. The `PAUSE_OVERLOAD_COUNT`-th within
+    /// `PAUSE_WINDOW_MS` steps the load down one notch instead.
+    fn end_pause(&mut self, s: &Sample, pause: Pause, fill: f64) {
+        while self
+            .recent_pauses
+            .front()
+            .is_some_and(|t| pause.since_ms.saturating_sub(*t) > PAUSE_WINDOW_MS)
+        {
+            self.recent_pauses.pop_front();
+        }
+        self.recent_pauses.push_back(pause.since_ms);
+        if self.recent_pauses.len() < PAUSE_OVERLOAD_COUNT {
+            self.pause_events += 1;
+            self.transition(s.now_ms, pause.from, "resumed", fill, false, 0.0);
+            return;
+        }
+        self.recent_pauses.clear();
+        let rate = self.verdicts_per_second;
+        if !self.step_down() && pause.from != ControlState::Throttled {
+            // Nothing left to step down (one batch, pacing at its target): resume as it was.
+            self.pause_events += 1;
+            self.transition(s.now_ms, pause.from, "resumed", fill, false, rate);
+            return;
+        }
+        self.transition(
+            s.now_ms,
+            ControlState::Throttled,
+            "queue_full_overload",
+            fill,
+            false,
+            rate,
+        );
+    }
+
+    /// A drain that counts as a throttle episode: the restart is one batch at a time.
+    fn begin_throttle_drain(&mut self) {
+        self.throttle_events += 1;
+        self.episode_active = true;
+        self.calm_ticks = 0;
+        self.note_if_premature();
+        self.in_flight_limit = 1;
+    }
+
     fn note_if_premature(&mut self) {
         if self
             .last_recover_tick
@@ -368,9 +439,19 @@ impl LoadController {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn reduce_load(&mut self, now_ms: u64, reason: &'static str, fill: f64, rising: bool) {
         let rate = self.verdicts_per_second;
+        if self.state == ControlState::Throttled && !self.step_changes() {
+            return;
+        }
+        self.step_down();
+        self.transition(now_ms, ControlState::Throttled, reason, fill, rising, rate);
+    }
+
+    /// The next load-reducing step: one batch fewer on the GPU, and the pacing toward the
+    /// measured verdict rate by at most 25 %.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn next_step(&self) -> (usize, u64) {
         let target = self.pacing_target().unwrap_or(self.pacing_ms);
         let new_limit = self.in_flight_limit.saturating_sub(1).max(1);
-        // Pacing moves toward the target by at most 25% per step.
         let new_pacing = if self.pacing_ms == 0 {
             target
         } else {
@@ -378,18 +459,30 @@ impl LoadController {
             let hi = self.pacing_ms + (self.pacing_ms / 4).max(1);
             target.clamp(lo, hi)
         };
-        let pacing_moves = new_pacing.abs_diff(self.pacing_ms) * 10 > self.pacing_ms.max(1);
-        let changes = new_limit != self.in_flight_limit || pacing_moves;
-        if self.state == ControlState::Throttled && !changes {
-            return;
+        (new_limit, new_pacing)
+    }
+
+    /// Whether the next step changes anything: the in-flight limit, or the pacing by more than
+    /// a tenth.
+    fn step_changes(&self) -> bool {
+        let (new_limit, new_pacing) = self.next_step();
+        new_limit != self.in_flight_limit
+            || new_pacing.abs_diff(self.pacing_ms) * 10 > self.pacing_ms.max(1)
+    }
+
+    /// Takes the next step and counts a throttle episode. False when it would change nothing.
+    fn step_down(&mut self) -> bool {
+        if !self.step_changes() {
+            return false;
         }
+        let (new_limit, new_pacing) = self.next_step();
         self.throttle_events += 1;
         self.note_if_premature();
         self.episode_active = true;
         self.calm_ticks = 0;
         self.in_flight_limit = new_limit;
         self.pacing_ms = new_pacing;
-        self.transition(now_ms, ControlState::Throttled, reason, fill, rising, rate);
+        true
     }
 
     fn stop(&mut self, now_ms: u64, reason: &'static str, fill: f64) {
@@ -437,18 +530,54 @@ impl LoadController {
         }
         let hard =
             fill >= self.config.hard || (s.host_used >= self.config.host_slots && fill >= 0.5);
-        if (s.pressure || hard) && self.state != ControlState::Draining {
-            self.throttle_events += 1;
-            self.episode_active = true;
-            self.calm_ticks = 0;
-            self.note_if_premature();
-            self.in_flight_limit = 1;
-            let reason = if s.pressure {
-                "host_memory_pressure"
-            } else {
-                "queue_hard_cap"
-            };
-            self.transition(s.now_ms, ControlState::Draining, reason, fill, false, 0.0);
+        if s.pressure && (self.state != ControlState::Draining || self.pause.is_some()) {
+            // Host memory pressure drains and restarts one batch at a time, a pause included.
+            self.pause = None;
+            self.begin_throttle_drain();
+            self.transition(
+                s.now_ms,
+                ControlState::Draining,
+                "host_memory_pressure",
+                fill,
+                false,
+                0.0,
+            );
+        } else if hard && self.state != ControlState::Draining {
+            // v1.2 C16b: a full queue stops submissions at once, as before, but only as a pause:
+            // the limit and pacing stay unless pauses this frequent show an overload.
+            self.pause = Some(Pause {
+                from: self.state,
+                since_ms: s.now_ms,
+            });
+            self.transition(
+                s.now_ms,
+                ControlState::Draining,
+                "queue_hard_cap",
+                fill,
+                false,
+                0.0,
+            );
+        }
+        if let Some(pause) = self.pause
+            && self.state == ControlState::Draining
+        {
+            if fill < self.config.resume {
+                self.pause = None;
+                self.end_pause(s, pause, fill);
+            } else if s.now_ms.saturating_sub(pause.since_ms) >= PAUSE_LIMIT_MS {
+                // Still full: the verifiers are behind. From here on it is the throttle it was
+                // before v1.2 C16b (one batch at a time once drained, then step by step).
+                self.pause = None;
+                self.begin_throttle_drain();
+                self.transition(
+                    s.now_ms,
+                    ControlState::Draining,
+                    "queue_hard_cap",
+                    fill,
+                    false,
+                    0.0,
+                );
+            }
         }
         // Accumulate the window and act once per closed window.
         if self.window.count == 0 && self.window.start_ms == 0 && s.now_ms > 0 {
@@ -530,7 +659,7 @@ impl LoadController {
                 }
             }
             ControlState::Draining => {
-                if !s.pressure && mean < cfg.resume && progressing {
+                if self.pause.is_none() && !s.pressure && mean < cfg.resume && progressing {
                     // Leave the full stop gently: one batch at a time, paced.
                     self.in_flight_limit = 1;
                     if let Some(target) = self.pacing_target() {
@@ -781,7 +910,10 @@ mod tests {
     fn verifier_bound_trace_throttles_settles_and_never_hits_the_hard_cap() {
         // The GPU could deliver a batch every 10 ms; one worker verifies one per 30 ms.
         let mut sim = Sim::new(10, 30, 1);
-        sim.run(30_000);
+        sim.run(15_000);
+        // v1.2 C16b: the first full queues pause; the third within a second steps the load down.
+        let converging = sim.cap_events;
+        sim.run(15_000);
         let c = &sim.controller;
         assert!(c.throttle_events >= 1);
         assert!(sim.max_backlog <= 8, "the queue is never overrun");
@@ -802,7 +934,8 @@ mod tests {
         );
         // The verifier still ran flat out: no output was dropped or skipped.
         assert!(sim.verdicts >= 30_000 / 30 - 3);
-        assert!(sim.cap_events <= 1);
+        assert!(converging <= 3, "{converging} full queues while converging");
+        assert_eq!(sim.cap_events, converging, "never again once settled");
     }
 
     #[test]
@@ -825,31 +958,103 @@ mod tests {
         assert_eq!((c.in_flight_limit, c.pacing_ms), (3, 0));
     }
 
-    #[test]
-    fn hard_cap_acts_on_the_sample_without_waiting_for_a_window() {
+    /// A balanced controller at full overlap, with batches submitted every 5 ms.
+    fn balanced() -> (LoadController, u64, u64) {
         let mut c = LoadController::new(config());
-        c.begin_burst(10);
-        assert!(c.observe(&sample(11, 1, 1, 0)).is_none());
-        let d = c.observe(&sample(12, 8, 0, 0)).expect("immediate");
+        c.begin_burst(0);
+        let (mut t, mut submits) = (0, 0);
+        while t < 2_000 {
+            t += 5;
+            submits += 1;
+            c.observe(&Sample {
+                submits,
+                verdicts: submits.saturating_sub(3),
+                ..sample(t, 1, 2, 0)
+            });
+        }
+        assert_eq!((c.state, c.in_flight_limit), (ControlState::Balanced, 3));
+        (c, t, submits)
+    }
+
+    fn queue(t: u64, backlog: usize, verdicts: u64, submits: u64) -> Sample {
+        Sample {
+            submits,
+            verdicts,
+            host_used: if backlog >= 7 { 8 } else { backlog + 1 },
+            ..sample(t, backlog, 1, 0)
+        }
+    }
+
+    #[test]
+    fn a_full_queue_pauses_at_once_and_a_burst_resumes_where_it_was() {
+        let (mut c, t, submits) = balanced();
+        let v = submits - 3;
+        let d = c.observe(&queue(t + 1, 7, v, submits)).expect("immediate");
         assert_eq!((d.to, d.reason), (ControlState::Draining, "queue_hard_cap"));
-        assert!(!c.permits(0, 13));
-        // Leaves the full stop only once the backlog is below the resume level for a window.
-        let mut t = 12;
-        for backlog in [7, 6, 5, 4, 4] {
-            t += 60;
-            c.observe(&sample(t, backlog, 0, (8 - backlog as u64) * 3));
-        }
-        assert_eq!(
-            c.state,
-            ControlState::Draining,
-            "still above the resume fraction"
+        assert!(
+            !c.permits(0, t + 2),
+            "no submission while the queue is full"
         );
-        for _ in 0..3 {
-            t += 60;
-            c.observe(&sample(t, 1, 0, 40 + t));
+        // The verifiers clear six batches in 3 ms: far faster than one every 5 ms arrived.
+        let d = c
+            .observe(&queue(t + 4, 1, v + 6, submits))
+            .expect("resumed");
+        assert_eq!((d.to, d.reason), (ControlState::Balanced, "resumed"));
+        assert_eq!((c.in_flight_limit, c.pacing_ms), (3, 0));
+        assert_eq!((c.pause_events, c.throttle_events), (1, 0));
+    }
+
+    #[test]
+    fn a_third_full_queue_within_a_second_steps_the_load_down() {
+        let (mut c, mut t, submits) = balanced();
+        let mut v = submits - 3;
+        for pause in 0..3 {
+            c.observe(&queue(t + 1, 7, v, submits));
+            v += 6;
+            let d = c.observe(&queue(t + 4, 1, v, submits)).expect("pause ends");
+            if pause < 2 {
+                assert_eq!((d.to, d.reason), (ControlState::Balanced, "resumed"));
+            } else {
+                assert_eq!(
+                    (d.to, d.reason),
+                    (ControlState::Throttled, "queue_full_overload")
+                );
+            }
+            t += 300;
         }
-        assert_eq!(c.state, ControlState::Throttled);
-        assert_eq!(c.reason, "recovering");
+        assert_eq!(c.in_flight_limit, 2, "one notch: one batch fewer");
+        assert_eq!((c.pause_events, c.throttle_events), (2, 1));
+        // Pauses a second or more apart stay pauses.
+        let (mut c, mut t, submits) = balanced();
+        let mut v = submits - 3;
+        for _ in 0..5 {
+            c.observe(&queue(t + 1, 7, v, submits));
+            v += 6;
+            c.observe(&queue(t + 4, 1, v, submits));
+            t += 1_100;
+        }
+        assert_eq!((c.state, c.in_flight_limit), (ControlState::Balanced, 3));
+        assert_eq!((c.pause_events, c.throttle_events), (5, 0));
+    }
+
+    #[test]
+    fn a_queue_still_full_after_the_pause_limit_restarts_one_batch_at_a_time() {
+        let (mut c, mut t, submits) = balanced();
+        let v = submits - 3;
+        c.observe(&queue(t + 1, 7, v, submits));
+        for _ in 0..12 {
+            t += 50;
+            c.observe(&queue(t, 7, v, submits));
+        }
+        assert_eq!(c.state, ControlState::Draining);
+        assert_eq!(c.in_flight_limit, 1);
+        assert_eq!(c.throttle_events, 1);
+        // Leaves the full stop only once the backlog is below the resume level for a window.
+        for n in 0..4 {
+            t += 60;
+            c.observe(&queue(t, 1, v + 7 + n, submits));
+        }
+        assert_eq!((c.state, c.reason), (ControlState::Throttled, "recovering"));
         assert_eq!(c.in_flight_limit, 1, "restarts one batch at a time");
     }
 
@@ -984,8 +1189,9 @@ mod tests {
         let mut sim = Sim::new(4, 10, 1);
         sim.run(60_000);
         let c = &sim.controller;
+        // v1.2 C16b: up to three full queues while it converges (two pauses, then a step down).
         assert!(
-            sim.cap_events <= 2,
+            sim.cap_events <= 3,
             "{} hard-cap events in 60 s",
             sim.cap_events
         );

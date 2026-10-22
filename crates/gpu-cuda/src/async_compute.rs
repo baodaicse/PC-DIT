@@ -96,7 +96,9 @@ impl Default for AsyncConfig {
     fn default() -> Self {
         Self {
             device_slots: 3,
-            host_slots: 8,
+            // v1.2 C16b: a waiting room of 9 beyond the 3 on the GPU and 4 verifiers. With 8 a
+            // full queue was 1-2 waiting, a few ms of a fast GPU's output.
+            host_slots: 16,
             workers: 2,
             workers_max: 4,
             batches: 32,
@@ -2328,7 +2330,8 @@ impl Pipeline {
                 d.at_ms >= burst_start_ms
                     && matches!(
                         d.reason,
-                        "verifier_backlog" | "backlog_rising" | "queue_hard_cap"
+                        // A pause the verifiers cleared at once (v1.2 C16b) is not verifier-bound.
+                        "verifier_backlog" | "backlog_rising" | "queue_full_overload"
                     )
             });
         let regime = classify_regime(&RegimeInput {

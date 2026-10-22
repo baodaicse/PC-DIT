@@ -907,10 +907,33 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
 - **C16a — vì sao hàng đợi chạm ngưỡng cứng.** Ghi mỗi lần đầy (thời điểm, `fill`, slot đang dùng, luồng kiểm đang làm
   gì, việc nền đang chạy: dựng corpus, kiểm toàn vẹn, chép staging, CPU-RAM) vào nhật ký bottleneck, rồi đo trên máy
   dev với tải CPU như pha chạy chồng. Nghi vấn: luồng kiểm bị chậm trong chốc lát khi CPU bị chiếm hết.
+  **Đã đo (v1.2.033).** Tái hiện trên máy dev: GTX 960, K 256 (kernel 1,1 ms mỗi batch, gần tỉ lệ kiểm/kernel của RTX
+  PRO 6000 ở K 4096), CPU-RAM `nice 10` chiếm cả 16 luồng. Bộ điều khiển cũ nằm ở `THROTTLED` 95–97 % thời gian, kết
+  thúc ở 1 batch, 0 lần hồi phục xong, giống thực địa. Nguyên nhân: điều kiện cứng thứ hai "dùng hết 8 slot host và
+  `fill` ≥ 0,5" xảy ra ngay trong vận hành bình thường. 3 batch trên GPU + 4 batch đang kiểm đã gần đủ 8 slot, chỉ cần
+  2 batch chờ (phòng chờ 4 slot). Lần nào cũng chạm 17–880 ms sau khi vừa lên lại 3 batch, `backlog_fill` đúng 0,5.
+  Mỗi lần chạm đưa về 1 batch và một chuỗi hồi phục 6–11 s (`hold` nhân đôi). Luồng kiểm không phải bị chậm lâu: chỉ
+  cần một nhịp dồn vài mili giây.
 - **C16b — hồi phục tương xứng với nguyên nhân.** Một lần đầy ngắn rồi hàng đợi rỗng lại không làm `hold` leo tới 8 s;
   đi lại tới đủ số batch khi hàng đợi rỗng và kết quả kiểm vẫn về đều. Giữ các bất biến của bộ điều khiển
   ([../gpu-vram/GPU_ASYNC_BALANCED_PIPELINE_ROADMAP.md](../gpu-vram/GPU_ASYNC_BALANCED_PIPELINE_ROADMAP.md) §2):
   không bỏ kiểm, không lấy mẫu, không giảm K.
+  **Đã làm (v1.2.033).** Hàng đợi đầy vẫn dừng gửi ngay như trước, nhưng chỉ là một lần tạm dừng: giữ nguyên số batch
+  và pacing; mẫu đầu tiên hàng đợi về dưới `resume` thì chạy lại đúng mức cũ (`resumed`, đếm `pause_events`), không
+  tính là lần hạ tải, không làm `hold` tăng. Lần tạm dừng thứ ba trong 1 s nghĩa là luồng kiểm sát giới hạn: giảm một
+  nấc bằng đòn bẩy sẵn có (bớt 1 batch, pacing về tốc độ kiểm; `queue_full_overload`). Hàng đợi vẫn đầy sau 500 ms là
+  quá tải thật: xử lý như cũ (về 1 batch, hồi phục từng bước). Áp lực RAM host không đổi. Đợt tạm dừng không làm burst
+  bị gán `VERIFIER_BOUND` (chỉ `queue_full_overload` mới gán). Mô phỏng quá tải: 3 lần đầy lúc hội tụ, sau đó pacing
+  đúng bằng thời gian kiểm và luồng kiểm chạy hết sức. Đo trên máy dev, xen kẽ, mỗi bản 2 lần:
+
+  | 30 s, K 256, CPU-RAM `nice 10` cả 16 luồng | Bản cũ | C16b |
+  |---|---|---|
+  | Batch/s | 597–609 | 811–816 (+35 %) |
+  | GPU bận | 70,9 % | 88,6–89,1 % |
+  | Ở `THROTTLED` | 95–97 % | 0 % (`BALANCED` 87–89 %) |
+  | Batch trên GPU cuối pha | 1 | 3 |
+
+  Máy rảnh không đổi (K 256: 845 so với 837 batch/s; K 4096: 54 batch/s cả hai). Cả 17 gate phần cứng CUDA qua.
 - **C16c — batch lớn hơn trên GPU nhiều VRAM.** Thêm job mỗi batch khi VRAM cho phép (4090 24 GB, PRO 6000 96 GB) để
   kernel mỗi batch dài hơn hẳn phần thời gian cố định. Output và công so tăng cùng tỉ lệ với phép tính, nên tỉ lệ
   phép tính trên mỗi word CPU so không đổi; corpus và oracle lớn theo số job, vẫn chia cho 256 lần tính lại; kho

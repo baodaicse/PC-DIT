@@ -509,7 +509,7 @@ giới hạn độ sâu hàng đợi GPU và là *đầu ra* của controller.
 | <30%, ổn định | Tăng submit rate/in-flight từng bước trong budget |
 | 30–60% | Giữ tải nếu backlog/age ổn định |
 | >70% hoặc backlog tăng liên tục | Giảm submit rate/in-flight, hoãn corpus/hash phụ |
-| >90% hoặc chạm hard cap | Dừng submit mới; drain/verify, không hủy output |
+| >90% hoặc chạm hard cap | Dừng submit mới; drain/verify, không hủy output. Từ v1.2.033 (C16b): rút về dưới 40 % ngay thì chạy lại đúng mức cũ (tạm dừng); lần thứ ba trong 1 s thì giảm một nấc; còn đầy sau 500 ms thì về 1 batch và hồi phục từng bước |
 | Sau throttle, <40% và ổn định | Phục hồi từng bước, không bật ngay tải tối đa |
 
 Đây là điểm khởi đầu để đo, chưa phải default validated. Vùng giữa các ngưỡng
