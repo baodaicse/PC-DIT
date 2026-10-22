@@ -927,7 +927,8 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   ngoài 3 batch trên GPU và 4 luồng kiểm; với 8 slot, hàng đợi "đầy" chỉ là 1–2 batch chờ, vài ms output của GPU nhanh;
   pinned thêm khoảng 17 MB ở 128 job × K 4096). Mô phỏng quá tải: 3 lần đầy lúc hội tụ, sau đó pacing đúng bằng thời
   gian kiểm và luồng kiểm chạy hết sức. Đo trên máy dev, xen kẽ, mỗi bản 2 lần (bảng dưới là tác dụng gộp của cả hai
-  thay đổi; chưa tách riêng được vì máy dev tự khởi động lại khi chạy tải nặng kéo dài, xem dưới):
+  thay đổi; chưa tách riêng được: máy dev tự reset hai lần, không log, khoảng 2 phút sau khi bắt đầu chạy CPU-RAM 16
+  luồng cạnh GPU kéo dài, nên tải đó chỉ chạy lại khi được đồng ý):
 
   | 30 s, K 256, CPU-RAM `nice 10` cả 16 luồng | Bản cũ | C16b |
   |---|---|---|
