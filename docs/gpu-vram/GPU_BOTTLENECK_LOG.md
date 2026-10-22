@@ -21,6 +21,9 @@ số worker/trần worker, áp lực bộ nhớ). Thứ tự ưu tiên:
 
 1. `MEMORY_PRESSURE` — áp lực bộ nhớ đang giữ tải xuống hoặc đang drain run.
 2. `STALLED` — controller đã dừng hẳn (không phải vì áp lực bộ nhớ, cái đó đã bắt ở trên).
+2b. `CONTROLLER_HOLD` (v1.2.037, C16d) — burst bị tính là verifier-bound chỉ vì controller đang giữ tải
+   (throttle hoặc pacing) trong khi hàng đợi kiểm gần như rỗng (`fill` trung bình của burst < 0,15): giới hạn là
+   controller, không phải luồng kiểm. Thực địa `Result/2010` từng ghi trường hợp này là `VERIFIER_WORKER_CEILING`.
 3. `VERIFIER_WORKER_CEILING` — verifier-bound *và* đã ở trần `--async-workers-max`: thêm CPU mới
    giúp được, thêm worker (đã hết chỗ) thì không.
 4. `VERIFIER_CPU_BACKLOG` — verifier-bound nhưng còn chỗ tăng worker.

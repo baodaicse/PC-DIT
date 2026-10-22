@@ -528,6 +528,8 @@ struct BottleneckSummary {
     samples: u64,
     seconds_memory_pressure: f64,
     seconds_stalled: f64,
+    /// v1.2 C16d: verifier-bound only because the controller held the load, queue nearly empty.
+    seconds_controller_hold: f64,
     seconds_verifier_cpu_backlog: f64,
     seconds_verifier_worker_ceiling: f64,
     seconds_pcie_transfer: f64,
@@ -544,6 +546,7 @@ impl BottleneckSummary {
         let bucket = match cause {
             C::MemoryPressure => &mut self.seconds_memory_pressure,
             C::Stalled => &mut self.seconds_stalled,
+            C::ControllerHold => &mut self.seconds_controller_hold,
             C::VerifierCpuBacklog => &mut self.seconds_verifier_cpu_backlog,
             C::VerifierWorkerCeiling => &mut self.seconds_verifier_worker_ceiling,
             C::PcieTransfer => &mut self.seconds_pcie_transfer,
@@ -618,6 +621,11 @@ fn sample_bottleneck(
             controller.reason,
             "host_memory_pressure" | "host_memory_pressure_sustained"
         ),
+        backlog_fill_mean: report
+            .cumulative
+            .last_burst
+            .as_ref()
+            .map_or(0.0, |burst| burst.backlog_fill_mean),
     };
     let cause = gpu_engine::bottleneck::classify(&input);
     let line = BottleneckLogLine {

@@ -59,8 +59,8 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
 | C13 | Cấp corpus kịp cho GPU nhanh: G1 `gpu-vram-dit` theo mức ISA, G2 kho corpus không bao giờ chờ, G3 gỡ kiểm toàn vẹn và nạp corpus khỏi luồng điều phối | `done` (v1.2.024–026), đã kiểm thực địa |
 | C14 | Chuỗi GEMM có đáp án biết trước (M^L = Π) | `parked` |
-| C15 | Sửa sau kết quả thực địa v1.2.023–026: lỗi cấp phát là INVALID, đọc cảm biến không chặn GPU, không chạy lại CPU-RAM trong COMBINED | `planned` |
-| C16 | GPU nhanh: bộ điều khiển tải giữ đủ batch trên GPU, batch lớn hơn khi nhiều VRAM, nhãn bottleneck đúng | `planned` |
+| C15 | Sửa sau kết quả thực địa v1.2.023–026: lỗi cấp phát là INVALID, đọc cảm biến không chặn GPU, không chạy lại CPU-RAM trong COMBINED | `done` (v1.2.030–032), chờ phiên thực địa |
+| C16 | GPU nhanh: bộ điều khiển tải giữ đủ batch trên GPU, burst đủ dài, nhãn bottleneck đúng | `done` (v1.2.033–037), chờ phiên thực địa |
 
 ### V0 — Version và hiển thị (`done`)
 
@@ -834,7 +834,7 @@ mất phần ép pipe FP32 FMA và Tensor core; (2) kiểm cả chuỗi chứ kh
 khỏi CPU-verified; (3) không áp vào data chain: đáp án của chain tính sẵn hai lần lúc nạp và đi qua đường SSD → RAM như
 một phần dữ liệu được kiểm, bỏ nó thì chain mất nửa lượng byte và mất FP32.
 
-### C15 — Sửa sau kết quả thực địa v1.2.023–026 (`planned`, 2026-10-20)
+### C15 — Sửa sau kết quả thực địa v1.2.023–026 (`done`, v1.2.030–032, 2026-10-22)
 
 Bằng chứng: `Result/1910` (5 phiên v1.2.023) và `Result/2010` (25 phiên v1.2.026). C15a và C15c ảnh hưởng tới
 verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có test.
@@ -875,7 +875,7 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   (baseline, pha chạy chồng, xoay lõi). Kiểm trên máy dev với lỗi RAM cài sẵn, 8 s: có rerun 16,6 s
   (`reproducible_same_route`), có cờ 8,5 s (`disabled`), cả hai FAIL.
 
-### C16 — GPU nhanh: giữ đủ batch trên GPU (`planned`, 2026-10-20)
+### C16 — GPU nhanh: giữ đủ batch trên GPU (`done`, v1.2.033–037, 2026-10-22)
 
 **Bằng chứng** (`Result/2010`, pha chạy chồng `max`, v1.2.026):
 
@@ -948,7 +948,7 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   (mà cửa sổ còn reset mỗi burst). Bộ điều khiển vì vậy không lên được 3 batch, và cuối mỗi burst pipeline xả sạch.
   Batch lớn hơn thì corpus và kho corpus phải lớn theo số job, vượt ngân sách RAM 2 GiB của mỗi GPU. Burst dài hơn
   thì không tốn gì.
-  **Đã làm (v1.2.037):** khi bộ lập lịch không yêu cầu độ dài, burst kéo dài khoảng `--async-burst-ms` (mặc định 250)
+  **Đã làm (v1.2.036):** khi bộ lập lịch không yêu cầu độ dài, burst kéo dài khoảng `--async-burst-ms` (mặc định 250)
   theo thời gian mỗi batch đo được ở các burst trước, trong khoảng [`--async-batches` (32), một lượt đổi corpus (256)].
   GPU chậm giữ 32; GPU nhanh lên tới 256. Máy dev, GPU riêng, 20 s:
 
@@ -959,6 +959,9 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
 
 - **C16d — nhãn bottleneck đúng.** Bộ điều khiển giữ tải trong khi hàng đợi rỗng thì ghi một nhãn riêng (bộ điều khiển
   đang giữ), không ghi `VERIFIER_BOUND`.
+  **Đã làm (v1.2.037):** nhãn `CONTROLLER_HOLD` khi burst là verifier-bound mà `fill` trung bình của hàng đợi < 0,15;
+  report có `seconds_controller_hold` trong `bottleneck_summary`. Nhãn `VERIFIER_*` chỉ còn khi hàng đợi thật sự có
+  việc chờ.
 
 **Kỳ vọng** (kiểm bằng phiên thực địa): GPU nhanh bận gấp 2–3 lần, toàn bộ vẫn CPU-verified; CPU so tăng tương ứng,
 từ 0,2 lên khoảng 0,5 lõi.

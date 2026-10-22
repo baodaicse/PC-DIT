@@ -16,6 +16,10 @@ pub enum BottleneckCause {
     MemoryPressure,
     /// The controller stopped submitting (sustained pressure, or another fatal reason).
     Stalled,
+    /// v1.2 C16d: the burst counts as verifier-bound only because the controller is holding the
+    /// load (throttled or paced) while the verifier queue is nearly empty: the verifiers are not
+    /// the limit, the controller is.
+    ControllerHold,
     /// Outputs arrive faster than the verifier workers can absorb; more workers (below the
     /// configured ceiling) would plausibly help.
     VerifierCpuBacklog,
@@ -39,6 +43,9 @@ impl BottleneckCause {
         match self {
             Self::MemoryPressure => "host memory pressure is holding load down or draining the run",
             Self::Stalled => "the controller stopped submitting",
+            Self::ControllerHold => {
+                "the load controller holds the GPU back while the verifier queue is nearly empty"
+            }
             Self::VerifierCpuBacklog => {
                 "verifier CPU cannot keep up with the GPU's output; more workers may help"
             }
@@ -66,7 +73,13 @@ pub struct BottleneckInput {
     pub workers: usize,
     pub workers_max: usize,
     pub memory_pressure: bool,
+    /// Mean verifier waiting-room fill of the last burst (0..=1).
+    pub backlog_fill_mean: f64,
 }
+
+/// Below this mean fill the verifier queue is nearly empty: a verifier-bound label then comes
+/// from the controller holding the load, not from the verifiers.
+pub const EMPTY_QUEUE_FILL: f64 = 0.15;
 
 #[must_use]
 pub fn classify(i: &BottleneckInput) -> BottleneckCause {
@@ -77,6 +90,9 @@ pub fn classify(i: &BottleneckInput) -> BottleneckCause {
         return BottleneckCause::Stalled;
     }
     match i.regime {
+        Regime::VerifierBound if i.backlog_fill_mean < EMPTY_QUEUE_FILL => {
+            BottleneckCause::ControllerHold
+        }
         Regime::VerifierBound if i.workers >= i.workers_max => {
             BottleneckCause::VerifierWorkerCeiling
         }
@@ -99,7 +115,29 @@ mod tests {
             workers: 2,
             workers_max: 4,
             memory_pressure: false,
+            backlog_fill_mean: 0.5,
         }
+    }
+
+    #[test]
+    fn a_verifier_bound_label_with_an_empty_queue_is_the_controller_holding() {
+        // Seen in the field (Result/2010): throttled at one batch for the whole overlap, the
+        // queue empty, labelled VERIFIER_WORKER_CEILING.
+        let held = BottleneckInput {
+            regime: Regime::VerifierBound,
+            controller_state: ControlState::Throttled,
+            pacing_ms: 2,
+            workers: 4,
+            workers_max: 4,
+            backlog_fill_mean: 0.0,
+            ..base()
+        };
+        assert_eq!(classify(&held), BottleneckCause::ControllerHold);
+        let backlog = BottleneckInput {
+            backlog_fill_mean: 0.6,
+            ..held
+        };
+        assert_eq!(classify(&backlog), BottleneckCause::VerifierWorkerCeiling);
     }
 
     #[test]
