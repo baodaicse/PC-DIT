@@ -17,7 +17,7 @@ Mỗi batch giữ cả hai từ lúc submit (dự trù chỗ trước khi submit
 completion cũ hoặc trùng bị từ chối dù chỉ một trong hai slot đã được dùng lại. GPU có thể chạy batch
 tiếp theo trong khi các output trước còn chờ verifier, và hàng đợi host có thể sâu hơn số batch trên
 GPU. Sổ cái kiểm bảo toàn mỗi burst: số batch, số byte readback, byte hàng đợi, khớp giữa hai nhóm slot
-và các hold quarantine. Mặc định 3 device slot + 8 host slot (trước đó 4 + 4).
+và các hold quarantine. Mặc định 3 device slot + 16 host slot từ v1.2.033 (C16b; trước đó 8, trước nữa 4 + 4).
 
 **`QUARANTINE`.** Batch lỗi giữ nguyên slot host và byte của nó (tối đa `--quarantine-slots`, mặc định 1, và
 không bao giờ giữ hết mọi slot; quá hạn 30 giây thì tự nhả). Đầy thì batch lỗi nhả ngay và được đếm là

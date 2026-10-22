@@ -3969,7 +3969,7 @@ mod tests {
     #[test]
     fn async_defaults_separate_device_and_host_slots_and_flags_override_them() {
         let default = async_config(&parse(&["--async-compute"]));
-        assert_eq!((default.device_slots, default.host_slots), (3, 8));
+        assert_eq!((default.device_slots, default.host_slots), (3, 16));
         assert_eq!((default.quarantine_slots, default.batches), (1, 32));
         assert!(default.host_slots > default.device_slots);
         assert!(default.workers >= 1 && default.corpus_threads >= 1);

@@ -923,8 +923,11 @@ verdict; C15b trả lại vòng burst cho GPU. Mỗi mục một commit, có tes
   tính là lần hạ tải, không làm `hold` tăng. Lần tạm dừng thứ ba trong 1 s nghĩa là luồng kiểm sát giới hạn: giảm một
   nấc bằng đòn bẩy sẵn có (bớt 1 batch, pacing về tốc độ kiểm; `queue_full_overload`). Hàng đợi vẫn đầy sau 500 ms là
   quá tải thật: xử lý như cũ (về 1 batch, hồi phục từng bước). Áp lực RAM host không đổi. Đợt tạm dừng không làm burst
-  bị gán `VERIFIER_BOUND` (chỉ `queue_full_overload` mới gán). Mô phỏng quá tải: 3 lần đầy lúc hội tụ, sau đó pacing
-  đúng bằng thời gian kiểm và luồng kiểm chạy hết sức. Đo trên máy dev, xen kẽ, mỗi bản 2 lần:
+  bị gán `VERIFIER_BOUND` (chỉ `queue_full_overload` mới gán). Cùng commit, slot host mặc định 8 → 16 (phòng chờ 9 slot
+  ngoài 3 batch trên GPU và 4 luồng kiểm; với 8 slot, hàng đợi "đầy" chỉ là 1–2 batch chờ, vài ms output của GPU nhanh;
+  pinned thêm khoảng 17 MB ở 128 job × K 4096). Mô phỏng quá tải: 3 lần đầy lúc hội tụ, sau đó pacing đúng bằng thời
+  gian kiểm và luồng kiểm chạy hết sức. Đo trên máy dev, xen kẽ, mỗi bản 2 lần (bảng dưới là tác dụng gộp của cả hai
+  thay đổi; chưa tách riêng được vì máy dev tự khởi động lại khi chạy tải nặng kéo dài, xem dưới):
 
   | 30 s, K 256, CPU-RAM `nice 10` cả 16 luồng | Bản cũ | C16b |
   |---|---|---|
