@@ -38,7 +38,7 @@ pub use memory::{LiveResources, live_resources};
 pub use sweep::{SweepConfig, SweepReport};
 pub use workers::Fairness;
 
-pub const KERNEL_SHA256: &str = "6aba864d76585de426bd5732b8736a29a4fdae10975254da041d44e6739c10cb";
+pub const KERNEL_SHA256: &str = "615d07fe09cc0425c2e083a975540517ef90d8d2d9b41fcf0b279f7bed1e9629";
 const PTX: &[u8] = include_bytes!("../kernels/gemm.ptx");
 /// INT8 tensor-core GEMM (`kernels/tensor.cu`), built for `compute_80`: loaded only on devices of
 /// compute capability 8.0 or newer.
@@ -55,6 +55,12 @@ pub enum MatrixFault {
     MissingWrite = 3,
     StaleGeneration = 4,
     GuardOverwrite = 5,
+    /// v1.2 C9 chain: the top bit of one intermediate of layer 1 flips.
+    ChainBitFlip = 6,
+    /// v1.2 C9 chain: layer 2 never runs (its scratch keeps what another batch left).
+    ChainSkippedLayer = 7,
+    /// v1.2 C9 chain: layer 3 multiplies by the matrix of layer 1.
+    ChainWrongMatrix = 8,
 }
 #[derive(Debug, Error)]
 pub enum Error {
@@ -137,6 +143,9 @@ pub struct CudaBackend {
     hash_function: Handle,
     check_function: Handle,
     seal_function: Handle,
+    /// v1.2 C9: one layer of the u32 GEMM chain, and its projection to the output.
+    chain_layer_function: Handle,
+    chain_out_function: Handle,
     /// The u32 and FP32 GEMMs with the boundary check fused in (no extra launch per batch).
     gemm_checked_function: Handle,
     gemm_f32_checked_function: Handle,
@@ -329,6 +338,8 @@ impl CudaBackend {
             hash_function: ptr::null_mut(),
             check_function: ptr::null_mut(),
             seal_function: ptr::null_mut(),
+            chain_layer_function: ptr::null_mut(),
+            chain_out_function: ptr::null_mut(),
             gemm_checked_function: ptr::null_mut(),
             gemm_f32_checked_function: ptr::null_mut(),
             sm_count: 1,
@@ -404,6 +415,8 @@ impl CudaBackend {
         for (handle, name) in [
             (&raw mut self.function, c"dit_gemm"),
             (&raw mut self.function_f32, c"dit_gemm_f32"),
+            (&raw mut self.chain_layer_function, c"dit_chain_layer"),
+            (&raw mut self.chain_out_function, c"dit_chain_out"),
             (&raw mut self.fill_function, c"dit_vram_fill"),
             (&raw mut self.verify_function, c"dit_vram_verify"),
             (&raw mut self.sweep_fill_function, c"dit_vram_sweep_fill"),

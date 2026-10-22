@@ -12,6 +12,21 @@ pub const F32_VERSION: &str = "G4-F32-FMA-GEMM-1";
 pub const I8_VERSION: &str = "G5-I8-MMA-GEMM-1";
 /// Matrix size of INT8 corpora: tensor tiles are 16x8, so `n` must divide by 16.
 pub const I8_N: usize = 64;
+/// v1.2 C9: a chain of GEMMs on data kept in VRAM. Each job: `X₀ = A` (`n`x`kc`), then
+/// `X_s = X_{s-1}·M_s` for [`CHAIN_LAYERS`] matrices `M_s` (`kc`x`kc`, shared by every job),
+/// then `Y = X_L·B` (`B` `kc`x`n`): one `n`x`n` output per job, tagged and verified word for word
+/// like the GEMM, against a CPU oracle that computes the whole chain. Modulo 2^32.
+pub const CHAIN_VERSION: &str = "G6-U32-CHAIN-GEMM-1";
+/// Layers of a chain corpus.
+pub const CHAIN_LAYERS: usize = 4;
+/// Largest inner dimension of a chain: the work of a layer grows with its square.
+pub const CHAIN_MAX_K: usize = 1024;
+
+/// Inner dimension `kc` of a chain corpus whose shape has inner dimension `k`.
+#[must_use]
+pub fn chain_inner(k: usize) -> usize {
+    k.min(CHAIN_MAX_K)
+}
 
 /// Arithmetic a corpus exercises: the integer ALU (`u32`, modulo 2^32) or the FP32 FMA pipes.
 /// Both are exact to the bit: integer wrap-around is exact, and a fused multiply-add is one
@@ -25,6 +40,8 @@ pub enum Arith {
     F32,
     /// Signed 8-bit operands on the tensor cores (compute capability 8.0+), exact in 32 bits.
     I8,
+    /// v1.2 C9: a chain of [`CHAIN_LAYERS`] GEMMs and a projection, modulo 2^32.
+    U32Chain,
 }
 
 /// Which arithmetic successive corpora use. `Alternate` switches at every corpus rotation, so a
@@ -39,8 +56,10 @@ pub enum ArithMix {
     I8,
     /// u32 and FP32 in turn.
     Alternate,
-    /// u32, FP32 and INT8 tensor in turn; without tensor cores, like `Alternate`.
+    /// u32, FP32, INT8 tensor and the u32 chain in turn (INT8 left out without tensor cores).
     All,
+    /// The u32 GEMM chain only (v1.2 C9).
+    Chain,
 }
 
 impl ArithMix {
@@ -48,15 +67,22 @@ impl ArithMix {
     /// INT8 tensor path (an `All` run then includes it).
     #[must_use]
     pub fn for_rotation(self, rotation: u64, tensor: bool) -> Arith {
-        const TURN: [Arith; 3] = [Arith::U32, Arith::F32, Arith::I8];
-        let cycle = match self {
+        let turn: &[Arith] = match self {
             Self::U32 => return Arith::U32,
             Self::F32 => return Arith::F32,
             Self::I8 => return Arith::I8,
-            Self::All if tensor => 3,
-            Self::Alternate | Self::All => 2,
+            Self::Chain => return Arith::U32Chain,
+            Self::Alternate => &[Arith::U32, Arith::F32],
+            Self::All if tensor => &[Arith::U32, Arith::F32, Arith::I8, Arith::U32Chain],
+            Self::All => &[Arith::U32, Arith::F32, Arith::U32Chain],
         };
-        TURN[usize::try_from(rotation % cycle).unwrap_or(0)]
+        turn[usize::try_from(rotation % turn.len() as u64).unwrap_or(0)]
+    }
+
+    /// Whether some corpus of this mix is a u32 chain (it needs its scratch on the device).
+    #[must_use]
+    pub fn has_chain(self) -> bool {
+        matches!(self, Self::All | Self::Chain)
     }
 
     /// Whether this mix uses more than one arithmetic, and so needs corpus rotation.
@@ -73,6 +99,7 @@ impl Arith {
             Self::U32 => VERSION,
             Self::F32 => F32_VERSION,
             Self::I8 => I8_VERSION,
+            Self::U32Chain => CHAIN_VERSION,
         }
     }
 }
@@ -162,14 +189,17 @@ impl Corpus {
         let n = Self::dimension(arith, seed);
         let k = k as usize;
         // INT8 packs four operands to a word: A (n x k) and B^T (n x k) bytes.
-        let per_job = Self::input_words_per_job(arith, n, k);
-        let words = jobs.checked_mul(per_job).ok_or("G3 input overflow")?;
+        let words = Self::input_words(arith, jobs, n, k).ok_or("G3 input overflow")?;
         let mut input = vec![0_u32; words];
         fill_input(&mut input, seed, threads);
         if arith == Arith::F32 {
             for word in &mut input {
                 *word = f32_operand(*word);
             }
+        }
+        if arith == Arith::U32Chain {
+            let kc = chain_inner(k);
+            chain_shared(&mut input[jobs * n * kc..], seed, n, kc);
         }
         let filled = start.elapsed().as_secs_f64();
         let oracle_start = Instant::now();
@@ -187,6 +217,7 @@ impl Corpus {
                 Arith::U32 => oracle(input, &mut dot, n, k, threads),
                 Arith::F32 => oracle_f32(input, &mut dot, n, k, threads),
                 Arith::I8 => oracle_i8(input, &mut dot, n, k, threads),
+                Arith::U32Chain => oracle_chain(input, &mut dot, n, chain_inner(k), threads),
             }
             hasher.join()
         });
@@ -225,6 +256,9 @@ impl Corpus {
         if !(1..=65_536).contains(&jobs) || !(1..=MAX_K).contains(&k) {
             return Err("G3 jobs must be 1..65536 and matrix inner dimension 1..4096");
         }
+        if arith == Arith::U32Chain {
+            return Err("u32 chain corpora are built, never stored");
+        }
         let n = Self::dimension(arith, seed);
         let k = k as usize;
         if input.len() != jobs * Self::input_words_per_job(arith, n, k) || dot.len() != jobs * n * n
@@ -261,13 +295,32 @@ impl Corpus {
     }
 
     /// Input words of one job: A and B as u32/f32 words, or packed four bytes to a word for INT8.
+    /// For a chain, the job's own `A` (the matrices are shared, see [`Self::input_words`]).
     #[must_use]
     pub fn input_words_per_job(arith: Arith, n: usize, k: usize) -> usize {
-        if arith == Arith::I8 {
-            n * k / 2
-        } else {
-            2 * n * k
+        match arith {
+            Arith::I8 => n * k / 2,
+            Arith::U32Chain => n * chain_inner(k),
+            Arith::U32 | Arith::F32 => 2 * n * k,
         }
+    }
+
+    /// All input words of a corpus. A chain stores the `A` of every job, then `M_1`..`M_L`
+    /// and `B`, shared by every job.
+    #[must_use]
+    pub fn input_words(arith: Arith, jobs: usize, n: usize, k: usize) -> Option<usize> {
+        let per_job = jobs.checked_mul(Self::input_words_per_job(arith, n, k))?;
+        if arith != Arith::U32Chain {
+            return Some(per_job);
+        }
+        let kc = chain_inner(k);
+        per_job.checked_add(CHAIN_LAYERS * kc * kc + kc * n)
+    }
+
+    /// Inner dimension of the chain of this corpus (its shape's `k`, at most [`CHAIN_MAX_K`]).
+    #[must_use]
+    pub fn chain_inner(&self) -> usize {
+        chain_inner(self.k)
     }
 
     /// Re-hashes the host copy of the input and the expected dot products (two threads) and
@@ -322,9 +375,19 @@ impl Corpus {
         }
         result
     }
+    /// Operations one batch verifies: a multiply and an add (integer, or one fused multiply-add
+    /// counted as two) per inner step and output cell; for a chain, of every layer and the
+    /// projection.
     #[must_use]
     pub fn integer_operations(&self) -> u64 {
-        2 * self.jobs as u64 * (self.n * self.n * self.k) as u64
+        let (n, k) = (self.n as u64, self.k as u64);
+        let per_job = if self.arith == Arith::U32Chain {
+            let kc = self.chain_inner() as u64;
+            CHAIN_LAYERS as u64 * n * kc * kc + n * n * kc
+        } else {
+            n * n * k
+        };
+        2 * self.jobs as u64 * per_job
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -500,6 +563,127 @@ fn oracle(input: &[u32], dot: &mut [u32], n: usize, k: usize, threads: usize) {
                     }
                 }
             }
+        }
+    };
+    let threads = threads.min(jobs).max(1);
+    if threads == 1 {
+        run(dot, 0);
+        return;
+    }
+    let per_job = jobs.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (index, part) in dot.chunks_mut(per_job * n * n).enumerate() {
+            scope.spawn(move || run(part, index * per_job));
+        }
+    });
+}
+
+/// v1.2 C9: makes the shared part of a chain corpus safe for error detection. Each `M_s`
+/// (`kc`x`kc`, random) is kept only if it is invertible modulo 2, otherwise drawn again from a
+/// derived seed: then `X ↦ X·M_s` is a bijection modulo 2^32 and an error in any layer, any
+/// bit, can never be cancelled by a later layer (with every entry odd, `M ≡ J` modulo 2 and
+/// `J·J ≡ 0` for even `kc`: a bit-31 error vanished two layers later). Every row of `B`
+/// (`kc`x`n`) gets an odd entry, so an error in the last layer always shows in the output.
+#[allow(clippy::cast_possible_truncation)]
+fn chain_shared(shared: &mut [u32], seed: u64, n: usize, kc: usize) {
+    let (matrices, b) = shared.split_at_mut(CHAIN_LAYERS * kc * kc);
+    for (layer, m) in matrices.chunks_exact_mut(kc * kc).enumerate() {
+        let mut attempt = 0_u64;
+        while !invertible_mod2(m, kc) {
+            attempt += 1;
+            let base = seed ^ super::splitmix64(((layer as u64 + 1) << 32) | attempt);
+            for (index, word) in m.iter_mut().enumerate() {
+                *word = super::splitmix64(base ^ (index as u64).wrapping_mul(0xD134_2543_DE82_EF95))
+                    as u32;
+            }
+        }
+    }
+    for (row, words) in b.chunks_exact_mut(n).enumerate() {
+        if words.iter().all(|word| word & 1 == 0) {
+            words[row % n] |= 1;
+        }
+    }
+}
+
+/// Whether the `k`x`k` matrix `m` (row-major) is invertible modulo 2: Gaussian elimination
+/// over GF(2) on its low bits, 64 columns to a word.
+fn invertible_mod2(m: &[u32], k: usize) -> bool {
+    let words = k.div_ceil(64);
+    let mut rows: Vec<Vec<u64>> = m
+        .chunks_exact(k)
+        .map(|row| {
+            let mut bits = vec![0_u64; words];
+            for (col, value) in row.iter().enumerate() {
+                bits[col / 64] |= u64::from(value & 1) << (col % 64);
+            }
+            bits
+        })
+        .collect();
+    for col in 0..k {
+        let (word, bit) = (col / 64, 1_u64 << (col % 64));
+        let Some(pivot) = (col..k).find(|&r| rows[r][word] & bit != 0) else {
+            return false;
+        };
+        rows.swap(col, pivot);
+        let pivot_row = rows[col].clone();
+        for row in rows.iter_mut().skip(col + 1) {
+            if row[word] & bit != 0 {
+                for (dst, src) in row.iter_mut().zip(&pivot_row).skip(word) {
+                    *dst ^= src;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// One job of a chain: `A·M_1·…·M_L·B`, plain i-t-j loops modulo 2^32 (the GPU tiles the same
+/// sums differently; the order of an exact modular sum does not matter).
+fn chain_job(a: &[u32], matrices: &[u32], b: &[u32], n: usize, kc: usize, out: &mut [u32]) {
+    let mut x = a.to_vec();
+    let mut next = vec![0_u32; n * kc];
+    for m in matrices.chunks_exact(kc * kc) {
+        next.fill(0);
+        for row in 0..n {
+            let dst = &mut next[row * kc..(row + 1) * kc];
+            for t in 0..kc {
+                let left = x[row * kc + t];
+                for (cell, &r) in dst.iter_mut().zip(&m[t * kc..(t + 1) * kc]) {
+                    *cell = cell.wrapping_add(left.wrapping_mul(r));
+                }
+            }
+        }
+        std::mem::swap(&mut x, &mut next);
+    }
+    out.fill(0);
+    for row in 0..n {
+        let dst = &mut out[row * n..(row + 1) * n];
+        for t in 0..kc {
+            let left = x[row * kc + t];
+            for (cell, &r) in dst.iter_mut().zip(&b[t * n..(t + 1) * n]) {
+                *cell = cell.wrapping_add(left.wrapping_mul(r));
+            }
+        }
+    }
+}
+
+/// The chain oracle: every job's `A·M_1·…·M_L·B`, jobs split across `threads`.
+fn oracle_chain(input: &[u32], dot: &mut [u32], n: usize, kc: usize, threads: usize) {
+    let jobs = dot.len() / (n * n);
+    let a_len = jobs * n * kc;
+    let matrices = &input[a_len..a_len + CHAIN_LAYERS * kc * kc];
+    let b = &input[a_len + CHAIN_LAYERS * kc * kc..];
+    let run = |part: &mut [u32], first_job: usize| {
+        for (local, out) in part.chunks_exact_mut(n * n).enumerate() {
+            let job = first_job + local;
+            chain_job(
+                &input[job * n * kc..(job + 1) * n * kc],
+                matrices,
+                b,
+                n,
+                kc,
+                out,
+            );
         }
     };
     let threads = threads.min(jobs).max(1);
@@ -815,9 +999,10 @@ mod tests {
         assert_eq!(ArithMix::All.for_rotation(2, true), Arith::I8);
         assert_eq!(
             ArithMix::All.for_rotation(2, false),
-            Arith::U32,
-            "no tensor: skip INT8"
+            Arith::U32Chain,
+            "no tensor: skip INT8 (the v1.2 C9 chain follows FP32)"
         );
+        assert_eq!(ArithMix::All.for_rotation(3, false), Arith::U32);
         assert_eq!(ArithMix::Alternate.for_rotation(1, true), Arith::F32);
     }
 
@@ -1118,5 +1303,139 @@ mod tests {
         let a = Corpus::new(2, 6, 11).unwrap();
         let b = Corpus::new_with_threads(2, 6, 11, 4).unwrap();
         assert_eq!((a.sha256, a.dot_sha256), (b.sha256, b.dot_sha256));
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    /// `a` (rows x inner) times `b` (inner x cols), modulo 2^32.
+    fn product(a: &[u32], b: &[u32], rows: usize, inner: usize, cols: usize) -> Vec<u32> {
+        let mut out = vec![0_u32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[r * cols + c] = (0..inner).fold(0_u32, |sum, t| {
+                    sum.wrapping_add(a[r * inner + t].wrapping_mul(b[t * cols + c]))
+                });
+            }
+        }
+        out
+    }
+
+    fn parts(corpus: &Corpus) -> (usize, usize, Vec<Vec<u32>>, Vec<u32>) {
+        let (n, kc) = (corpus.n, corpus.chain_inner());
+        let a_len = corpus.jobs * n * kc;
+        let matrices = corpus.input[a_len..a_len + CHAIN_LAYERS * kc * kc]
+            .chunks_exact(kc * kc)
+            .map(<[u32]>::to_vec)
+            .collect();
+        let b = corpus.input[a_len + CHAIN_LAYERS * kc * kc..].to_vec();
+        (n, kc, matrices, b)
+    }
+
+    #[test]
+    fn a_chain_corpus_has_invertible_matrices_and_an_odd_entry_in_every_row_of_b() {
+        let corpus = Corpus::new_arith(Arith::U32Chain, 11, 3, 48, 1).unwrap();
+        let (n, kc, matrices, b) = parts(&corpus);
+        assert_eq!(kc, 48);
+        assert_eq!(
+            corpus.input.len(),
+            3 * n * kc + CHAIN_LAYERS * kc * kc + kc * n
+        );
+        assert_eq!(
+            Corpus::input_words(Arith::U32Chain, 3, n, 48),
+            Some(corpus.input.len())
+        );
+        assert!(matrices.iter().all(|m| invertible_mod2(m, kc)));
+        assert!(b.chunks_exact(n).all(|row| row.iter().any(|w| w & 1 == 1)));
+        // The identity is invertible, a matrix with an all-even column is not, nor J for even k.
+        let identity: Vec<u32> = (0..16 * 16).map(|i| u32::from(i % 17 == 0)).collect();
+        assert!(invertible_mod2(&identity, 16));
+        let mut even = identity.clone();
+        even[5 * 16 + 5] = 2;
+        assert!(!invertible_mod2(&even, 16));
+        assert!(!invertible_mod2(&[1_u32; 16 * 16], 16));
+        // The inner dimension of a chain is the shape's, at most 1024.
+        assert_eq!((chain_inner(256), chain_inner(4096)), (256, CHAIN_MAX_K));
+    }
+
+    #[test]
+    fn the_chain_oracle_equals_the_product_taken_in_another_order() {
+        let corpus = Corpus::new_arith(Arith::U32Chain, 7, 2, 32, 1).unwrap();
+        let (n, kc, matrices, b) = parts(&corpus);
+        // A·(M1·(M2·(M3·(M4·B)))): a different order of the same exact modular product.
+        let mut tail = b.clone();
+        for m in matrices.iter().rev() {
+            tail = product(m, &tail, kc, kc, n);
+        }
+        for job in 0..corpus.jobs {
+            let a = &corpus.input[job * n * kc..(job + 1) * n * kc];
+            assert_eq!(
+                product(a, &tail, n, kc, n),
+                corpus.dot[job * n * n..(job + 1) * n * n],
+                "job {job}"
+            );
+        }
+        let again = Corpus::new_arith(Arith::U32Chain, 7, 2, 32, 2).unwrap();
+        assert_eq!(
+            (&again.dot, &again.sha256),
+            (&corpus.dot, &corpus.sha256),
+            "threads change nothing"
+        );
+        assert_eq!(
+            corpus.integer_operations(),
+            2 * 2 * (CHAIN_LAYERS * n * kc * kc + n * n * kc) as u64
+        );
+    }
+
+    #[test]
+    fn a_bit_31_error_in_a_layer_always_reaches_the_output() {
+        let corpus = Corpus::new_arith(Arith::U32Chain, 3, 1, 32, 1).unwrap();
+        let (n, kc, matrices, b) = parts(&corpus);
+        let a = corpus.input[..n * kc].to_vec();
+        // The chain from layer 1 on, with X1 given.
+        let finish = |x1: &[u32], layers: &[Vec<u32>]| {
+            let mut x = x1.to_vec();
+            for m in &layers[1..] {
+                x = product(&x, m, n, kc, kc);
+            }
+            product(&x, &b, n, kc, n)
+        };
+        let x1 = product(&a, &matrices[0], n, kc, kc);
+        let clean = finish(&x1, &matrices);
+        assert_eq!(clean, corpus.dot);
+        for cell in [0, 5, n * kc - 1] {
+            let mut bad = x1.clone();
+            bad[cell] ^= 1 << 31;
+            assert_ne!(finish(&bad, &matrices), clean, "cell {cell}");
+        }
+        // Why the matrices must be invertible modulo 2: with every entry odd the same error
+        // is cancelled two layers later (`M ≡ J`, `J·J ≡ 0` modulo 2 for even k).
+        let odd: Vec<Vec<u32>> = matrices
+            .iter()
+            .map(|m| m.iter().map(|w| w | 1).collect())
+            .collect();
+        let x1 = product(&a, &odd[0], n, kc, kc);
+        let mut bad = x1.clone();
+        bad[0] ^= 1 << 31;
+        assert_eq!(finish(&bad, &odd), finish(&x1, &odd));
+    }
+
+    #[test]
+    fn the_chain_is_the_fourth_turn_of_all_and_its_own_mix() {
+        let turns: Vec<Arith> = (0..4)
+            .map(|r| ArithMix::All.for_rotation(r, true))
+            .collect();
+        assert_eq!(turns, [Arith::U32, Arith::F32, Arith::I8, Arith::U32Chain]);
+        let no_tensor: Vec<Arith> = (0..3)
+            .map(|r| ArithMix::All.for_rotation(r, false))
+            .collect();
+        assert_eq!(no_tensor, [Arith::U32, Arith::F32, Arith::U32Chain]);
+        assert_eq!(ArithMix::Chain.for_rotation(5, true), Arith::U32Chain);
+        assert_eq!(ArithMix::Alternate.for_rotation(1, true), Arith::F32);
+        assert!(ArithMix::All.has_chain() && ArithMix::Chain.has_chain());
+        assert!(!ArithMix::Alternate.has_chain());
+        assert!(Corpus::from_parts(Arith::U32Chain, 1, 1, 16, vec![], vec![]).is_err());
     }
 }

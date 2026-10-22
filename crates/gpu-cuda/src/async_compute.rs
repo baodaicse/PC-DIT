@@ -169,7 +169,8 @@ impl AsyncConfig {
         } else {
             0
         };
-        3 + 5 * self.device_slots + self.host_slots + lane + checks
+        let chain = if self.arith.has_chain() { 3 } else { 0 };
+        3 + 5 * self.device_slots + self.host_slots + lane + checks + chain
     }
     fn threads(self) -> usize {
         if self.corpus_threads == 0 {
@@ -468,6 +469,47 @@ impl Drop for DeviceSlot {
     }
 }
 
+/// v1.2 C9: the two scratch buffers of the GEMM chain (its layers alternate between them) and the
+/// event after the last chain launched. Every chain uses the same scratch, so each waits for the
+/// one before on the device (`cuStreamWaitEvent`); copies of other slots still overlap it.
+pub(crate) struct ChainScratch {
+    context: Rc<Context>,
+    buffers: [Buffer; 2],
+    done: Handle,
+}
+impl ChainScratch {
+    fn new(backend: &CudaBackend, jobs: usize, inner: u32) -> Result<Self> {
+        let bytes = jobs * gemm::MAX_N * gemm::chain_inner(inner as usize) * 4;
+        backend.alloc_step()?;
+        let first = Buffer::new(&backend.context, bytes)?;
+        backend.alloc_step()?;
+        let second = Buffer::new(&backend.context, bytes)?;
+        backend.alloc_step()?;
+        let mut done = ptr::null_mut();
+        // Ordering only, no timing (CU_EVENT_DISABLE_TIMING).
+        check("chain event", unsafe {
+            (backend.context.driver.event_create)(&raw mut done, 2)
+        })?;
+        LIVE_EVENTS.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(Self {
+            context: Rc::clone(&backend.context),
+            buffers: [first, second],
+            done,
+        })
+    }
+}
+impl Drop for ChainScratch {
+    fn drop(&mut self) {
+        if self.done.is_null() || self.context.stopped.get() || self.context.current().is_err() {
+            return;
+        }
+        unsafe {
+            (self.context.driver.event_destroy)(self.done);
+        }
+        LIVE_EVENTS.fetch_sub(1, AtomicOrdering::SeqCst);
+    }
+}
+
 /// Pinned readback: the D2H target, then read-only for the verifier until the verdict.
 struct HostSlot {
     readback: Pinned,
@@ -485,6 +527,8 @@ pub(crate) struct Pipeline {
     // Device slots drop first: one still in flight marks the context stopped, so the host
     // slots they write to are then leaked rather than freed under a running copy.
     devices: Vec<DeviceSlot>,
+    /// v1.2 C9: scratch of the GEMM chain, when the mix has it (dropped after the slots).
+    chain: Option<ChainScratch>,
     hosts: Vec<HostSlot>,
     input: Buffer,
     upload: Pinned,
@@ -505,6 +549,8 @@ pub(crate) struct Pipeline {
     staged_installs: u64,
     /// Smoothed wall time per batch of past bursts, milliseconds (C16c); 0 before the first.
     batch_wall_ms: f64,
+    /// A fault armed for the first batch of the next burst (negative gates).
+    armed_fault: Option<u32>,
     /// The periodic host-corpus check running on a helper thread (C13 G3).
     integrity_job: Option<thread::JoinHandle<IntegrityOutcome>>,
     /// Shape of the corpus in use (it changes only at a rotation, between bursts).
@@ -777,7 +823,14 @@ impl Pipeline {
         }
         backend.alloc_counter.set(0);
         let (input, output, _) = gemm::workspace_per_job(inner);
-        let input = usize::try_from(input).map_err(|_| Error::Request("input size"))? * jobs;
+        let mut input = usize::try_from(input).map_err(|_| Error::Request("input size"))? * jobs;
+        if config.arith.has_chain() {
+            // A chain corpus adds its shared matrices: with few jobs they outweigh the GEMM's.
+            let chain =
+                gemm::Corpus::input_words(Arith::U32Chain, jobs, gemm::MAX_N, inner as usize)
+                    .ok_or(Error::Request("input size"))?;
+            input = input.max(chain * 4);
+        }
         let output = usize::try_from(output).map_err(|_| Error::Request("output size"))? * jobs;
         let (output, device_output) = slot_sizes(config, output, jobs);
         // Every resource is an owner (RAII) until the pipeline exists, so a failure at any
@@ -811,6 +864,11 @@ impl Pipeline {
         {
             lane.set_half(Some(0));
         }
+        let chain = config
+            .arith
+            .has_chain()
+            .then(|| ChainScratch::new(backend, jobs, inner))
+            .transpose()?;
         backend.alloc_step()?;
         let mut origin = ptr::null_mut();
         check("async origin event", unsafe {
@@ -825,6 +883,7 @@ impl Pipeline {
             failure_attribution: None,
             interrupted: false,
             devices,
+            chain,
             hosts,
             input,
             upload,
@@ -838,6 +897,7 @@ impl Pipeline {
             staged: None,
             staged_installs: 0,
             batch_wall_ms: 0.0,
+            armed_fault: None,
             integrity_job: None,
             jobs,
             inner,
@@ -1508,13 +1568,15 @@ impl Pipeline {
         let arith = corpus.arith;
         // With the checks on, the u32 and FP32 GEMMs check their own output in the same kernel
         // (no extra launch); the INT8 tensor GEMM is followed by the separate check kernels.
-        let fused = self.checks.is_some() && arith != Arith::I8;
+        let fused = self.checks.is_some() && matches!(arith, Arith::U32 | Arith::F32);
         let function = match (arith, fused) {
             (Arith::U32, false) => backend.function,
             (Arith::U32, true) => backend.gemm_checked_function,
             (Arith::F32, false) => backend.function_f32,
             (Arith::F32, true) => backend.gemm_f32_checked_function,
             (Arith::I8, _) => backend.function_i8,
+            // Launched layer by layer by `launch_chain`.
+            (Arith::U32Chain, _) => backend.chain_out_function,
         };
         // Tiled GEMMs: one 16x16 block per output tile. Tensor: 4 warps of 16x8 tiles per block.
         let (grid_x, grid_y, block_x, block_y) = if arith == Arith::I8 {
@@ -1548,21 +1610,25 @@ impl Pipeline {
         ];
         // The plain GEMMs take the first eight parameters; the extra ones are then ignored.
         let params = &mut all_params;
-        check("async GEMM", unsafe {
-            (driver.launch)(
-                function,
-                grid_x,
-                grid_y,
-                jobs,
-                block_x,
-                block_y,
-                1,
-                0,
-                slot.stream,
-                params.as_mut_ptr(),
-                ptr::null_mut(),
-            )
-        })?;
+        if arith == Arith::U32Chain {
+            self.launch_chain(backend, slot, lo, hi, fault)?;
+        } else {
+            check("async GEMM", unsafe {
+                (driver.launch)(
+                    function,
+                    grid_x,
+                    grid_y,
+                    jobs,
+                    block_x,
+                    block_y,
+                    1,
+                    0,
+                    slot.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            })?;
+        }
         let readback = match &self.checks {
             Some(checks) => {
                 if !fused {
@@ -1595,6 +1661,107 @@ impl Pipeline {
             (driver.event_record)(slot.events[2], slot.stream)
         })?;
         Ok(())
+    }
+
+    /// v1.2 C9: one batch of the u32 GEMM chain on `slot`: its layers into the shared scratch,
+    /// once the chain before it is done, then the projection into the slot's output. Negative
+    /// gates: [`crate::MatrixFault::ChainSkippedLayer`] leaves layer 2 out,
+    /// [`crate::MatrixFault::ChainWrongMatrix`] gives layer 3 the matrix of layer 1.
+    #[allow(clippy::cast_possible_truncation)]
+    fn launch_chain(
+        &self,
+        backend: &CudaBackend,
+        slot: &DeviceSlot,
+        lo: u32,
+        hi: u32,
+        fault: u32,
+    ) -> Result<()> {
+        let scratch = self
+            .chain
+            .as_ref()
+            .ok_or(Error::Request("GEMM chain scratch missing"))?;
+        let corpus = self
+            .corpus
+            .as_ref()
+            .ok_or(Error::Request("corpus missing"))?;
+        let driver = &backend.context.driver;
+        let (n, kc, jobs) = (corpus.n, corpus.chain_inner(), self.jobs);
+        check("chain wait", unsafe {
+            (driver.stream_wait_event)(slot.stream, scratch.done, 0)
+        })?;
+        let matrices = self.input.address + (jobs * n * kc * 4) as u64;
+        let matrix_bytes = (kc * kc * 4) as u64;
+        let mut b = matrices + gemm::CHAIN_LAYERS as u64 * matrix_bytes;
+        let (mut n32, mut kc32, mut lo32, mut hi32) = (n as u32, kc as u32, lo, hi);
+        let mut source = self.input.address;
+        let launch = |function: Handle, grid_x: u32, grid_y: u32, params: &mut [*mut c_void]| {
+            check("async GEMM chain", unsafe {
+                (driver.launch)(
+                    function,
+                    grid_x,
+                    grid_y,
+                    jobs as u32,
+                    16,
+                    16,
+                    1,
+                    0,
+                    slot.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            })
+        };
+        for layer in 1..=gemm::CHAIN_LAYERS as u32 {
+            let mut dst = scratch.buffers[(layer as usize - 1) % 2].address;
+            if fault == crate::MatrixFault::ChainSkippedLayer as u32 && layer == 2 {
+                source = dst;
+                continue;
+            }
+            let from = if fault == crate::MatrixFault::ChainWrongMatrix as u32 && layer == 3 {
+                0
+            } else {
+                layer - 1
+            };
+            let (mut src, mut m) = (source, matrices + u64::from(from) * matrix_bytes);
+            let (mut layer_arg, mut fault_arg) = (layer, fault);
+            launch(
+                backend.chain_layer_function,
+                kc32.div_ceil(16),
+                n32.div_ceil(16),
+                &mut [
+                    (&raw mut src).cast::<c_void>(),
+                    (&raw mut m).cast(),
+                    (&raw mut dst).cast(),
+                    (&raw mut n32).cast(),
+                    (&raw mut kc32).cast(),
+                    (&raw mut lo32).cast(),
+                    (&raw mut layer_arg).cast(),
+                    (&raw mut fault_arg).cast(),
+                ],
+            )?;
+            source = dst;
+        }
+        let mut output = slot.output.address;
+        let (mut last, mut fault_arg) = (gemm::CHAIN_LAYERS as u32, fault);
+        launch(
+            backend.chain_out_function,
+            n32.div_ceil(16),
+            n32.div_ceil(16),
+            &mut [
+                (&raw mut source).cast::<c_void>(),
+                (&raw mut b).cast(),
+                (&raw mut output).cast(),
+                (&raw mut n32).cast(),
+                (&raw mut kc32).cast(),
+                (&raw mut lo32).cast(),
+                (&raw mut hi32).cast(),
+                (&raw mut last).cast(),
+                (&raw mut fault_arg).cast(),
+            ],
+        )?;
+        check("chain done", unsafe {
+            (driver.event_record)(scratch.done, slot.stream)
+        })
     }
 
     /// c3: the GPU checks the output of the batch against the answers and hashes it (one block
@@ -1769,6 +1936,8 @@ impl Pipeline {
         let mut interrupted = false;
         let mut drain_started = None;
         let start_generation = self.next_generation;
+        // A negative gate armed for the first batch of this burst (it replaces `inject`'s).
+        let armed = self.armed_fault.take();
         // A lane slice runs the lane alone: no compute batch, only a deadline.
         let target = if lane_slice.is_some() {
             start_generation
@@ -2178,7 +2347,11 @@ impl Pipeline {
                     };
                     match ledger.reserve(batch, output_bytes as u64, now_ms) {
                         Ok(batch) => {
-                            let fault = u32::from(inject && next_generation == start_generation);
+                            let fault = if next_generation == start_generation {
+                                armed.unwrap_or(u32::from(inject))
+                            } else {
+                                0
+                            };
                             let seal_fault = u32::from(std::mem::take(&mut seal_fault_pending));
                             next_generation += 1;
                             limit_min = limit_min.min(controller.in_flight_limit);
@@ -2460,8 +2633,12 @@ impl Pipeline {
         }
         self.shape.window.observe(regime);
         let cells = burst.totals.verified * (corpus.jobs * corpus.n * corpus.n) as u64;
-        // Each cell is 2K operations, K of this burst's corpus (the adaptive shape changes K).
-        let operations = cells.saturating_mul(2 * corpus.k as u64);
+        // The operations of this burst's corpus: 2K per cell for a GEMM (K of its own corpus, the
+        // adaptive shape changes it), every layer and the projection for a chain.
+        let operations = burst
+            .totals
+            .verified
+            .saturating_mul(corpus.integer_operations());
         let c = &mut self.cumulative;
         c.inner_now = u32::try_from(corpus.k).unwrap_or(u32::MAX);
         match corpus.arith {
@@ -2476,6 +2653,10 @@ impl Pipeline {
             Arith::I8 => {
                 c.i8_results_verified += cells;
                 c.i8_ops_verified += operations;
+            }
+            Arith::U32Chain => {
+                c.chain_results_verified += cells;
+                c.chain_ops_verified += operations;
             }
         }
         // The next burst may use more verifier workers, but only while verifiers are the limit
@@ -2761,6 +2942,19 @@ impl CudaBackend {
                 .clone_from(&pipeline.failure_attribution);
         }
         failure.map_or(Ok(()), |error| Err(Error::Unavailable(error)))
+    }
+    /// Negative gate: the first batch of the next async burst runs with `fault` (a flipped
+    /// output bit, a wrong row, a missing write, a stale generation, a guard overwrite, or one of
+    /// the GEMM chain's: a flipped intermediate, a skipped layer, a wrong matrix).
+    /// # Errors
+    /// Fails before the async resources exist.
+    pub fn arm_matrix_fault(&self, fault: crate::MatrixFault) -> Result<()> {
+        self.balanced
+            .borrow_mut()
+            .as_mut()
+            .ok_or(Error::Request("async resources not prepared"))?
+            .armed_fault = Some(fault as u32);
+        Ok(())
     }
     /// Negative gate: changes one bit of the host copy of the corpus in use (not the device's).
     /// # Errors

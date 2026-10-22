@@ -59,6 +59,9 @@ fn arith_code(arith: Arith) -> u32 {
         Arith::U32 => 0,
         Arith::F32 => 1,
         Arith::I8 => 2,
+        // Never stored: a chain corpus is built where it runs (`Corpus::from_parts` refuses it),
+        // and a record carrying this code is not read back.
+        Arith::U32Chain => 3,
     }
 }
 

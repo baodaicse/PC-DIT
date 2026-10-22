@@ -211,6 +211,10 @@ pub struct Cumulative {
     pub u32_ops_verified: u64,
     pub f32_flops_verified: u64,
     pub i8_ops_verified: u64,
+    /// v1.2 C9: cells of the u32 GEMM chain and the operations behind them (every layer and
+    /// the projection; [`crate::gemm::Corpus::integer_operations`]).
+    pub chain_results_verified: u64,
+    pub chain_ops_verified: u64,
     /// K of the corpus in use.
     pub inner_now: u32,
     /// Steps the adaptive shape took (none when K was given or could not grow).

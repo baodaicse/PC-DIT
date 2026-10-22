@@ -50,6 +50,7 @@ api! {
     stream_destroy: "cuStreamDestroy_v2" (Handle);
     event_create: "cuEventCreate" (*mut Handle, u32);
     event_record: "cuEventRecord" (Handle, Handle);
+    stream_wait_event: "cuStreamWaitEvent" (Handle, Handle, u32);
     event_query: "cuEventQuery" (Handle);
     event_elapsed: "cuEventElapsedTime" (*mut f32, Handle, Handle);
     event_destroy: "cuEventDestroy_v2" (Handle);

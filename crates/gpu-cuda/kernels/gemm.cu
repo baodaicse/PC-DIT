@@ -25,6 +25,70 @@ extern "C" __global__ void dit_gemm(const unsigned *input, unsigned *output,
     }
 }
 
+// v1.2 C9: the u32 GEMM chain. Layer s computes X_s = X_{s-1} * M_s (n x kc times kc x kc,
+// modulo 2^32) into a scratch buffer; X_0 is the job's A in the corpus. Every intermediate is
+// stored XORed with a mask of the batch generation, the layer and its position: a layer that
+// never wrote leaves another batch's mask behind and the output comes out wrong. Must equal
+// nothing on the CPU: the oracle computes the plain chain, the masks cancel on the device.
+__device__ __forceinline__ unsigned chain_mask(unsigned lo, unsigned layer, unsigned index) {
+    return (lo*0x9E3779B1u + layer*0x7F4A7C15u) ^ (index*0x85EBCA6Bu);
+}
+
+extern "C" __global__ void dit_chain_layer(const unsigned *src, const unsigned *m, unsigned *dst,
+    unsigned n, unsigned kc, unsigned lo, unsigned layer, unsigned fault) {
+    __shared__ unsigned left[16][16], right[16][16];
+    unsigned x=threadIdx.x, y=threadIdx.y;
+    unsigned row=blockIdx.y*16+y, col=blockIdx.x*16+x;
+    unsigned job=blockIdx.z, base=job*n*kc, sum=0;
+    for(unsigned k=0;k<kc;k+=16) {
+        unsigned at=base+row*kc+k+x;
+        unsigned value=(row<n && k+x<kc)?src[at]:0;
+        if(layer>1 && row<n && k+x<kc) value^=chain_mask(lo,layer-1,at);
+        left[y][x]=value;
+        right[y][x]=(col<kc && k+y<kc)?m[(k+y)*kc+col]:0;
+        __syncthreads();
+        #pragma unroll
+        for(unsigned t=0;t<16;++t) sum+=left[y][t]*right[t][x];
+        __syncthreads();
+    }
+    if(row<n && col<kc) {
+        unsigned at=base+row*kc+col;
+        // Fault 6: the top bit of one intermediate flips (the error all-odd matrices cancelled).
+        if(fault==6 && layer==1 && job==0 && row==0 && col==0) sum^=0x80000000u;
+        dst[at]=sum^chain_mask(lo,layer,at);
+    }
+}
+
+// The projection Y = X_L * B (kc x n) of the chain, with the layout, tagging and fault modes of
+// dit_gemm (1 flipped bit, 2 wrong row, 3 missing write, 4 stale generation, 5 guard).
+extern "C" __global__ void dit_chain_out(const unsigned *src, const unsigned *b, unsigned *output,
+    unsigned n, unsigned kc, unsigned lo, unsigned hi, unsigned layer, unsigned fault) {
+    __shared__ unsigned left[16][16], right[16][16];
+    unsigned x=threadIdx.x, y=threadIdx.y;
+    unsigned row=blockIdx.y*16+y, col=blockIdx.x*16+x;
+    unsigned job=blockIdx.z, base=job*n*kc, sum=0;
+    for(unsigned k=0;k<kc;k+=16) {
+        unsigned source_row=(fault==2)?(row+1)%n:row;
+        unsigned at=base+source_row*kc+k+x;
+        left[y][x]=(row<n && k+x<kc)?(src[at]^chain_mask(lo,layer,at)):0;
+        right[y][x]=(col<n && k+y<kc)?b[(k+y)*n+col]:0;
+        __syncthreads();
+        #pragma unroll
+        for(unsigned t=0;t<16;++t) sum+=left[y][t]*right[t][x];
+        __syncthreads();
+    }
+    unsigned out=job*(n*n+4);
+    if(row<n && col<n) {
+        if(fault==1 && row==0 && col==0) sum^=1;
+        if(fault==3 && row==0 && col==0) return;
+        if(fault==4) lo^=1;
+        unsigned value=sum ^ lo ^ ((hi<<13)|(hi>>19));
+        output[out+2+row*n+col]=((value<<7)|(value>>25)) ^ (job*0x9E3779B9u) ^ (row*n+col);
+        if(row==0 && col==0) { output[out]=lo; output[out+1]=hi; }
+        if(fault==5 && row==0 && col==0) output[out+2+n*n]=0;
+    }
+}
+
 // FP32 GEMM on the FMA pipes: the same layout, tagging and fault modes as dit_gemm, with every
 // product accumulated by one fused multiply-add in ascending k (each thread walks its tiles and
 // their columns in order), which is exactly what gpu_engine::gemm's FP32 oracle computes.
