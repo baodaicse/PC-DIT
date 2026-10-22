@@ -547,8 +547,10 @@ pub(crate) struct Pipeline {
     staged: Option<Arc<Corpus>>,
     /// Uploads that found their corpus already in `upload` (C13 G3).
     staged_installs: u64,
-    /// Smoothed wall time per batch of past bursts, milliseconds (C16c); 0 before the first.
-    batch_wall_ms: f64,
+    /// Smoothed wall time per batch of past bursts of each arithmetic, milliseconds (C16c),
+    /// indexed by [`arith_index`]; 0 before its first burst. A chain batch takes tens of times a
+    /// GEMM's, so one figure for all would size every burst wrong after a rotation.
+    batch_wall_ms: [f64; 4],
     /// A fault armed for the first batch of the next burst (negative gates).
     armed_fault: Option<u32>,
     /// The periodic host-corpus check running on a helper thread (C13 G3).
@@ -684,6 +686,16 @@ fn retire(corpus: Option<Arc<Corpus>>) {
         let _ = thread::Builder::new()
             .name("gpu-corpus-free".into())
             .spawn(move || drop(corpus));
+    }
+}
+
+/// Index of an arithmetic in per-arithmetic tables.
+const fn arith_index(arith: Arith) -> usize {
+    match arith {
+        Arith::U32 => 0,
+        Arith::F32 => 1,
+        Arith::I8 => 2,
+        Arith::U32Chain => 3,
     }
 }
 
@@ -896,7 +908,7 @@ impl Pipeline {
             staging: None,
             staged: None,
             staged_installs: 0,
-            batch_wall_ms: 0.0,
+            batch_wall_ms: [0.0; 4],
             armed_fault: None,
             integrity_job: None,
             jobs,
@@ -1087,23 +1099,64 @@ impl Pipeline {
     }
 
     /// v1.2 C16c: the burst when nothing asks for one: about `burst_target_ms` of the measured
-    /// batch time, between `batches` and one corpus rotation (256 batches without rotation).
+    /// batch time of `arith`, between `batches` and half a corpus's life (of 256 batches without
+    /// rotation), and never more than about `MAX_BURST_MS` of work (a chain batch on a slow GPU
+    /// takes over a second). The first burst of an arithmetic is a short one that measures it.
+    /// Half, so a burst boundary falls inside every corpus's life: the next corpus is staged at
+    /// a boundary (C13 G3), and with one burst per corpus it was never built yet there.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    fn burst_batches(&self) -> u64 {
+    fn burst_batches(&self, arith: Arith) -> u64 {
+        const MAX_BURST_MS: f64 = 2_000.0;
         let floor = self.config.batches.max(1);
-        if self.config.burst_target_ms == 0 || self.batch_wall_ms <= 0.0 {
+        if self.config.burst_target_ms == 0 {
             return floor;
         }
-        let rotation = match self.config.rotate_every_batches {
+        let measured = self.batch_wall_ms[arith_index(arith)];
+        if measured <= 0.0 {
+            return floor.min(2 * self.config.device_slots as u64).max(1);
+        }
+        let floor = floor.min(((MAX_BURST_MS / measured) as u64).max(1));
+        let life = match self.rotation_batches() {
             0 => 256,
             every => every,
         };
-        let wanted = (self.config.burst_target_ms as f64 / self.batch_wall_ms).round() as u64;
-        wanted.clamp(floor, rotation.max(floor))
+        let wanted = (self.config.burst_target_ms as f64 / measured).round() as u64;
+        wanted.clamp(floor, (life / 2).max(floor))
+    }
+
+    /// v1.2 C9: batches the corpus in use stays for before a rotation is due. In a mix of
+    /// arithmetics every corpus gets about the GPU time a corpus of the fastest one gets in
+    /// `rotate_every_batches`: a chain batch takes tens of times a GEMM's and would otherwise
+    /// hold the GPU nearly all the time, leaving the FP32 and tensor pipes a few percent. Until
+    /// both batch times are measured, `rotate_every_batches`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn rotation_batches(&self) -> u64 {
+        let every = self.config.rotate_every_batches;
+        let Some(arith) = self.corpus.as_ref().map(|c| c.arith) else {
+            return every;
+        };
+        if every == 0 || !self.config.arith.alternates() {
+            return every;
+        }
+        let own = self.batch_wall_ms[arith_index(arith)];
+        let fastest = self
+            .batch_wall_ms
+            .iter()
+            .copied()
+            .filter(|ms| *ms > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        if own <= 0.0 || !fastest.is_finite() {
+            return every;
+        }
+        ((every as f64 * fastest / own).round() as u64).clamp(every.min(2), every)
     }
 
     /// Builds a corpus of the shape in use here, waiting for it (no prefetch to take).
@@ -1134,11 +1187,12 @@ impl Pipeline {
     /// thread while the bursts run: the new corpus once built, else (with a pool, from two bursts
     /// before the rotation) the pool's oldest, which that rotation takes then.
     fn stage_next(&mut self) {
-        let every = self.config.rotate_every_batches;
+        let every = self.rotation_batches();
         if self.external || every == 0 {
             return;
         }
-        let near = self.batches_on_corpus + 2 * self.burst_batches() >= every;
+        let arith = self.corpus.as_ref().map_or(Arith::U32, |c| c.arith);
+        let near = self.batches_on_corpus + 2 * self.burst_batches(arith) >= every;
         let next = if let Some(prefetch) = self.prefetch.as_mut().filter(|p| p.is_built()) {
             prefetch.built().cloned()
         } else if self.config.corpus_pool > 0 && near {
@@ -1251,7 +1305,7 @@ impl Pipeline {
             self.prefetch = None;
         }
         let mut rotated = false;
-        let every = self.config.rotate_every_batches;
+        let every = self.rotation_batches();
         if every > 0 && self.batches_on_corpus >= every {
             self.rotation += 1;
             self.batches_on_corpus = 0;
@@ -1338,7 +1392,7 @@ impl Pipeline {
             .corpus
             .as_ref()
             .is_some_and(|c| c.jobs == self.jobs && c.k == self.inner as usize);
-        let every = self.config.rotate_every_batches;
+        let every = self.rotation_batches();
         let due = every > 0 && self.batches_on_corpus >= every;
         let in_use_seed = |pipeline: &Self| pipeline.corpus.as_ref().map_or(0, |c| c.seed);
         if current_fits && !due {
@@ -1944,7 +1998,7 @@ impl Pipeline {
         } else {
             start_generation
                 .checked_add(batches.map_or_else(
-                    || self.burst_batches(),
+                    || self.burst_batches(corpus.arith),
                     |asked| asked.clamp(1, self.config.batches),
                 ))
                 .ok_or(Error::Request("batch identity overflow"))?
@@ -2622,11 +2676,12 @@ impl Pipeline {
         self.cumulative.add_burst(burst.clone());
         // C16c: the batch time the next burst is sized by (a burst too short to say little is
         // not counted).
-        if burst.totals.submitted >= 8 {
+        if burst.totals.submitted >= 2 {
             #[allow(clippy::cast_precision_loss)]
             let per_batch = burst_wall * 1000.0 / burst.totals.submitted as f64;
-            self.batch_wall_ms = if self.batch_wall_ms > 0.0 {
-                0.7 * self.batch_wall_ms + 0.3 * per_batch
+            let known = &mut self.batch_wall_ms[arith_index(corpus.arith)];
+            *known = if *known > 0.0 {
+                0.7 * *known + 0.3 * per_batch
             } else {
                 per_batch
             };

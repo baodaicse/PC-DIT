@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # v1.2 C13: every ISA build of gpu-vram-dit must build the same GEMM corpora, bit for bit: the
-# input and the CPU oracle's expected answers (their SHA-256), for u32, FP32 and INT8. The builds
+# input and the CPU oracle's expected answers (their SHA-256), for u32, FP32, INT8 and the chain. The builds
 # this CPU can run are compared with the baseline one; the others are reported as not run.
 #   tools/test_gpu_isa.sh [baseline-binary]
 set -euo pipefail
@@ -13,14 +13,13 @@ build_of() {
     printf '%s\n' "$ROOT_DIR/target/isa-$1/$TARGET/release/gpu-vram-dit"
 }
 
-if [[ ! -x "$BASE" ]]; then
+# Cargo rebuilds only what changed; a stale build would not know a newer arithmetic.
+if [[ $# -eq 0 ]]; then
     cargo build --release -p gpu-cli --manifest-path "$ROOT_DIR/Cargo.toml"
 fi
 for level in v3 v4; do
-    if [[ ! -x "$(build_of "$level")" ]]; then
-        CARGO_TARGET_DIR="$ROOT_DIR/target/isa-$level" RUSTFLAGS="-C target-cpu=x86-64-$level" \
-            cargo build --release -p gpu-cli --target "$TARGET" --manifest-path "$ROOT_DIR/Cargo.toml"
-    fi
+    CARGO_TARGET_DIR="$ROOT_DIR/target/isa-$level" RUSTFLAGS="-C target-cpu=x86-64-$level" \
+        cargo build --release -p gpu-cli --target "$TARGET" --manifest-path "$ROOT_DIR/Cargo.toml"
 done
 
 flags=$(grep -m1 '^flags' /proc/cpuinfo || true)
@@ -34,9 +33,10 @@ runnable=()
 has avx2 fma bmi1 bmi2 f16c movbe && runnable+=(v3)
 has avx2 fma avx512f avx512bw avx512cd avx512dq avx512vl && runnable+=(v4)
 
-# arith jobs inner: small shapes and the RTX 5080 overlap one (128 jobs x K 4096).
+# arith jobs inner: small shapes and the RTX 5080 overlap one (128 jobs x K 4096); the u32 GEMM
+# chain (v1.2 C9, inner dimension at most 1024) at a small shape and at its full inner dimension.
 CASES=("u32 16 256" "fp32 16 256" "int8 16 256" "u32 8 1024" "fp32 8 1024" "int8 8 1024"
-    "u32 128 4096" "fp32 128 4096" "int8 128 4096")
+    "u32 128 4096" "fp32 128 4096" "int8 128 4096" "chain 16 256" "chain 4 1024")
 
 digest() {
     "$1" corpus-digest --arith "$2" --jobs "$3" --inner "$4" --seed 11 --threads 4

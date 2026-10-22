@@ -159,7 +159,7 @@ impl WorkspaceBudget {
         plan: SlotPlan,
         prefetch_corpus: bool,
     ) -> (u64, u64, u64, u64) {
-        Self::async_footprint_pooled(inner, plan, prefetch_corpus, 0)
+        Self::async_footprint_pooled(inner, plan, prefetch_corpus, 0, false)
     }
 
     /// Host RAM of one corpus (input and expected results) of `jobs` jobs at `inner`.
@@ -171,22 +171,34 @@ impl WorkspaceBudget {
     }
 
     /// As [`Self::async_footprint`], with `corpus_pool` more corpora kept in host RAM; the host
-    /// value contains them too.
+    /// value contains them too. With `chain` (the mix has the v1.2 C9 GEMM chain) the device
+    /// also holds the chain's two scratch buffers, and the input buffer (and its pinned upload
+    /// staging) fits the chain's shared matrices too.
     #[must_use]
     pub fn async_footprint_pooled(
         inner: u32,
         plan: SlotPlan,
         prefetch_corpus: bool,
         corpus_pool: usize,
+        chain: bool,
     ) -> (u64, u64, u64, u64) {
+        use gpu_engine::gemm::{Arith, Corpus, MAX_N, chain_inner};
         let (input, output, _) = gpu_engine::gemm::workspace_per_job(inner);
         let corpus = Self::corpus_host_bytes(inner, plan.jobs);
         let jobs = plan.jobs as u64;
-        let device = jobs * (input + output * plan.device_slots as u64);
+        let (input_bytes, scratch) = if chain {
+            let words = Corpus::input_words(Arith::U32Chain, plan.jobs, MAX_N, inner as usize)
+                .map_or(u64::MAX, |w| w as u64);
+            let scratch = 2 * jobs * (MAX_N * chain_inner(inner as usize) * 4) as u64;
+            ((jobs * input).max(words.saturating_mul(4)), scratch)
+        } else {
+            (jobs * input, 0)
+        };
+        let device = input_bytes + jobs * output * plan.device_slots as u64 + scratch;
         let pinned_queue = jobs * output * plan.host_slots as u64;
         let prefetch = if prefetch_corpus { corpus } else { 0 };
         // The corpus in use plus its pinned upload staging (another input's worth).
-        let host = corpus + jobs * input + pinned_queue + prefetch + corpus_pool as u64 * corpus;
+        let host = corpus + input_bytes + pinned_queue + prefetch + corpus_pool as u64 * corpus;
         (device, host, pinned_queue, prefetch)
     }
 
@@ -222,6 +234,7 @@ impl WorkspaceBudget {
             prefetch_corpus,
             lane_pinned_bytes,
             0,
+            false,
         )
     }
 
@@ -242,6 +255,7 @@ impl WorkspaceBudget {
         prefetch_corpus: bool,
         lane_pinned_bytes: u64,
         corpus_pool: usize,
+        chain: bool,
     ) -> Result<Self, &'static str> {
         if !(1..=gpu_engine::gemm::MAX_K).contains(&inner) {
             return Err("matrix inner dimension outside contract");
@@ -265,7 +279,7 @@ impl WorkspaceBudget {
             .chain(request.ladder().into_iter().map(|plan| (plan, 0)));
         for (step, (plan, kept)) in attempts.enumerate() {
             let (matrix_device, matrix_host, pinned_queue, prefetch) =
-                Self::async_footprint_pooled(inner, plan, prefetch_corpus, kept);
+                Self::async_footprint_pooled(inner, plan, prefetch_corpus, kept, chain);
             let matrix_host = matrix_host + lane_pinned_bytes;
             let local_free = device_free.saturating_sub(matrix_device);
             let host_free = host_budget
@@ -372,6 +386,25 @@ mod tests {
     }
 
     #[test]
+    fn the_gemm_chain_adds_its_scratch_to_the_device() {
+        let request = ask(512, 3, 16);
+        let plain = WorkspaceBudget::async_footprint_pooled(1024, request, true, 0, false);
+        let chain = WorkspaceBudget::async_footprint_pooled(1024, request, true, 0, true);
+        // Two scratch buffers of n x kc per job (kc = 1024 here); 512 jobs' input already holds
+        // the shared matrices, so the input and its staging stay as they were.
+        let scratch = 2 * 512 * (gpu_engine::gemm::MAX_N * 1024 * 4) as u64;
+        assert_eq!(chain.0, plain.0 + scratch);
+        assert_eq!(chain.1, plain.1);
+        // With a few jobs the shared matrices outweigh the GEMM input: input and staging grow.
+        let few = ask(4, 3, 16);
+        let (plain, chain) = (
+            WorkspaceBudget::async_footprint_pooled(1024, few, false, 0, false),
+            WorkspaceBudget::async_footprint_pooled(1024, few, false, 0, true),
+        );
+        assert!(chain.1 > plain.1 && chain.0 > plain.0);
+    }
+
+    #[test]
     fn the_corpus_pool_is_held_when_it_fits_and_given_up_first_when_not() {
         // The RTX 5080 overlap shape: 512 jobs at K 1024 (jobs x K stays as K grows).
         let corpus = WorkspaceBudget::corpus_host_bytes(1024, 512);
@@ -387,6 +420,7 @@ mod tests {
                 true,
                 32 * MIB,
                 pool,
+                false,
             )
         };
         let without = plan(2048 * MIB, 0).unwrap();

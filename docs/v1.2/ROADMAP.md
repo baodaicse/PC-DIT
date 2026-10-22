@@ -53,7 +53,7 @@ Trạng thái: `done`, `in_progress`, `planned` (đã thống nhất), `proposed
 | C6 | Xoay từng lõi (A: xoay thuần; B: xoay khi GPU chạy hết tải); combined chạy A+B | `done` (v1.2.012) |
 | C7 | GPU: K của GEMM tự tăng khi CPU kiểm không kịp | `done` (v1.2.018) |
 | C8 | GPU: INT8 Tensor core trong test đầy đủ và COMBINED | `done` (v1.2.018) |
-| C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word (M khả nghịch mod 2, xem lại 2026-10-20) | `planned` (thảo luận) |
+| C9 | GPU: GEMM nhiều tầng trên dữ liệu VRAM, CPU vẫn kiểm từng word (M khả nghịch mod 2, xem lại 2026-10-20) | `done` (v1.2.038–039), chờ phiên thực địa |
 | C10 | GPU: compute sweep khả nghịch, GPU tự kiểm, CPU kiểm lại theo checkpoint | `planned` (thảo luận) |
 | C11 | Cân bằng tải GPU / CPU-RAM trong pha chạy chồng: đo tỉ lệ cân bằng, ngân sách băng thông RAM, điều phối | `parked` (phức tạp) |
 | C12 | Nhịp RAM như trước v1.2 trong pha chạy chồng: worker RAM gần 1/3 bus, mọi luồng còn lại chạy oracle | `done` (v1.2.021) |
@@ -511,7 +511,7 @@ compute capability ≥ 8.0). Bằng chứng: RTX 5060 Ti (CC 12.0), 30 phút, 2,
 bit (2026-10-08). Chưa có lần chạy trên CC 8.x (RTX 30/40): chế độ 2 (Tensor INT8 check) vẫn để kiểm dòng card mới,
 chế độ 3 là test đầy đủ không INT8 cho card bị nghi lỗi phần mềm INT8.
 
-### C9 — GEMM nhiều tầng trên dữ liệu VRAM (`planned`)
+### C9 — GEMM nhiều tầng trên dữ liệu VRAM (`done`, v1.2.038–039, 2026-10-22)
 
 **Mục tiêu.** GPU tính nặng hơn nhiều trên mỗi word CPU phải so, và ép cả VRAM lẫn ALU, mà vẫn giữ chuẩn của tài
 liệu GPU: CPU so **toàn bộ** output với một đáp án độc lập, chính xác từng bit, không lấy mẫu.
@@ -561,6 +561,40 @@ thường khi CPU kiểm là giới hạn; ngưỡng chấp nhận.
 **Các bước:** C9a oracle CPU, logic thuần và test (điều kiện hệ số lẻ, lan lỗi); C9b kernel CUDA, các lỗi cài sẵn, test
 phần cứng trên GTX 960; C9c đưa vào vòng luân phiên, báo cáo, UI, nối với C7; C9d đo trên máy thật (COMBINED trên
 máy RTX PRO 6000 hoặc RTX 4090, GPU nhanh nhất trong kết quả thực địa, sau C16).
+
+**Đã làm (v1.2.038–039).** Các điểm "cần chốt" được chốt khi làm (làm trọn theo yêu cầu 2026-10-22):
+
+- **Chỉ u32** (`Arith::U32Chain`, `G6-U32-CHAIN-GEMM-1`). FP32 và INT8 chưa làm (cần chuẩn hóa và gập int8 riêng).
+- **L = 4 cố định, kc = min(K, 1024)**: công một tầng tăng theo bình phương kc.
+- **Có bước chiếu** (gấp khoảng 65 lần phép tính trên mỗi word CPU so ở K 1024). M_s ngẫu nhiên đặc, giữ nếu khả nghịch
+  mod 2 (khử Gauss GF(2), bốc lại theo seed dẫn xuất); B ngẫu nhiên, hàng nào toàn chẵn thì đặt một số lẻ.
+- **Trung gian trong VRAM** (2 bộ đệm luân phiên, `2 × jobs × 65 × kc × 4` byte, tính vào ngân sách VRAM), mỗi ô XOR
+  mặt nạ theo generation, tầng và vị trí, nên một tầng không ghi để lại mặt nạ của batch khác và output sai. Các
+  batch chuỗi dùng chung vùng nháp, nối tiếp nhau bằng `cuStreamWaitEvent`; D2H của slot khác vẫn chồng lên.
+- **Vòng luân phiên:** chuỗi là lượt cuối của `all` (u32 → FP32 → INT8 → chuỗi; không Tensor thì bỏ INT8), cộng mix
+  `chain` riêng. COMBINED và menu chế độ 1 (đều dùng `all`) có chuỗi từ bản này. Trong mix nhiều phép tính, mỗi corpus
+  giữ khoảng bằng thời gian GPU mà 256 batch của phép tính nhanh nhất cần, đo theo thời gian mỗi batch của từng phép
+  tính: đổi theo số batch thì chuỗi chiếm khoảng 95 % GPU (pipe FP32 và Tensor còn khoảng 2 % mỗi loại). Muốn chuỗi
+  nhiều hơn thì đây là chỗ đổi.
+- **Độ dài burst theo từng phép tính** (C16c): burst đầu của mỗi phép tính ngắn để đo; burst không quá khoảng 2 s
+  việc và không quá nửa đời một corpus, để luôn có một ranh giới burst giữa đời corpus cho bước chép sẵn (G3). Một
+  burst dài bằng cả đời corpus thì corpus mới luôn chưa dựng xong lúc quyết định chép, và lượt đổi phải chép lại.
+- **C7:** K vẫn theo thang C7; chuỗi lấy kc từ K. Không có bậc L riêng.
+
+Báo cáo: `chain_results_verified`, `chain_ops_verified`, `detection.compute.verified_chain_ops(_per_second)`, dòng
+dashboard `chain … Gop/s`. Negative gate: `arm_matrix_fault` (`ChainBitFlip`, `ChainSkippedLayer`,
+`ChainWrongMatrix`, cộng 5 lỗi output), và `--inject-hardware-fault matrix` vẫn FAIL với `--compute-mix chain`.
+`corpus-digest --arith chain` và `tools/test_gpu_isa.sh` có chuỗi.
+
+Đo trên máy dev (GTX 960, 3700X, chỉ GPU):
+
+| | Kết quả |
+|---|---|
+| `chain`, K 1024, 128 job (0,26 s mỗi batch) | 260,6 G phép tính/s đã kiểm, GPU bận 94 %, PASS |
+| `all`, K 1024, 128 job, 40 s | u32 114,9 + FP32 55,9 + chuỗi 96,0 = 266,8 G/s, 24 lần đổi corpus, PASS |
+| Dữ liệu CPU phải so trên mỗi G phép tính | chuỗi ít hơn khoảng 15 lần so với GEMM đơn ở K 4096 |
+| Dựng một corpus chuỗi 128 job × kc 1024 | 1,69 s (bản v1, 4 luồng) |
+| Digest corpus chuỗi v1 so với v3 | trùng (16 × 256 và 4 × 1024) |
 
 ### C10 — Compute sweep khả nghịch, GPU tự kiểm (`planned`)
 

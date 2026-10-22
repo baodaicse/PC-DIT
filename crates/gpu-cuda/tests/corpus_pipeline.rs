@@ -67,6 +67,8 @@ fn staged_corpora_are_verified_like_any_other_and_a_fault_still_fails() {
         rotate_every_batches: 8,
         corpus_pool: 3,
         arith: ArithMix::Alternate,
+        // Fixed bursts: one rotation each, as the premise says (timed bursts: the gate below).
+        burst_target_ms: 0,
         ..AsyncConfig::default()
     });
     for _ in 0..16 {
@@ -96,4 +98,35 @@ fn staged_corpora_are_verified_like_any_other_and_a_fault_still_fails() {
         "a flipped result bit must not pass on a staged corpus"
     );
     assert_eq!(backend.async_report().unwrap().cumulative.totals.failed, 1);
+}
+
+#[test]
+#[ignore = "bounded real NVIDIA corpus staging gate with timed bursts"]
+fn timed_bursts_leave_a_boundary_inside_every_corpus_for_staging() {
+    // v1.2 C16c/C9: bursts grow with the batch time but stay within half a corpus's life, so
+    // the next corpus can be staged at a boundary in the middle of it (with one burst per
+    // corpus it was never built yet there).
+    let backend = prepared(AsyncConfig {
+        batches: 8,
+        rotate_every_batches: 64,
+        corpus_pool: 3,
+        arith: ArithMix::Alternate,
+        ..AsyncConfig::default()
+    });
+    for _ in 0..24 {
+        backend
+            .verify_matrix_async(31, false, &|| false, None)
+            .unwrap();
+    }
+    backend.finish_async().unwrap();
+    let c = backend.async_report().unwrap().cumulative;
+    assert_eq!(c.totals.failed, 0, "{:?}", c.mismatch_samples);
+    let last = c.last_burst.as_ref().map_or(0, |b| b.totals.submitted);
+    assert!(last <= 32, "a burst is at most half a corpus: {last}");
+    assert!(
+        c.corpus_staged_installs >= 2,
+        "staged {} of {} rotations",
+        c.corpus_staged_installs,
+        c.corpus_rotations + c.corpus_pool_serves
+    );
 }

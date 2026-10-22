@@ -1195,6 +1195,9 @@ pub struct ComputeDetection {
     /// INT8 tensor-core GEMM operations verified (multiply + add per step and cell).
     pub verified_int8_tensor_ops: u64,
     pub verified_int8_tensor_ops_per_second: f64,
+    /// v1.2 C9: u32 GEMM chain operations verified (every layer and the projection).
+    pub verified_chain_ops: u64,
+    pub verified_chain_ops_per_second: f64,
     pub failed_batches: u64,
     /// Async path only: every differing word of every failed batch.
     pub mismatch_words: Option<u64>,

@@ -117,6 +117,8 @@ enum DigestArithArg {
     U32,
     Fp32,
     Int8,
+    /// The u32 GEMM chain (v1.2 C9).
+    Chain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -147,8 +149,10 @@ enum ComputeMixArg {
     /// INT8 tensor cores only (compute capability 8.0+).
     Int8,
     Alternate,
-    /// u32, FP32 and INT8 tensor in turn (INT8 skipped without tensor cores).
+    /// u32, FP32, INT8 tensor and the u32 GEMM chain in turn (INT8 skipped without tensor cores).
     All,
+    /// The u32 GEMM chain only (v1.2 C9).
+    Chain,
 }
 
 impl From<ComputeMixArg> for gpu_cuda::ArithMix {
@@ -159,6 +163,7 @@ impl From<ComputeMixArg> for gpu_cuda::ArithMix {
             ComputeMixArg::Int8 => Self::I8,
             ComputeMixArg::Alternate => Self::Alternate,
             ComputeMixArg::All => Self::All,
+            ComputeMixArg::Chain => Self::Chain,
         }
     }
 }
@@ -387,8 +392,9 @@ struct RunArgs {
     /// Async only: GEMM arithmetic -- `u32` (default; integer ALU, modulo 2^32), `fp32` (IEEE
     /// single precision, one fused multiply-add per step, bit-exact against the CPU oracle),
     /// `int8` (tensor cores, exact 32-bit accumulation; compute capability 8.0+, inner dimension
-    /// divisible by 32), `alternate` (u32 and fp32 in turn at each corpus rotation) or `all`
-    /// (u32, fp32 and int8 in turn; int8 skipped without tensor cores).
+    /// divisible by 32), `alternate` (u32 and fp32 in turn at each corpus rotation), `all`
+    /// (u32, fp32, int8 and the u32 GEMM chain in turn; int8 skipped without tensor cores) or
+    /// `chain` (v1.2 C9: four GEMM layers on VRAM data and a projection per job, u32, exact).
     #[arg(long, value_enum)]
     compute_mix: Option<ComputeMixArg>,
     /// Async only: batches allowed on the GPU at once (default 3). The plan may lower it.
@@ -904,6 +910,7 @@ fn corpus_digest(args: &CorpusDigestArgs) -> Result<ExitCode, Box<dyn std::error
         DigestArithArg::U32 => gpu_engine::gemm::Arith::U32,
         DigestArithArg::Fp32 => gpu_engine::gemm::Arith::F32,
         DigestArithArg::Int8 => gpu_engine::gemm::Arith::I8,
+        DigestArithArg::Chain => gpu_engine::gemm::Arith::U32Chain,
     };
     let started = Instant::now();
     let corpus =
@@ -1096,6 +1103,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                         prefetch,
                         config.lane.pinned_bytes(),
                         if prefetch { config.corpus_pool } else { 0 },
+                        config.arith.has_chain(),
                     )?;
                     // The plan may have shed queue depth, overlap or jobs; configure what fits.
                     let (device_slots, host_slots) = (
@@ -1124,6 +1132,7 @@ fn run_single(args: &RunArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
                             },
                             prefetch,
                             effective.corpus_pool,
+                            effective.arith.has_chain(),
                         );
                     plan.matrix_jobs_effective = jobs;
                     plan.async_device_slots = Some(effective.device_slots);
@@ -2481,14 +2490,22 @@ fn build_scorecard(i: &ScorecardInputs<'_>) -> hwhealth::DetectionScorecard {
     // sequential path runs the u32 GEMM only, at one K; the async one counts each arithmetic,
     // each cell with its own corpus's K (the adaptive shape changes K between corpora).
     let cumulative = i.async_report.map(|r| &r.cumulative);
-    let (ops, flops, tensor_ops) = cumulative.map_or(
+    let (ops, flops, tensor_ops, chain_ops) = cumulative.map_or(
         (
             i.results_verified
                 .saturating_mul(2 * u64::from(i.compute_inner)),
             0,
             0,
+            0,
         ),
-        |c| (c.u32_ops_verified, c.f32_flops_verified, c.i8_ops_verified),
+        |c| {
+            (
+                c.u32_ops_verified,
+                c.f32_flops_verified,
+                c.i8_ops_verified,
+                c.chain_ops_verified,
+            )
+        },
     );
     let sweep = i.async_report.and_then(|r| r.sweep.as_ref());
     hwhealth::DetectionScorecard {
@@ -2500,6 +2517,8 @@ fn build_scorecard(i: &ScorecardInputs<'_>) -> hwhealth::DetectionScorecard {
             verified_fp32_flops_per_second: flops as f64 / seconds,
             verified_int8_tensor_ops: tensor_ops,
             verified_int8_tensor_ops_per_second: tensor_ops as f64 / seconds,
+            verified_chain_ops: chain_ops,
+            verified_chain_ops_per_second: chain_ops as f64 / seconds,
             failed_batches: i.campaign_failed_batches,
             mismatch_words: cumulative.map(|c| c.mismatch_words),
             mismatch_samples: cumulative.map(|c| c.mismatch_samples.clone()).unwrap_or_default(),
@@ -2661,10 +2680,11 @@ fn mix_note(args: &RunArgs, backend: Option<&Backend>, elapsed: Duration) -> Opt
         now => format!("{start}->{now}"),
     };
     Some(format!(
-        "u32 {:.1} Gop/s | fp32 {:.1} GFLOP/s | int8 tensor {:.1} TOPS (verified, whole run) | K {inner}",
+        "u32 {:.1} Gop/s | fp32 {:.1} GFLOP/s | int8 tensor {:.1} TOPS | chain {:.1} Gop/s (verified, whole run) | K {inner}",
         cumulative.u32_ops_verified as f64 / seconds / 1e9,
         cumulative.f32_flops_verified as f64 / seconds / 1e9,
-        cumulative.i8_ops_verified as f64 / seconds / 1e12
+        cumulative.i8_ops_verified as f64 / seconds / 1e12,
+        cumulative.chain_ops_verified as f64 / seconds / 1e9
     ))
 }
 

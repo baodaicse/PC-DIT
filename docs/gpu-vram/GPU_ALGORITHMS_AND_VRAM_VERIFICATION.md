@@ -195,11 +195,14 @@ Cùng bố cục, cùng cách gắn tag và cùng bộ xác thực như GEMM u32
 | `u32` | ALU số nguyên | cộng/nhân lấy dư 2³² là phép chính xác | như mục 3.1 |
 | `fp32` | pipe FP32 FMA | mỗi bước là **một** phép fused multiply-add IEEE-754 (làm tròn đúng một lần), cộng dồn theo đúng thứ tự k tăng dần ở cả kernel (`__fmaf_rn`) lẫn oracle CPU (`f32::mul_add`); đầu vào là số thực đủ 23 bit mantissa, có dấu, trong [0.5, 4) nên không tràn/không subnormal | **đã kiểm trên GTX 960**: khớp từng bit qua nhiều corpus, lỗi chèn bị bắt |
 | `int8` | Tensor core (`mma.sync.m16n8k32 .s8.s8.s32`, compute capability ≥ 8.0) | nhân int8 cộng dồn int32; \|tổng\| ≤ 128²·4096 < 2³¹ nên không tràn | **đã kiểm trên RTX 5060 Ti** (CC 12.0, 2026-10-08): chế độ 3 cũ chạy 30 phút, 2,9·10¹¹ kết quả INT8 khớp oracle CPU từng bit, PASS; chưa có lần chạy trên CC 8.x (RTX 30/40). Cách tính địa chỉ theo bố cục fragment của PTX ISA, giống nhau từ `sm_80` ([tensor_layout.rs](../../crates/gpu-cuda/tests/tensor_layout.rs)) |
+| `u32_chain` (v1.2.039, C9) | ALU số nguyên + VRAM | mỗi job `A·M₁·M₂·M₃·M₄·B` modulo 2³²: 4 tầng kc×kc (kc = min(K, 1024), chung mọi job, ngẫu nhiên và **khả nghịch mod 2**, kiểm bằng khử Gauss GF(2)) rồi chiếu xuống n×n bằng B ngẫu nhiên (mỗi hàng có số lẻ); dữ liệu trung gian nằm trong VRAM, XOR mặt nạ theo generation/tầng/vị trí để một tầng bỏ ghi lộ ra; output n×n gắn tag như GEMM, CPU so toàn bộ với oracle tính cả chuỗi | **đã kiểm trên GTX 960**: khớp từng bit qua nhiều corpus; 8 lỗi chèn (5 lỗi output, lật bit 31 một ô tầng 1, bỏ tầng 2, tầng 3 dùng nhầm M₁) đều FAIL; digest corpus trùng giữa bản v1 và v3 |
 
 - FP16/BF16 trên Tensor core **không** được dùng: thứ tự cộng bên trong Tensor core không được đặc tả, nên
   không so từng bit được.
 - `--compute-mix`: `u32` (mặc định CLI), `fp32`, `int8`, `alternate` (u32 và fp32 luân phiên mỗi lần xoay
-  corpus), `all` (u32 → fp32 → int8; bỏ int8 nếu GPU không có Tensor core). **Menu (chế độ 1) và COMBINED dùng
+  corpus), `all` (u32 → fp32 → int8 → chuỗi u32; bỏ int8 nếu GPU không có Tensor core), `chain` (chỉ chuỗi). Trong
+  mix nhiều phép tính, mỗi corpus giữ khoảng bằng thời gian GPU mà `--corpus-rotate-batches` batch của phép tính nhanh
+  nhất cần (v1.2.039): một batch chuỗi dài gấp hàng chục lần batch GEMM, không cân thì chuỗi chiếm gần hết GPU. **Menu (chế độ 1) và COMBINED dùng
   `all` từ v1.2.018**, sau khi INT8 đã khớp oracle trên RTX 5060 Ti; chế độ 3 chạy `alternate` (không INT8) cho card
   mà INT8 bị nghi lỗi phần mềm (xem mục 7).
 - Corpus INT8 dùng N = 64 cố định (tile Tensor là 16×8) và cần K chia hết cho 32. Module Tensor là một PTX
